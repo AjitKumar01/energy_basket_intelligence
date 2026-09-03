@@ -1,0 +1,531 @@
+\documentclass[aspectratio=169,11pt,t]{beamer}
+
+\usepackage{amsmath,amssymb,booktabs,array}
+\usepackage[T1]{fontenc}
+\usepackage{lmodern}
+
+\definecolor{Ink}{HTML}{111111}
+\definecolor{Muted}{HTML}{60646C}
+\definecolor{Panel}{HTML}{F0F2F4}
+\definecolor{Rule}{HTML}{B8BCC4}
+\definecolor{Accent}{HTML}{3D8DFF}
+\definecolor{AccentLight}{HTML}{DDEEFF}
+
+\setbeamercolor{normal text}{fg=Ink,bg=white}
+\setbeamercolor{frametitle}{fg=Ink,bg=white}
+\setbeamercolor{structure}{fg=Accent}
+\setbeamercolor{block title}{fg=Ink,bg=AccentLight}
+\setbeamercolor{block body}{fg=Ink,bg=Panel}
+\setbeamercolor{alerted text}{fg=Accent}
+
+\setbeamerfont{title}{size=\fontsize{28}{32},series=\bfseries}
+\setbeamerfont{subtitle}{size=\fontsize{15}{19}}
+\setbeamerfont{frametitle}{size=\fontsize{16}{25},series=\bfseries}
+\setbeamerfont{normal text}{size=\fontsize{13}{17}}
+\setbeamerfont{block title}{size=\fontsize{13}{16},series=\bfseries}
+\setbeamerfont{block body}{size=\fontsize{12}{16}}
+
+\setbeamertemplate{navigation symbols}{}
+\setbeamertemplate{itemize item}{\color{Accent}\raisebox{0.15ex}{\small$\bullet$}}
+\setbeamertemplate{itemize subitem}{\color{Accent}\raisebox{0.15ex}{\scriptsize$\bullet$}}
+\setbeamertemplate{enumerate item}{\color{Accent}\insertenumlabel.}
+\setbeamertemplate{frametitle}{%
+  \vspace{0.35cm}\insertframetitle\par
+  \vspace{0.08cm}{\color{Rule}\rule{\textwidth}{0.5pt}}
+}
+\setbeamertemplate{footline}{%
+  \leavevmode
+  \hbox{%
+    \begin{beamercolorbox}[wd=.86\paperwidth,ht=2.7ex,dp=1.2ex,leftskip=.65cm]{normal text}%
+      \scriptsize\color{Muted}Energy-based basket intelligence
+    \end{beamercolorbox}%
+    \begin{beamercolorbox}[wd=.14\paperwidth,ht=2.7ex,dp=1.2ex,rightskip=.65cm plus1fil]{normal text}%
+      \scriptsize\color{Muted}\hfill\insertframenumber
+    \end{beamercolorbox}%
+  }
+}
+
+\newcommand{\blue}[1]{\textcolor{Accent}{#1}}
+\newcommand{\smallsource}[1]{\vfill{\tiny\color{Muted}#1}}
+
+\title{Energy-based basket intelligence for retail}
+\subtitle{One probability model for recommendation, generation and decision support}
+\author{}
+\date{}
+
+\begin{document}
+
+% 1
+\begin{frame}[plain]
+  \vspace{1.2cm}
+  {\color{Accent}\large RETAIL BASKET MODEL}\par
+  \vspace{0.8cm}
+  {\usebeamerfont{title}\inserttitle\par}
+  \vspace{0.45cm}
+  {\usebeamerfont{subtitle}\color{Muted}\insertsubtitle\par}
+  \vfill
+  {\color{Rule}\rule{0.46\textwidth}{0.8pt}}\par
+  \vspace{0.22cm}
+  {\small\color{Muted}Version 4 model and current empirical interpretation}
+\end{frame}
+
+% 2
+\begin{frame}{The model turns transactions into basket intelligence}
+\begin{columns}[T,onlytextwidth]
+  \column{0.31\textwidth}
+  \begin{block}{Understand}
+  Learn what different customers buy, which products appear together, and how basket
+  composition changes across contexts.
+  \end{block}
+
+  \column{0.31\textwidth}
+  \begin{block}{Predict}
+  Complete a basket, rank candidate products, and generate plausible baskets for a known
+  shopping context.
+  \end{block}
+
+  \column{0.31\textwidth}
+  \begin{block}{Plan}
+  Screen bundles, prices and promotions before spending money on controlled retailer
+  experiments.
+  \end{block}
+\end{columns}
+
+\vspace{0.22cm}
+\begin{center}
+\large\blue{Current position: predictive basket intelligence, not autonomous pricing.}
+\end{center}
+\end{frame}
+
+% 3
+\begin{frame}{The retailer receives five practical capabilities}
+\begin{columns}[T,onlytextwidth]
+  \column{0.48\textwidth}
+  \begin{enumerate}
+    \item \textbf{Basket recommendation}\par
+          Rank products that best complete a customer's current basket.
+    \item \textbf{Bundle discovery}\par
+          Find supported product relationships beyond popularity alone.
+    \item \textbf{Customer understanding}\par
+          Summarize preferences, basket patterns and apparent price sensitivity.
+  \end{enumerate}
+
+  \column{0.48\textwidth}
+  \begin{enumerate}
+    \setcounter{enumi}{3}
+    \item \textbf{Scenario screening}\par
+          Compare predicted basket response under candidate prices or promotions.
+    \item \textbf{Basket simulation}\par
+          Generate baskets for testing, planning and model diagnostics.
+  \end{enumerate}
+
+  \vspace{0.12cm}
+  \blue{Business use: reduce thousands of possible actions to a small,
+  evidence-based shortlist.}
+\end{columns}
+\end{frame}
+
+% 4
+\begin{frame}{The problem is to model a complete basket, not isolated products}
+\small
+For a known shopping context $x$, we want one normalized probability for every feasible
+non-empty basket $S$:
+
+\[
+\boxed{\quad p(S\mid x,\text{purchase trip})\quad}
+\]
+
+\begin{columns}[T,onlytextwidth]
+  \column{0.48\textwidth}
+  \begin{block}{Inputs}
+  Customer, prices, promotions, calendar, store, available catalogue and declared history.
+  \end{block}
+
+  \column{0.48\textwidth}
+  \begin{block}{Output}
+  A probability distribution over sets of distinct products, with basket sizes from 1 to
+  120.
+  \end{block}
+\end{columns}
+
+\small Current data conditions on a purchase trip; predicting a visit requires a separate model.
+\end{frame}
+
+% 5
+\begin{frame}{Every basket receives an energy, then energies become probabilities}
+\[
+p_{\Theta}(S\mid x)
+=\frac{\exp\{E_{\Theta}(S;x)\}}{Z_{+}(x)},
+\qquad
+Z_{+}(x)=\sum_{T\in\Omega_x^{+}}\exp\{E_{\Theta}(T;x)\}.
+\]
+
+\begin{columns}[T,onlytextwidth]
+  \column{0.48\textwidth}
+  \begin{itemize}
+    \item $S$: the basket being scored
+    \item $x$: the observed shopping context
+    \item $E_{\Theta}(S;x)$: basket energy or compatibility score
+    \item $\Theta$: all learned model parameters
+  \end{itemize}
+
+  \column{0.48\textwidth}
+  \begin{itemize}
+    \item $\mathcal A_x$: products offered in context $x$
+    \item $\Omega_x^{+}$: all non-empty subsets of $\mathcal A_x$ up to size 120
+    \item $Z_{+}(x)$: the normalizer over every feasible basket
+    \item Higher energy means higher probability after normalization
+  \end{itemize}
+\end{columns}
+\end{frame}
+
+% 6
+\begin{frame}{The energy combines product value, interaction and basket shape}
+\[
+\boxed{
+E_{\Theta}(S;x)=
+\sum_{j\in S}b_j(x)
++\sum_{j<k;\,j,k\in S}\phi_j^{\top}\phi_k
+-\sum_c\rho_c\binom{n_c(S)}{2}
+-\rho_0(|S|)
+}
+\]
+
+\begin{columns}[T,onlytextwidth]
+  \column{0.24\textwidth}
+  \textbf{$b_j(x)$}\par
+  Contextual value of product $j$.
+
+  \column{0.24\textwidth}
+  \textbf{$\phi_j^{\top}\phi_k$}\par
+  Low-rank relationship between products $j$ and $k$.
+
+  \column{0.24\textwidth}
+  \textbf{$\rho_c,n_c(S)$}\par
+  Category effect and number of basket products in category $c$.
+
+  \column{0.24\textwidth}
+  \textbf{$\rho_0(|S|)$}\par
+  Flexible preference over total basket size.
+\end{columns}
+
+\vspace{0.35cm}
+$j,k$ index products, $c$ indexes affinity groups, and $|S|$ is the number of distinct
+products in the basket.
+\end{frame}
+
+% 7
+\begin{frame}{Contextual utility explains why the same product differs by trip}
+\small
+\[
+\begin{aligned}
+b_{jht}={}&\lambda_j+\theta_h^{\top}\alpha_j
+-g_{hj}\,\Delta\log p_{jt}
++w_j^{\mathrm{dsp}}D_{jt}+w_j^{\mathrm{mlr}}M_{jt}\\
+&+\mu_j^{\top}\delta_{w(t)}
++\zeta_j^{\top}\xi_{s(t)}
++\psi_j^{\top}r_{jht}.
+\end{aligned}
+\]
+
+\begin{columns}[T,onlytextwidth]
+  \column{0.48\textwidth}
+  \begin{itemize}
+    \item $j,h,t$: product, household and shopping time
+    \item $\lambda_j$: product's baseline appeal
+    \item $\theta_h^{\top}\alpha_j$: household-product preference
+    \item $g_{hj}\ge0$: household-product price sensitivity
+    \item $\Delta\log p_{jt}$: change in log price
+  \end{itemize}
+
+  \column{0.48\textwidth}
+  \begin{itemize}
+    \item $D_{jt},M_{jt}$: display and mailer promotion indicators
+    \item $w_j^{\mathrm{dsp}},w_j^{\mathrm{mlr}}$: promotion responses
+    \item $\mu_j^{\top}\delta_{w(t)}$: calendar effect
+    \item $\zeta_j^{\top}\xi_{s(t)}$: store effect
+    \item $\psi_j^{\top}r_{jht}$: declared history features
+  \end{itemize}
+\end{columns}
+\end{frame}
+
+% 8
+\begin{frame}{The only fundamental computational obstacle is the normalizer}
+\small
+The observed basket is easy to score. The difficulty is the denominator:
+
+\[
+Z_{+}(x)=\sum_{T\in\Omega_x^{+}}\exp\{E_{\Theta}(T;x)\}.
+\]
+
+\begin{center}
+\begin{minipage}{0.82\textwidth}
+\begin{block}{Why direct enumeration fails}
+With 5,455 products, the number of possible subsets is on the scale of $2^{5455}$.
+Training, incidence probabilities and calibrated counterfactuals all require $Z_{+}$ or
+its derivatives.
+\end{block}
+\end{minipage}
+\end{center}
+
+\end{frame}
+
+% 9
+\begin{frame}{The tractability theorem removes exponential catalogue growth}
+\small
+Let $z\sim\mathcal N(0,I_r)$, where $r$ is the interaction rank. Define
+
+\[
+w_j(z;x)=\exp\!\left\{b_j(x)-\tfrac12\|\phi_j\|^2+z^{\top}\phi_j\right\}.
+\]
+
+The Hubbard-Stratonovich and elementary-polynomial result is
+
+\[
+\boxed{
+Z_{+}(x)=
+\mathbb E_z\!\left[
+\sum_{n=1}^{n_{\max}}e^{-\rho_0(n)}A_n(z,x)
+\right].
+}
+\]
+
+$A_n(z,x)$ is the exact total conditional weight of all size-$n$ baskets, computed by
+elementary symmetric polynomials and category convolution.
+
+\begin{center}
+\blue{Result: an exact dynamic program plus an $r$-dimensional Gaussian integral.}
+\end{center}
+\end{frame}
+
+% 10
+\begin{frame}{Three simple identities make the theorem work}
+\begin{enumerate}
+  \item \textbf{Rewrite all pair interactions as one squared low-rank sum}
+  \[
+  \sum_{j<k\in S}\phi_j^{\top}\phi_k
+  =\tfrac12\left\|\sum_{j\in S}\phi_j\right\|^2
+  -\tfrac12\sum_{j\in S}\|\phi_j\|^2.
+  \]
+
+  \item \textbf{Use a Gaussian expectation for the squared term}
+  \[
+  \mathbb E_z[e^{z^{\top}v}]=e^{\|v\|^2/2}.
+  \]
+
+  \item \textbf{Use elementary symmetric polynomials to sum distinct products}
+
+  The coefficient of degree $n$ collects every size-$n$ basket exactly once, including
+  its category and total-size terms.
+\end{enumerate}
+\end{frame}
+
+% 11
+\begin{frame}{Training and every application use the same joint law}
+For an observed basket $S_x$, training maximizes
+
+\[
+\ell_x(\Theta)=E_{\Theta}(S_x;x)-\log Z_{+}(x).
+\]
+
+\begin{columns}[T,onlytextwidth]
+  \column{0.31\textwidth}
+  \begin{block}{Observed signal}
+  Raise the energy of baskets that actually occurred.
+  \end{block}
+
+  \column{0.31\textwidth}
+  \begin{block}{Model correction}
+  Lower probability assigned to alternatives through $\log Z_{+}$.
+  \end{block}
+
+  \column{0.31\textwidth}
+  \begin{block}{One objective}
+  Recommendation is not trained separately; it is a conditional query of the fitted law.
+  \end{block}
+\end{columns}
+
+\end{frame}
+
+% 12
+\begin{frame}{Recommendation is exact because the common normalizer cancels}
+\small
+Let $R$ be the revealed basket and let product $j\notin R$ be a candidate completion.
+Define its add-one score
+
+\[
+s_j(R,x)=E(R\cup\{j\};x)-E(R;x).
+\]
+
+Then
+
+\[
+\boxed{
+P(j\text{ completes }R\mid x,\text{one item missing})
+=\frac{e^{s_j(R,x)}}{\sum_{k\notin R}e^{s_k(R,x)}}.
+}
+\]
+
+The score combines standalone utility, compatibility with products already in $R$,
+category crowding and the basket-size increment. Ranking needs no partition-function
+approximation.
+\end{frame}
+
+% 13
+\begin{frame}{Basket generation follows the probability law in four stages}
+\small
+\begin{columns}[T,onlytextwidth]
+  \column{0.48\textwidth}
+  \begin{enumerate}
+    \item \textbf{Draw the latent interaction state $z$}\par
+          This summarizes the low-rank basket interaction direction.
+    \item \textbf{Draw total size $n$}\par
+          Use weights $e^{-\rho_0(n)}A_n(z,x)$ for $n=1,\ldots,120$.
+  \end{enumerate}
+
+  \column{0.48\textwidth}
+  \begin{enumerate}
+    \setcounter{enumi}{2}
+    \item \textbf{Draw category counts}\par
+          Allocate the selected total across affinity groups.
+    \item \textbf{Draw distinct products}\par
+          Sample the required number within each group using the conditional weights
+          $w_j(z;x)$.
+  \end{enumerate}
+\end{columns}
+
+\vspace{0.10cm}
+\blue{Current output: distinct-product baskets. Units, margin and inventory need a
+separate quantity model.}
+\end{frame}
+
+% 14
+\begin{frame}{Incidence and price scenarios are derivatives or reweighted expectations}
+\small
+\begin{columns}[T,onlytextwidth]
+  \column{0.48\textwidth}
+  \begin{block}{Product incidence}
+  \[
+  \pi_j(x)=P(j\in S\mid x)
+  =\frac{\partial\log Z_{+}(x)}{\partial b_j}.
+  \]
+  This includes utility, interactions, basket size and competition for basket positions.
+  \end{block}
+
+  \column{0.48\textwidth}
+  \begin{block}{Price or promotion scenario}
+  If action $a$ changes basket energy by
+  $\Delta_a(S)=E_a(S)-E_{\mathrm f}(S)$, then
+  \[
+  \mathbb E_a[f(S)]
+  =\frac{\mathbb E_{\mathrm f}[f(S)e^{\Delta_a(S)}]}
+  {\mathbb E_{\mathrm f}[e^{\Delta_a(S)}]}.
+  \]
+  \end{block}
+\end{columns}
+
+\vspace{0.05cm}
+\blue{Predictive response; causal only with credible identified price variation.}
+\end{frame}
+
+% 15
+\begin{frame}{Interactions and segments turn probabilities into retailer insight}
+\small
+The identifiable interaction object is the Gram matrix
+$K=\Phi\Phi^{\top}$, where $K_{jk}=\phi_j^{\top}\phi_k$.
+
+\begin{columns}[T,onlytextwidth]
+  \column{0.48\textwidth}
+  \begin{block}{Product relationships}
+  $K_{jk}$ measures how product $j$ changes product $k$'s add-one energy, holding the rest
+  of the basket fixed. Category and size effects must also be included.
+  \end{block}
+
+  \column{0.48\textwidth}
+  \begin{block}{Customer segments}
+  Group household preference surfaces and summarize their products, basket patterns and
+  apparent price response. Segments describe behaviour; they are not permanent identities.
+  \end{block}
+\end{columns}
+
+\vspace{0.05cm}
+\blue{Predictive bundle evidence, not proof of causal complementarity.}
+\end{frame}
+
+% 16
+\begin{frame}{Current evidence supports basket intelligence, with a generation warning}
+\small
+\begin{columns}[T,onlytextwidth]
+  \column{0.48\textwidth}
+  \textbf{What is established}
+  \begin{itemize}
+    \item Gain over exact additive parent:
+          $0.03275\pm0.00239$ nats per basket.
+    \item Gains over Bernoulli, DPP and NDPP:
+          $2.252$, $2.262$ and $1.812$ nats.
+    \item Locked test MRR: $0.09525\pm0.00607$.
+    \item Strong interaction-pair lift: $1.216$;
+          matched controls: $0.998$.
+  \end{itemize}
+
+  \column{0.48\textwidth}
+  \textbf{What is not yet calibrated}
+  \begin{itemize}
+    \item Generated mean size: $7.34$ versus observed $10.03$.
+    \item Generated size variance: $63.83$ versus observed $136.28$.
+    \item Interaction-only recommendation gain is not yet conclusive.
+    \item Price responses are predictive, not causal revenue estimates.
+  \end{itemize}
+\end{columns}
+
+\smallsource{Source: locked Version 4 household-size rank-one evaluation.}
+\end{frame}
+
+% 17
+\begin{frame}{Retail deployment should move from prediction to controlled learning}
+\begin{columns}[T,onlytextwidth]
+  \column{0.31\textwidth}
+  \begin{block}{1. Understand}
+  Train on historical baskets. Deliver segments, recommendations, supported product pairs
+  and scenario rankings.
+  \end{block}
+
+  \column{0.31\textwidth}
+  \begin{block}{2. Test}
+  Randomize a small set of model-supported bundles or promotions. Record exposure,
+  non-purchase, quantity and margin.
+  \end{block}
+
+  \column{0.31\textwidth}
+  \begin{block}{3. Optimize}
+  Calibrate incremental profit, add inventory and sequential state, then optimize a
+  budget-constrained policy.
+  \end{block}
+\end{columns}
+
+\vspace{0.08cm}
+\begin{center}
+\small\blue{RL can optimize a calibrated sequential environment; it cannot repair a biased one.}
+\end{center}
+\end{frame}
+
+% 18
+\begin{frame}{The immediate value is a smaller, better decision space}
+\vspace{0.35cm}
+\begin{center}
+\begin{minipage}{0.86\textwidth}
+{\Large\bfseries The model gives the retailer one coherent view of basket behaviour.}\par
+\vspace{0.5cm}
+{\large It connects customer context, product value, interactions, basket size and price
+response in a normalized probability law.}\par
+\vspace{0.6cm}
+{\large\color{Accent}Use it now to recommend, discover and shortlist.\par}
+\vspace{0.22cm}
+{\large\color{Accent}Use controlled experiments to turn those predictions into decisions.\par}
+\end{minipage}
+\end{center}
+\vfill
+{\color{Rule}\rule{\textwidth}{0.8pt}}
+\end{frame}
+
+\end{document}

@@ -1,0 +1,14 @@
+# Python 3.11+ (developed and verified on 3.13.4).
+#
+# Exact pins are the clean-clone certification environment.  Change them only with a
+# fresh smoke run because PyTorch C++ extensions are ABI-specific.
+
+numpy==2.3.5
+pandas==2.3.3
+pyarrow==21.0.0        # parquet engine for the intermediate panels
+scipy==1.16.3          # KS test, t distribution, sparse matrices in the placebo tests
+scikit-learn==1.7.2    # deterministic household segmentation
+matplotlib==3.10.7     # every figure in figures/
+torch==2.9.1           # both model stages; CPU execution is supported
+setuptools==80.9.0     # builds the local PyTorch C++ extension
+pytest==9.0.1          # executable numerical and pipeline-contract checks

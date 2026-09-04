@@ -31,8 +31,7 @@ from features import Features
 from ragged import (RaggedIndex, RaggedModel, set_quad, sobol_grid,
                     sobol_mixture_grid)
 from sparse_artifact import load_sparse_initialization_artifact
-from sparse_training import (SparseRuleManager,
-                             calibrate_population_phi_correction)
+from sparse_training import SparseRuleManager
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 OUT = os.path.join(HERE, "..", "..", "out")
@@ -459,8 +458,11 @@ def initialize_interaction_moments(model, D, trips, strength=0.12, prior=20.0,
 class Batcher:
     """Builds the ragged index and the per-slot features for a set of trips."""
 
-    def __init__(self, D, F, nmax):
+    def __init__(self, D, F, nmax, include_recency=True):
         self.D, self.F, self.nmax = D, F, nmax
+        self.include_recency = bool(include_recency)
+        if self.include_recency and not getattr(F, "include_recency", True):
+            raise ValueError("Batcher requests recency but Features did not load it")
         self.C = int(D["n_cat"])
         self.ptr = D["store_cat_ptr"]
         self.items = D["store_items"]
@@ -503,8 +505,9 @@ class Batcher:
             0, ix.item_trip, torch.ones_like(dlp, dtype=torch.float64))
         _dbar = _dbar / _dcnt.clamp_min(1.0)
         ctx = dict(dlp_bar=_dbar, dlp=dlp.double(), disp=disp.double(), mail=mail.double(),
-                   week=(wk_i - 1) % 52, store=st_i,
-                   rec=self.F.recency(ix.item, user[ix.item_trip], dy_i))
+                   week=(wk_i - 1) % 52, store=st_i)
+        if self.include_recency:
+            ctx["rec"] = self.F.recency(ix.item, user[ix.item_trip], dy_i)
         li, lt, lc, lu = [], [], [], []
         for bi, t in enumerate(trips):
             a, b = int(self.lptr[t]), int(self.lptr[t + 1])
@@ -518,8 +521,9 @@ class Batcher:
         # each product identically
         dlp_l, disp_l, mail_l = self.F.gather(LI, store[LT], day[LT], week[LT])
         lctx = dict(dlp_bar=_dbar, dlp=dlp_l.double(), disp=disp_l.double(), mail=mail_l.double(),
-                    week=(week[LT] - 1) % 52, store=store[LT],
-                    rec=self.F.recency(LI, user[LT], day[LT]))
+                    week=(week[LT] - 1) % 52, store=store[LT])
+        if self.include_recency:
+            lctx["rec"] = self.F.recency(LI, user[LT], day[LT])
         house = torch.as_tensor(D["trip_user"][trips], dtype=torch.long)
         return (ix, ctx, lctx, house,
                 LI, LT, torch.as_tensor(np.concatenate(lc), dtype=torch.long),

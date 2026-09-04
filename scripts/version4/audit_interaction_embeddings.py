@@ -22,10 +22,11 @@ os.environ.setdefault("V3_AFFINITY", "1")
 
 import numpy as np
 import pandas as pd
-import torch
 from scipy.spatial import cKDTree
 
 from data import build
+from checkpoint_io import load_checkpoint
+from provenance import file_sha256, strict_json_dumps
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -269,8 +270,11 @@ def markdown(result):
 
 def main(args):
     checkpoint = args.checkpoint if args.checkpoint.is_absolute() else ROOT / args.checkpoint
-    blob = torch.load(checkpoint, map_location="cpu", weights_only=False)
-    state = blob["model"]
+    data = build()
+    model, blob, _meta = load_checkpoint(
+        checkpoint, data,
+        required_capabilities=("conditional_nonempty_incidence", "gram_interactions"))
+    state = model.state_dict()
     rank = int(blob.get("active_rank", 0))
     if not 0 < rank <= state["phi"].shape[1]:
         raise RuntimeError("checkpoint has no valid active interaction rank")
@@ -287,7 +291,6 @@ def main(args):
     category = metadata.cat_id.to_numpy()
     pairs = top_pairs(phi, category, eligible, args.pairs, relation="different")
     controls = matched_controls(pairs, phi, metadata, eligible, args.seed)
-    data = build()
     heldout = heldout_pair_statistics(data, pairs + controls, split=2)
     cut = len(pairs)
     top_summary = summarize_pair_panel(
@@ -336,6 +339,9 @@ def main(args):
         })
     result = {
         "checkpoint": str(checkpoint),
+        "checkpoint_sha256": file_sha256(checkpoint),
+        "data_fingerprint_sha256": blob["data_fingerprint_sha256"],
+        "trained_capabilities": blob["trained_capabilities"],
         "split": "test",
         "definition": (
             "pair-specific gamma_ij = phi_i'phi_j - rho_c(i) * 1[c(i)=c(j)]; "
@@ -383,10 +389,10 @@ def main(args):
     }
     output = args.output if args.output.is_absolute() else ROOT / args.output
     output.parent.mkdir(parents=True, exist_ok=True)
-    output.write_text(json.dumps(result, indent=2) + "\n")
+    output.write_text(strict_json_dumps(result))
     md_output = output.with_suffix(".md")
     md_output.write_text(markdown(result))
-    print(json.dumps({
+    print(strict_json_dumps({
         "output": str(output),
         "markdown": str(md_output),
         "active_rank": rank,
@@ -394,7 +400,7 @@ def main(args):
         "control_aggregate_lift": control_summary["aggregate_lift"],
         "top_pair_fraction_above_null": top_summary["fraction_observed_above_expected"],
         "control_fraction_above_null": control_summary["fraction_observed_above_expected"],
-    }, indent=2))
+    }), end="")
 
 
 if __name__ == "__main__":

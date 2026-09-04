@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import argparse
-import json
 import math
 import os
 from pathlib import Path
@@ -13,44 +12,16 @@ os.environ.setdefault("V3_AFFINITY", "1")
 import numpy as np
 import torch
 
-from audit_particle_counterfactual_generation import ROOT, load_checkpoint
+from checkpoint_io import ROOT, load_checkpoint
 from data import build
-from evalall import load_any
 from features import Features
 from fit import Batcher
 from interaction_particles import differentiable_logz_beta0
-from ragged import RaggedModel, smolyak_grid
+from pipeline_support import smolyak_rule
+from provenance import file_sha256, strict_json_dumps
 
 
 torch.set_default_dtype(torch.float64)
-
-
-def load_version4_checkpoint(path, data):
-    """Load both artifact-backed modern checkpoints and audited format-2 runs."""
-    blob = torch.load(path, map_location="cpu", weights_only=False)
-    if "artifact" in blob.get("config", {}):
-        return load_checkpoint(path, data)
-    if blob.get("format") != 2 or "model" not in blob or "data" not in blob:
-        raise RuntimeError(f"unsupported checkpoint format: {path}")
-    state, meta = blob["model"], blob["data"]
-    required = ("nmax", "R", "n_item", "n_cat")
-    if any(key not in meta for key in required):
-        raise RuntimeError(f"format-2 checkpoint lacks support metadata: {path}")
-    model = RaggedModel(
-        int(data["n_item"]), int(data["n_user"]), int(data["n_cat"]),
-        K=int(state["alpha"].shape[1]), Kz=int(state["phi"].shape[1]),
-        nmax=int(meta["nmax"]), R=int(meta["R"]), S=int(data["n_store"]),
-        Kp=int(state["gamma"].shape[1]), phi_init=0.0)
-    load_any(path, model, int(data["n_item"]), data)
-    model.double().eval()
-    return model, blob, meta
-
-
-def rule(model, rank, level):
-    active, weights = smolyak_grid(rank, level)
-    nodes = torch.zeros(len(weights), model.Kz, dtype=model.phi.dtype)
-    nodes[:, :rank] = active
-    return nodes, weights
 
 
 @torch.no_grad()
@@ -117,8 +88,12 @@ def main():
     data = build()
     parent_path = args.parent if args.parent.is_absolute() else ROOT / args.parent
     child_path = args.child if args.child.is_absolute() else ROOT / args.child
-    parent, parent_blob, meta = load_version4_checkpoint(parent_path, data)
-    child, child_blob, child_meta = load_version4_checkpoint(child_path, data)
+    parent, parent_blob, meta = load_checkpoint(
+        parent_path, data,
+        required_capabilities=("conditional_nonempty_incidence",))
+    child, child_blob, child_meta = load_checkpoint(
+        child_path, data,
+        required_capabilities=("conditional_nonempty_incidence", "gram_interactions"))
     if float(parent.phi.detach().abs().max()) != 0.0:
         raise RuntimeError("parent must have Phi=0")
     singular = torch.linalg.svdvals(child.phi)
@@ -128,8 +103,9 @@ def main():
             f"child active rank is {active_rank}, not {args.rank}")
     if int(meta["nmax"]) != int(child_meta["nmax"]):
         raise RuntimeError("parent and child supports differ")
-    batcher = Batcher(data, Features(int(data["n_item"]), int(data["n_store"]), 712),
-                      int(meta["nmax"]))
+    features = Features(int(data["n_item"]), int(data["n_store"]), 712,
+                        include_recency=False)
+    batcher = Batcher(data, features, int(meta["nmax"]), include_recency=False)
     split = {"validation": 1, "test": 2}[args.split]
     population = np.flatnonzero((data["trip_split"] == split)
                                 & (data["trip_nlines"] <= int(meta["nmax"])))
@@ -140,13 +116,13 @@ def main():
                     else active_rank + 2)
     low_level, audit_level = target_level - 1, target_level + 1
     low_value, cancel_low = interaction_values(
-        child, batcher, trips, rule(child, active_rank, low_level), args.chunk)
+        child, batcher, trips, smolyak_rule(child, active_rank, low_level), args.chunk)
     target_value, cancel_target = interaction_values(
-        child, batcher, trips, rule(child, active_rank, target_level), args.chunk)
+        child, batcher, trips, smolyak_rule(child, active_rank, target_level), args.chunk)
     n_audit = min(args.audit_trips, len(trips))
     audit_value, cancel_audit = interaction_values(
         child, batcher, trips[:n_audit],
-        rule(child, active_rank, audit_level), min(args.chunk, n_audit))
+        smolyak_rule(child, active_rank, audit_level), min(args.chunk, n_audit))
     lines = (data["line_ptr"][trips + 1] - data["line_ptr"][trips]).astype(
         np.int64, copy=False)
     parent_summary = summary(parent_value)
@@ -163,6 +139,10 @@ def main():
     result = {
         "parent": str(parent_path), "parent_iteration": int(parent_blob["iter"]),
         "child": str(child_path), "child_iteration": int(child_blob["iter"]),
+        "parent_sha256": file_sha256(parent_path),
+        "checkpoint_sha256": file_sha256(child_path),
+        "data_fingerprint_sha256": child_blob["data_fingerprint_sha256"],
+        "trained_capabilities": child_blob["trained_capabilities"],
         "split": args.split, "complete_support": f"1..{int(meta['nmax'])}",
         "active_rank": active_rank,
         "levels": {"low": low_level, "target": target_level,
@@ -198,8 +178,9 @@ def main():
         low_child=low_value, audit_trips=trips[:n_audit],
         audit_child=audit_value)
     result["per_trip_output"] = str(per_trip_output)
-    output.write_text(json.dumps(result, indent=2) + "\n")
-    print(json.dumps(result, indent=2))
+    result["per_trip_sha256"] = file_sha256(per_trip_output)
+    output.write_text(strict_json_dumps(result))
+    print(strict_json_dumps(result), end="")
     if not result["numerical_certification"]["passed"]:
         raise SystemExit(2)
 

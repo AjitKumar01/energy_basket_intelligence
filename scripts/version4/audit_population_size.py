@@ -11,13 +11,13 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from audit_particle_counterfactual_generation import ROOT, load_checkpoint
+from checkpoint_io import ROOT, load_checkpoint
 from data import build
 from features import Features
 from fit import Batcher
-from fit_interaction_particles import supported_trips
-from fit_multifidelity_rank8 import rule
-from profile_rho0_size_likelihood import collect_size_law, install
+from pipeline_support import (collect_size_law, install_quadrature, smolyak_rule,
+                              supported_trips)
+from provenance import file_sha256, strict_json_dumps
 
 
 torch.set_default_dtype(torch.float64)
@@ -49,7 +49,7 @@ def metrics(log_probability: np.ndarray, observed: np.ndarray) -> dict:
 @torch.no_grad()
 def one_size_panel(model, batcher, trips, quadrature):
     """Evaluate one panel, raising when the requested signed rule is invalid."""
-    install(model, quadrature)
+    install_quadrature(model, quadrature)
     ix, ctx, _line_ctx, house, _li, lt, _lc, _lq = batcher.make(trips)
     model.house, model.ctx = house, ctx
     _logz, probability = model.log_Z(ix, drop_empty=True, return_size=True)
@@ -125,7 +125,7 @@ def resumable_screen(model, batcher, population, checkpoint, rank, levels,
         observed_path, mode=mode, dtype=np.int16, shape=(len(population),))
     used_level = np.lib.format.open_memmap(
         level_path, mode=mode, dtype=np.int16, shape=(len(population),))
-    rules = [rule(model, rank, level) for level in levels]
+    rules = [smolyak_rule(model, rank, level) for level in levels]
     for position in range(start, len(population), chunk):
         stop = min(position + chunk, len(population))
         got_observed, got_probability, got_level = resilient_size_panel(
@@ -138,7 +138,7 @@ def resumable_screen(model, batcher, population, checkpoint, rank, levels,
             progress = {**expected, "completed_contexts": stop,
                         "complete": stop == len(population)}
             temporary = Path(str(progress_path) + ".tmp")
-            temporary.write_text(json.dumps(progress, indent=2) + "\n")
+            temporary.write_text(strict_json_dumps(progress))
             temporary.replace(progress_path)
             print(f"[population-screen] {label} {stop}/{len(population)}",
                   flush=True)
@@ -193,16 +193,18 @@ def main() -> None:
     split_code = {"train": 0, "validation": 1, "test": 2}[args.split]
     checkpoint = args.checkpoint if args.checkpoint.is_absolute() \
         else ROOT / args.checkpoint
-    model, _blob, meta = load_checkpoint(checkpoint, data)
+    model, blob, meta = load_checkpoint(
+        checkpoint, data,
+        required_capabilities=("conditional_nonempty_incidence", "gram_interactions"))
     population = supported_trips(data, split_code, int(meta["nmax"]))
     full_population_size = len(population)
     if args.contexts < 0:
         raise ValueError("contexts must be nonnegative")
     if args.contexts:
         population = population[:min(args.contexts, len(population))]
-    batcher = Batcher(data, Features(int(data["n_item"]),
-                                     int(data["n_store"]), 712),
-                      int(meta["nmax"]))
+    features = Features(int(data["n_item"]), int(data["n_store"]), 712,
+                        include_recency=False)
+    batcher = Batcher(data, features, int(meta["nmax"]), include_recency=False)
     output = args.output if args.output.is_absolute() else ROOT / args.output
     output.parent.mkdir(parents=True, exist_ok=True)
     screen_levels = [args.screen_level, args.confirm_level,
@@ -219,7 +221,7 @@ def main() -> None:
     confirm_trips = population[chosen_index]
     confirm_observed, q9 = collect_size_law(
         model, batcher, confirm_trips,
-        rule(model, args.rank, args.confirm_level), args.chunk,
+        smolyak_rule(model, args.rank, args.confirm_level), args.chunk,
         f"tail-q{args.confirm_level}")
     confirm_output = output.with_name(output.stem + "_confirm_per_trip.npz")
     np.savez_compressed(
@@ -270,7 +272,7 @@ def main() -> None:
     calibration_trips = population[calibration_index]
     calibration_observed, calibration_q9 = collect_size_law(
         model, batcher, calibration_trips,
-        rule(model, args.rank, args.confirm_level), args.chunk,
+        smolyak_rule(model, args.rank, args.confirm_level), args.chunk,
         f"calibration-q{args.confirm_level}")
     calibration_q9_tail = np.exp(calibration_q9[:, 59:]).sum(1)
     calibration_q8_tail = q8_tail[calibration_index]
@@ -313,6 +315,9 @@ def main() -> None:
     }
     result = {
         "checkpoint": str(checkpoint), "split": args.split,
+        "checkpoint_sha256": file_sha256(checkpoint),
+        "data_fingerprint_sha256": blob["data_fingerprint_sha256"],
+        "trained_capabilities": blob["trained_capabilities"],
         "full_population_contexts": int(full_population_size),
         "screened_complete_population": bool(len(population) == full_population_size),
         "support": "1..120", "rank": args.rank,
@@ -349,8 +354,8 @@ def main() -> None:
             "and an explicit error envelope. Failure blocks production certification "
             "but preserves resumable state."),
     }
-    output.write_text(json.dumps(result, indent=2) + "\n")
-    print(json.dumps(result, indent=2))
+    output.write_text(strict_json_dumps(result))
+    print(strict_json_dumps(result), end="")
     if not result["passed"]:
         raise SystemExit(2)
 

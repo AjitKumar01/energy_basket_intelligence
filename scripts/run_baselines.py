@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 import argparse
-import fcntl
 import os
 import shlex
 import subprocess
 import sys
 from pathlib import Path
+
+from file_lock import acquire_process_lock
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -34,17 +35,11 @@ def acquire_single_runner_lock(profile: str):
     """Prevent concurrent baseline drivers from writing the same checkpoints."""
     lock_path = ROOT / "artifacts" / f"baselines_{profile}.lock"
     lock_path.parent.mkdir(parents=True, exist_ok=True)
-    stream = lock_path.open("a+")
     try:
-        fcntl.flock(stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except BlockingIOError as error:
+        return acquire_process_lock(lock_path)
+    except RuntimeError as error:
         raise SystemExit(
             f"another {profile} baseline driver holds {lock_path}") from error
-    stream.seek(0)
-    stream.truncate()
-    stream.write(f"pid={os.getpid()}\n")
-    stream.flush()
-    return stream
 
 
 def run(command, environment, dry_run=False):

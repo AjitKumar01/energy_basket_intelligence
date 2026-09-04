@@ -20,19 +20,20 @@ downward safety projection and must pass the independent downstream audits.
 from __future__ import annotations
 
 import argparse
-import json
 from pathlib import Path
 
 import numpy as np
 import torch
 from scipy.special import logsumexp
+from scipy.stats import norm
 
-from audit_particle_counterfactual_generation import ROOT, load_checkpoint
+from checkpoint_io import ROOT, load_checkpoint
 from audit_population_size import resumable_screen, screen_signature
 from data import build
 from features import Features
 from fit import Batcher
-from fit_interaction_particles import supported_trips
+from pipeline_support import supported_trips
+from provenance import file_sha256, strict_json_dumps
 
 
 torch.set_default_dtype(torch.float64)
@@ -122,8 +123,8 @@ def residual_diagnostics(log_probability: np.ndarray, observed: np.ndarray,
         sign_agreement = float(np.mean(
             np.sign(fold_sum[eligible, 0]) == np.sign(fold_sum[eligible, 1])))
     else:
-        correlation = float("nan")
-        sign_agreement = float("nan")
+        correlation = None
+        sign_agreement = None
     return {
         "observed_size_mean": float(observed.mean()),
         "parent_expected_size_mean": float(expected.mean()),
@@ -205,7 +206,7 @@ def seed_population_cache(checkpoint: Path, population_output: Path,
         "completed_contexts": len(population), "complete": True,
     }
     Path(str(prefix) + ".progress.json").write_text(
-        json.dumps(progress, indent=2) + "\n")
+        strict_json_dumps(progress))
     return str(prefix)
 
 
@@ -242,7 +243,9 @@ def main() -> None:
     data = build()
     checkpoint = args.checkpoint if args.checkpoint.is_absolute() \
         else ROOT / args.checkpoint
-    model, blob, meta = load_checkpoint(checkpoint, data)
+    model, blob, meta = load_checkpoint(
+        checkpoint, data,
+        required_capabilities=("conditional_nonempty_incidence", "gram_interactions"))
     if not model.household_size_rank1:
         raise RuntimeError(
             "checkpoint does not use the identified rank-one household-size coordinate")
@@ -251,9 +254,9 @@ def main() -> None:
         raise ValueError("contexts must be nonnegative")
     if args.contexts:
         population = population[:min(args.contexts, len(population))]
-    batcher = Batcher(
-        data, Features(int(data["n_item"]), int(data["n_store"]), 712),
-        int(meta["nmax"]))
+    features = Features(int(data["n_item"]), int(data["n_store"]), 712,
+                        include_recency=False)
+    batcher = Batcher(data, features, int(meta["nmax"]), include_recency=False)
     report_path = args.report if args.report.is_absolute() else ROOT / args.report
     report_path.parent.mkdir(parents=True, exist_ok=True)
     levels = [args.screen_level, args.screen_level + 1, args.screen_level + 2]
@@ -267,6 +270,7 @@ def main() -> None:
     diagnostics = residual_diagnostics(
         base_log_probability, observed, household, fold, n_household)
     audit = []
+    simultaneous_critical = float(norm.ppf(1.0 - 0.025 / len(args.ridge_grid)))
     for ridge in args.ridge_grid:
         kappa_0 = solve_households(
             base_log_probability, observed, household,
@@ -292,7 +296,8 @@ def main() -> None:
             "gain_se_method": "household_cluster_robust",
             "gain_trip_naive_se": float(
                 heldout.std(ddof=1) / np.sqrt(len(heldout))),
-            "gain_lcb95": float(heldout.mean() - 1.96 * cluster_se),
+            "gain_lcb95_nominal": float(heldout.mean() - 1.96 * cluster_se),
+            "gain_lcb95": float(heldout.mean() - simultaneous_critical * cluster_se),
             "fold_0_gain": float(gain_0.mean()),
             "fold_1_gain": float(gain_1.mean()),
         })
@@ -331,6 +336,9 @@ def main() -> None:
     result = {
         "method": "identified_rank_one_household_common_utility",
         "parent": str(checkpoint),
+        "parent_sha256": file_sha256(checkpoint),
+        "data_fingerprint_sha256": blob["data_fingerprint_sha256"],
+        "trained_capabilities": blob["trained_capabilities"],
         "output": str(args.output if args.output.is_absolute() else ROOT / args.output),
         "status": (
             "incremental_correction_applied" if correction_supported else
@@ -345,6 +353,12 @@ def main() -> None:
         "parent_rank1_kappa_abs_max": float(np.abs(parent_kappa).max()),
         "parent_residual_diagnostics": diagnostics,
         "crossfit_ridge_audit": audit,
+        "ridge_selection_inference": {
+            "method": "two-sided Bonferroni simultaneous normal bound",
+            "familywise_confidence": 0.95,
+            "candidate_ridges": len(args.ridge_grid),
+            "critical_value": simultaneous_critical,
+        },
         "selected_ridge": selected["ridge"],
         "proposed_ridge": selected["ridge"],
         "applied_ridge": selected["ridge"] if correction_supported else None,
@@ -353,8 +367,8 @@ def main() -> None:
         "selected_crossfit_gain_lcb95": selected["gain_lcb95"],
         "minimum_required_crossfit_gain": args.minimum_crossfit_gain,
         "full_fit_gain": float(final_gain.mean()),
-        "full_fit_gain_se": float(
-            final_gain.std(ddof=1) / np.sqrt(len(final_gain))),
+        "full_fit_gain_se": household_cluster_se(final_gain, household),
+        "full_fit_gain_se_method": "household_cluster_robust",
         "screen_tail_cap": args.screen_tail_cap,
         "capped_households": int(np.isfinite(upper_bound).sum()),
         "kappa_quantiles": np.quantile(
@@ -375,8 +389,8 @@ def main() -> None:
             "and population confirmation remain mandatory."),
     }
     if not correction_supported and args.on_crossfit_failure == "error":
-        report_path.write_text(json.dumps(result, indent=2) + "\n")
-        print(json.dumps(result, indent=2), flush=True)
+        report_path.write_text(strict_json_dumps(result))
+        print(strict_json_dumps(result), end="", flush=True)
         raise RuntimeError(
             "incremental rank-one recalibration was unsupported; diagnostic report written")
 
@@ -414,8 +428,8 @@ def main() -> None:
         tilted, observed)
     result["output"] = str(output)
     result["final_population_cache_prefix"] = cache_prefix
-    report_path.write_text(json.dumps(result, indent=2) + "\n")
-    print(json.dumps(result, indent=2), flush=True)
+    report_path.write_text(strict_json_dumps(result))
+    print(strict_json_dumps(result), end="", flush=True)
 
 
 if __name__ == "__main__":

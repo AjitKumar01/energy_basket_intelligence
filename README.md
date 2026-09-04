@@ -62,6 +62,9 @@ unobserved large-basket clique phase. Narrow two-item groups retain the original
 The evidence and decision rule are in [`paper/PIPELINE.md`](paper/PIPELINE.md). The full
 model derivation is in [`paper/THEORY.md`](paper/THEORY.md), and estimator details are in
 [`paper/ESTIMATOR.md`](paper/ESTIMATOR.md).
+The executable architecture, stage and artifact graph, active-versus-experimental module
+map, and current implementation issue register are in
+[`paper/CODEBASE_ARCHITECTURE.md`](paper/CODEBASE_ARCHITECTURE.md).
 Stage-wise interruption recovery, checkpoint prerequisites, cross-machine transfer and
 all `--start-at` commands are documented in
 [`paper/STAGEWISE_RESURRECTION.md`](paper/STAGEWISE_RESURRECTION.md).
@@ -105,7 +108,14 @@ costs and a 28-day promotion budget. Every one of the 60,459 supported baskets i
 have no numerical-integration error. Synthetic results validate recovery under declared
 truth; they do not replace real held-out evaluation or randomized commercial trials.
 
-## Current empirical status
+## Historical empirical status and current certification state
+
+The numerical results below were produced by commit `06b49ad`, before the artifact-
+lineage and simultaneous ridge-selection corrections on the
+`architecture-hardening-cleanup` branch. They remain evidence about the Version-4 model,
+but they are not a certification of the hardened executable pipeline. The model law and
+estimators were not changed by the cleanup. A new full-data execution is required before
+these numbers can be relabelled as current-pipeline results.
 
 The rank-one pipeline has completed from fresh initialization. It selected rank 5 and, on
 locked 4,096-trip panels, improves over its matched exact additive parent by
@@ -296,7 +306,7 @@ After a stage has completed, resume at the next stage:
 
 | Last completed work | Files that must be retained | Recovery command |
 |---|---|---|
-| Derived data | `data/`, `basket_input/` | `--start-at initialize` |
+| Derived data | `data/`, `basket_input/`, including `data/build_meta.json` and `basket_input/model_data_fingerprint.json` | `--start-at initialize` |
 | Initialization | `artifacts/initialization.pt` | `--start-at additive` |
 | Additive convergence | initialization plus `out/v3_pipeline_additive_{best,}.pt` | `--start-at rank` |
 | Rank selection | additive files plus `artifacts/interaction_basis_rank8.{npz,json}` | `--start-at interaction` |
@@ -326,15 +336,26 @@ affinity/cache layer, and compiles the native extension for the current machine.
 `--start-at`; rebuild first with `--from-raw --stop-after data`, restore the checkpoints,
 and then issue the recovery command.
 
+The data stage writes one content-addressed identity to
+`basket_input/model_data_fingerprint.json`. It covers the audited source/derived hashes,
+declared price basis, training-only affinity partition and ragged model index. Every new
+initialization, fitted checkpoint and evaluation report records this identity. Recovery
+rejects missing or different identities even when array dimensions happen to match.
+Artifacts made before this contract do not contain enough evidence to be migrated safely;
+rebuild the data and restart at initialization once when adopting this branch.
+
 Before spending compute, the driver checks:
 
 - initialization/checkpoint lineage and initialization digest;
+- exact model-data and price-basis fingerprint equality;
 - whether additive convergence actually completed;
 - full-versus-smoke profile compatibility;
 - whether the rank basis came from the restored additive iteration;
+- the rank-basis content hash recorded in its report;
 - the candidate format and active interaction rank;
-- completion of the household-size stage; and
-- presence, readability, and likelihood certification of reused evaluation outputs.
+- completion of the household-size stage;
+- presence, readability, and likelihood certification of reused evaluation outputs; and
+- exact candidate hashes on every evaluation report and the segment-assignment hash.
 
 Checkpoint files created on another computer may contain its old absolute initialization
 path. The loader now relocates that reference to `artifacts/initialization.pt` in the new
@@ -379,6 +400,8 @@ used for reporting results.
 | Path | Meaning |
 |---|---|
 | `artifacts/pipeline.log` | complete console log when invoked with `tee` as above |
+| `data/build_meta.json` | explicit price-basis declaration produced with the derived data |
+| `basket_input/model_data_fingerprint.json` | immutable content identity required by all checkpoints and reports |
 | `out/v3_pipeline_additive.log` | exact additive optimizer log |
 | `out/v3_pipeline_additive.pt` | latest additive state used only for interruption recovery |
 | `out/v3_pipeline_additive_best.pt` | best additive parent |

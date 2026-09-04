@@ -10,7 +10,6 @@ TV, and moment diagnostics at size, commodity, item, and commodity-pair levels.
 from __future__ import annotations
 
 import argparse
-import json
 import math
 import time
 from itertools import combinations
@@ -24,16 +23,15 @@ from sklearn.metrics import adjusted_rand_score, silhouette_score
 from sklearn.preprocessing import StandardScaler
 from torch.nn.functional import softplus
 
-from audit_particle_counterfactual_generation import (ROOT, copied_context,
-                                                       load_checkpoint,
-                                                       named_basket,
-                                                       particle_delta)
+from checkpoint_io import ROOT, load_checkpoint
 from data import build
 from features import Features
 from fit import Batcher
 from interaction_particles import (blocked_rejuvenation,
                                    rao_blackwell_particle_statistics)
+from pipeline_support import copied_context, named_basket, particle_delta
 from tempered_ais import annealed_smc_logz
+from provenance import file_sha256, strict_json_dumps
 
 
 torch.set_default_dtype(torch.float64)
@@ -372,7 +370,9 @@ def main():
     torch.set_num_threads(args.threads)
     data = build()
     ckpt = args.ckpt if args.ckpt.is_absolute() else ROOT / args.ckpt
-    model, blob, meta = load_checkpoint(ckpt, data)
+    model, blob, meta = load_checkpoint(
+        ckpt, data,
+        required_capabilities=("conditional_nonempty_incidence", "gram_interactions"))
     representation, taste, price = household_representation(model)
     labels, count, selection, centers = choose_segments(
         representation, args.candidate_segments, args.seed)
@@ -403,9 +403,9 @@ def main():
         minlength=int(data["n_user"]))
     mean_beta = beta.mean(0)
     price_coefficient = gamma @ mean_beta * float(softplus(model.price_kappa.detach()))
-    batcher = Batcher(
-        data, Features(int(data["n_item"]), int(data["n_store"]), 712),
-        model.nmax)
+    features = Features(int(data["n_item"]), int(data["n_store"]), 712,
+                        include_recency=False)
+    batcher = Batcher(data, features, model.nmax, include_recency=False)
     rng = np.random.default_rng(args.seed + 1)
     segments = []
     for segment in range(count):
@@ -445,13 +445,18 @@ def main():
     np.savez_compressed(assignments, household=np.arange(len(labels)), segment=labels,
                         representation=representation, taste=taste, price=price,
                         centers=centers)
+    assignments_digest = file_sha256(assignments)
     output = {
         "checkpoint": str(ckpt), "checkpoint_iteration": int(blob["iter"]),
+        "checkpoint_sha256": file_sha256(ckpt),
+        "data_fingerprint_sha256": blob["data_fingerprint_sha256"],
+        "trained_capabilities": blob["trained_capabilities"],
         "method": ("KMeans on separately standardized, equal-block-weighted, "
                    "rotation-invariant household taste and price surfaces"),
         "test_leakage": False,
         "chosen_segments": count, "candidate_selection": selection,
         "assignments": str(assignments),
+        "assignments_sha256": assignments_digest,
         "distribution_metrics": (
             "symmetric Dirichlet total prior mass 1; KL in nats; JS and TV reported; "
             "all eligible segment test baskets form the real reference; observed and "
@@ -459,7 +464,7 @@ def main():
         "segments": segments,
     }
     output_path = args.output if args.output.is_absolute() else ROOT / args.output
-    output_path.write_text(json.dumps(output, indent=2) + "\n")
+    output_path.write_text(strict_json_dumps(output))
     summary = {
         "checkpoint": output["checkpoint"],
         "chosen_segments": output["chosen_segments"],
@@ -471,7 +476,7 @@ def main():
         } for segment in output["segments"]],
         "full_report": str(output_path),
     }
-    print(json.dumps(summary, indent=2))
+    print(strict_json_dumps(summary), end="")
 
 
 if __name__ == "__main__":

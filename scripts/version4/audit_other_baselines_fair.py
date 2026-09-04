@@ -5,6 +5,7 @@ import json
 import math
 import os
 import time
+from pathlib import Path
 
 import numpy as np
 import torch
@@ -13,6 +14,8 @@ from baselines import Batches, Bernoulli, DPP
 from baselines2 import Multinomial, NDPP, Shopper, size_law
 from data import build
 from features import Features
+from provenance import (file_sha256, load_data_fingerprint,
+                        strict_json_dumps)
 
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -70,7 +73,8 @@ def require(ok, message):
         raise RuntimeError(message)
 
 
-def model_from_checkpoint(name, path, data, iteration, require_converged):
+def model_from_checkpoint(name, path, data, iteration, require_converged,
+                          data_fingerprint):
     blob = torch.load(path, map_location="cpu", weights_only=False)
     require(blob.get("format") == 3 and blob.get("kind") == "verified-basket-baseline",
             f"{name}: checkpoint has no verified provenance")
@@ -93,6 +97,8 @@ def model_from_checkpoint(name, path, data, iteration, require_converged):
                 f"{name}: certificate does not select this checkpoint")
     require(md.get("affinity") == "1" and int(md["n_item"]) == 5455,
             f"{name}: wrong data universe")
+    require(blob.get("data_fingerprint_sha256") == data_fingerprint,
+            f"{name}: checkpoint belongs to a different audited dataset")
     J, N, S = (int(data[k]) for k in ("n_item", "n_user", "n_store"))
     common = dict(K=cfg["K"], Kp=cfg["Kp"], seed=cfg["seed"],
                   taste_init=cfg["taste_init"])
@@ -191,8 +197,17 @@ def main(args):
     require(os.environ.get("V3_AFFINITY") == "1", "set V3_AFFINITY=1")
     data = build()
     root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+    data_fingerprint = load_data_fingerprint(
+        root, verify_files=True)["fingerprint_sha256"]
     full_path = (args.full_per_trip if os.path.isabs(args.full_per_trip)
                  else os.path.join(root, args.full_per_trip))
+    full_report_path = (args.full_report if os.path.isabs(args.full_report)
+                        else os.path.join(root, args.full_report))
+    full_report = json.loads(Path(full_report_path).read_text())
+    require(full_report.get("data_fingerprint_sha256") == data_fingerprint,
+            "full-model score report belongs to a different audited dataset")
+    require(full_report.get("per_trip_sha256") == file_sha256(full_path),
+            "full-model per-trip scores fail their report content digest")
     full = np.load(full_path)
     required_arrays = {"trips", "lines", args.full_key}
     require(required_arrays.issubset(full.files),
@@ -213,6 +228,8 @@ def main(args):
     batcher = Batches(data, Features(int(data["n_item"]), int(data["n_store"]), 712))
 
     result = dict(schema=2, created_unix=time.time(), iteration=args.iteration,
+                  data_fingerprint_sha256=data_fingerprint,
+                  full_checkpoint_sha256=full_report.get("checkpoint_sha256"),
                   split=args.split, full_score_key=args.full_key,
                   manifest=dict(n=len(trips), sha256=hash_ids(trips), ids=trips.tolist()),
                   checkpoint_kind=args.checkpoint_kind,
@@ -225,7 +242,8 @@ def main(args):
         path = os.path.join(
             OUT, f"baseline_verified_{name}{suffix}{best_suffix}.pt")
         model, blob = model_from_checkpoint(
-            name, path, data, args.iteration, args.require_converged)
+            name, path, data, args.iteration, args.require_converged,
+            data_fingerprint)
         print(f"[other] scoring {name}", flush=True)
         values, got_lines = score(model, name, batcher, trips,
                                   args.bernoulli_chunk if name == "bernoulli" else args.chunk,
@@ -266,14 +284,14 @@ def main(args):
     stem = args.output if os.path.isabs(args.output) else os.path.join(root, args.output)
     os.makedirs(os.path.dirname(stem), exist_ok=True)
     np.savez_compressed(stem + "_per_trip.npz", **arrays)
-    with open(stem + ".json", "w") as stream:
-        json.dump(result, stream, indent=2)
+    Path(stem + ".json").write_text(strict_json_dumps(result))
     print(f"[other] wrote {stem}.json", flush=True)
 
 
 if __name__ == "__main__":
     p = argparse.ArgumentParser()
     p.add_argument("--full-per-trip", default="reports/likelihood_test_per_trip.npz")
+    p.add_argument("--full-report", default="reports/likelihood_test.json")
     p.add_argument("--full-key", default="target_child")
     p.add_argument("--split", choices=("validation", "test"), default="validation")
     p.add_argument("--iteration", type=int, default=400)

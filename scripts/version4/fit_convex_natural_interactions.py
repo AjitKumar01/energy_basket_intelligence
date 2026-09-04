@@ -29,11 +29,12 @@ import numpy as np
 import torch
 from scipy.special import logsumexp
 
-from audit_particle_counterfactual_generation import ROOT, load_checkpoint
+from checkpoint_io import ROOT, load_checkpoint
 from data import build
 from features import Features
 from fit import Batcher
-from fit_interaction_particles import supported_trips
+from pipeline_support import supported_trips
+from provenance import file_sha256, strict_json_dumps
 from tempered_block_gibbs import conditional_slots_repeated
 
 
@@ -269,11 +270,21 @@ def main() -> None:
     data = build()
     parent_path = args.parent if args.parent.is_absolute() else ROOT / args.parent
     spectral_path = args.spectral if args.spectral.is_absolute() else ROOT / args.spectral
-    model, parent_blob, meta = load_checkpoint(parent_path, data)
+    model, parent_blob, meta = load_checkpoint(
+        parent_path, data,
+        required_capabilities=("conditional_nonempty_incidence",))
     if float(model.phi.abs().max()) != 0.0:
         raise RuntimeError("natural-parameter proposal must be a Phi=0 additive parent")
     basis_np, keep_count = spectral_basis(
         spectral_path, args.rank, args.score_mass)
+    spectral_report = json.loads(spectral_path.with_suffix(".json").read_text())
+    if spectral_report.get("basis_sha256") != file_sha256(spectral_path):
+        raise RuntimeError("spectral basis failed its report content digest")
+    if spectral_report.get("parent_sha256") != file_sha256(parent_path):
+        raise RuntimeError("spectral basis was not built from this additive checkpoint")
+    if spectral_report.get("data_fingerprint_sha256") != parent_blob.get(
+            "data_fingerprint_sha256"):
+        raise RuntimeError("spectral basis and additive checkpoint data differ")
     basis = torch.as_tensor(basis_np, dtype=model.phi.dtype)
 
     population = supported_trips(data, 0, int(meta["nmax"]))
@@ -288,9 +299,9 @@ def main() -> None:
     width = args.rank * args.rank + 2
     observed = np.empty((context_count, width), dtype=np.float64)
     draws = np.empty((context_count, args.draws, width), dtype=np.float64)
-    batcher = Batcher(
-        data, Features(int(data["n_item"]), int(data["n_store"]), 712),
-        int(meta["nmax"]))
+    features = Features(int(data["n_item"]), int(data["n_store"]), 712,
+                        include_recency=False)
+    batcher = Batcher(data, features, int(meta["nmax"]), include_recency=False)
     generator = torch.Generator().manual_seed(args.seed + 1)
     for start in range(0, context_count, args.batch):
         sub = trips[start:start + args.batch]
@@ -365,7 +376,10 @@ def main() -> None:
         "method": "constrained_common_random_number_monte_carlo_mle",
         "parent": str(parent_path),
         "parent_iteration": int(parent_blob["iter"]),
+        "parent_sha256": file_sha256(parent_path),
+        "data_fingerprint_sha256": parent_blob["data_fingerprint_sha256"],
         "spectral": str(spectral_path),
+        "spectral_sha256": file_sha256(spectral_path),
         "contexts": context_count,
         "draws_per_context": args.draws,
         "rank": args.rank,
@@ -398,8 +412,8 @@ def main() -> None:
     }
     output = args.output if args.output.is_absolute() else ROOT / args.output
     report_path = output.with_suffix(".json")
-    report_path.write_text(json.dumps(result, indent=2) + "\n")
-    print(json.dumps(result, indent=2))
+    report_path.write_text(strict_json_dumps(result))
+    print(strict_json_dumps(result), end="")
     if not accepted:
         raise RuntimeError("natural-parameter candidate failed cross-fit or ESS gate")
 
@@ -418,16 +432,27 @@ def main() -> None:
         "estimator": "constrained_crn_monte_carlo_mle_version4_natural_block",
         "iter": 0,
         "model": model.state_dict(),
+        "fresh_artifact_digest": parent_blob["fresh_artifact_digest"],
+        "data_fingerprint_sha256": parent_blob["data_fingerprint_sha256"],
         "config": {**parent_blob["config"],
                    "artifact": parent_blob["config"]["artifact"]},
         "parent": str(parent_path),
         "parent_iteration": int(parent_blob["iter"]),
+        "parent_sha256": file_sha256(parent_path),
+        "spectral_sha256": file_sha256(spectral_path),
         "active_rank": int(phi.shape[1]),
         "interaction_products": keep_count,
         "best_validation": None,
         "best_iteration": 0,
         "evaluations": [],
         "records": [],
+        "trained_capabilities": {
+            "conditional_nonempty_incidence": True,
+            "gram_interactions": True,
+            "recency": False,
+            "quantities": False,
+            "arrival_or_null_basket": False,
+        },
         "natural_mcle_report": str(report_path),
     }
     atomic_save(output, payload)

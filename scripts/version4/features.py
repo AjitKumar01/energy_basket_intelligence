@@ -48,8 +48,9 @@ def log(m):
 class Features:
     """Panels held once, gathered per batch."""
 
-    def __init__(self, n_item, n_store, n_day, device=None):
+    def __init__(self, n_item, n_store, n_day, device=None, include_recency=True):
         self.J, self.S, self.D = n_item, n_store, n_day
+        self.include_recency = bool(include_recency)
         self.dev = torch.from_numpy(
             np.load(os.path.join(BI, "log_price_dev.npy")).astype(np.float32))
         log(f"price deviation panel {tuple(self.dev.shape)}, "
@@ -69,13 +70,18 @@ class Features:
         log(f"store price deviations: {len(key):,} cells "
             f"({len(key) / (n_item * n_store * 52):.2%} of the grid)")
 
-        st = np.load(os.path.join(BI, "state.npz"))
-        self.st_keys = torch.from_numpy(st["keys"])
-        self.item_sub = torch.from_numpy(st["item_sub"].astype(np.int64))
-        self.sub_gap = torch.from_numpy(st["sub_gap"])
-        self.n_sub = int(self.item_sub.max()) + 1
-        log(f"recency: {len(self.st_keys):,} purchase events over {self.n_sub} "
-            f"sub-commodities; median gap {float(self.sub_gap.median()):.1f} days")
+        if self.include_recency:
+            st = np.load(os.path.join(BI, "state.npz"))
+            self.st_keys = torch.from_numpy(st["keys"])
+            self.item_sub = torch.from_numpy(st["item_sub"].astype(np.int64))
+            self.sub_gap = torch.from_numpy(st["sub_gap"])
+            self.n_sub = int(self.item_sub.max()) + 1
+            log(f"recency: {len(self.st_keys):,} purchase events over {self.n_sub} "
+                f"sub-commodities; median gap {float(self.sub_gap.median()):.1f} days")
+        else:
+            self.st_keys = self.item_sub = self.sub_gap = None
+            self.n_sub = 0
+            log("recency disabled by the fitted feature contract")
 
         pr = np.load(os.path.join(BI, "promo.npz"))
         self.promo_week_min = int(pr["coverage_min_week"])
@@ -105,6 +111,8 @@ class Features:
         This is the block version 2 measures as its largest single ablation, and it was the
         largest thing missing here.
         """
+        if not self.include_recency:
+            raise RuntimeError("recency was not loaded for this feature contract")
         sub = self.item_sub[item]
         group = user.to(torch.int64) * self.n_sub + sub
         key = group * 1024 + day

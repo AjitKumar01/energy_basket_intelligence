@@ -1,5 +1,13 @@
 # Certified rank-one pipeline result
 
+> **Historical result boundary (4 September 2026).** These results were produced by
+> commit `06b49ad`. They predate the data-fingerprint, content-addressed report lineage,
+> validation-only acceptance, and simultaneous ridge-selection corrections introduced on
+> `architecture-hardening-cleanup`. They remain a frozen record of that execution, not a
+> certification result for the hardened pipeline. The Version-4 probability law was not
+> changed; the hardened pipeline must be run on the full data before a new certified
+> headline replaces this one.
+
 ## 1. Scope and lineage
 
 This document records the completed result of the selected Version-4 pipeline on the

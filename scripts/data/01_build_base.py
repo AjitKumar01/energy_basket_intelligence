@@ -30,6 +30,7 @@ Outputs (parquet, in ../data):
                         promo_depth, n_tx, n_store
     price_store_week.parquet  product x store x week panel: price, base_price, n_tx
 """
+import json
 import os
 import numpy as np
 import pandas as pd
@@ -208,6 +209,13 @@ def main():
     trips.to_parquet(os.path.join(OUT, "trips.parquet"), index=False)
     pw.to_parquet(os.path.join(OUT, "price_week.parquet"), index=False)
     psw.to_parquet(os.path.join(OUT, "price_store_week.parquet"), index=False)
+    with open(os.path.join(OUT, "build_meta.json"), "w") as stream:
+        json.dump({
+            "schema_version": 1,
+            "price_basis": basis,
+            "unit_price_source_column": f"{basis}_price",
+        }, stream, indent=2)
+        stream.write("\n")
     log("wrote tx / trips / price_week / price_store_week parquet")
 
 

@@ -233,9 +233,8 @@ the raw files, or fit a model.
 Use the smoke profile before committing a long full fit:
 
 ~~~bash
-git clone --branch version4-household-size-rank1 --single-branch \
-  https://github.com/AjitKumar01/nf_dunnhumby.git
-cd nf_dunnhumby
+git clone https://github.com/AjitKumar01/energy_basket_intelligence.git
+cd energy_basket_intelligence
 python --version  # must report 3.11 or newer
 python -m venv .venv
 source .venv/bin/activate
@@ -272,27 +271,79 @@ If `data/` and `basket_input/` already exist:
 python scripts/run_pipeline.py 2>&1 | tee artifacts/pipeline.log
 ```
 
-If the machine stops during the exact-additive stage, continue the same from-scratch run
-without resetting Adam or replaying minibatches:
+## Recovering a partial pipeline
+
+There are two different recovery operations:
+
+- **Continue an interrupted additive optimizer:** restore its latest model, Adam state,
+  learning-rate scheduler, validation history, and minibatch stream.
+- **Start after a completed stage:** validate its artifacts and execute only the remaining
+  pipeline suffix.
+
+If the machine stops during exact-additive training, resume from the latest checkpoint,
+not the best-validation checkpoint:
 
 ```bash
-python scripts/run_pipeline.py --resume-additive out/v3_pipeline_additive.pt \
+python scripts/run_pipeline.py --profile full --start-at additive \
+  --resume-additive out/v3_pipeline_additive.pt \
   2>&1 | tee -a artifacts/pipeline.log
 ```
 
-After a stage has completed, skip it with `--start-at`. For example:
+If `--start-at` is omitted here, `--resume-additive` automatically selects the additive
+stage. The explicit command is preferable in production scripts.
+
+After a stage has completed, resume at the next stage:
+
+| Last completed work | Files that must be retained | Recovery command |
+|---|---|---|
+| Derived data | `data/`, `basket_input/` | `--start-at initialize` |
+| Initialization | `artifacts/initialization.pt` | `--start-at additive` |
+| Additive convergence | initialization plus `out/v3_pipeline_additive_{best,}.pt` | `--start-at rank` |
+| Rank selection | additive files plus `artifacts/interaction_basis_rank8.{npz,json}` | `--start-at interaction` |
+| Final fitted model | initialization, additive files, `artifacts/candidate.json`, `artifacts/candidate_rank1.pt`, and spectral basis | `--start-at evaluation` |
+| Evaluations | initialization, final candidate, evaluation JSON files, and `artifacts/customer_segments.npz` | `--start-at certification` |
+
+The brace shorthand `v3_pipeline_additive_{best,}.pt` means both
+`v3_pipeline_additive_best.pt` and `v3_pipeline_additive.pt`. The best checkpoint supplies
+the fitted parent; the latest checkpoint proves that the full convergence rule completed.
+
+Examples:
 
 ```bash
-python scripts/run_pipeline.py --start-at rank 2>&1 | tee -a artifacts/pipeline.log
-python scripts/run_pipeline.py --start-at interaction 2>&1 | tee -a artifacts/pipeline.log
-python scripts/run_pipeline.py --start-at evaluation 2>&1 | tee -a artifacts/pipeline.log
-python scripts/run_pipeline.py --start-at certification 2>&1 | tee -a artifacts/pipeline.log
+python scripts/run_pipeline.py --profile full --start-at rank \
+  2>&1 | tee -a artifacts/pipeline.log
+python scripts/run_pipeline.py --profile full --start-at interaction \
+  2>&1 | tee -a artifacts/pipeline.log
+python scripts/run_pipeline.py --profile full --start-at evaluation \
+  2>&1 | tee -a artifacts/pipeline.log
+python scripts/run_pipeline.py --profile full --start-at certification \
+  2>&1 | tee -a artifacts/pipeline.log
 ```
 
-The driver validates the required checkpoint lineage, convergence state, active rank and
-full/smoke profile before spending compute. See the
-[stage-wise recovery guide](paper/STAGEWISE_RESURRECTION.md) before copying artifacts from
-another machine.
+Every recovery still audits the raw and derived data, reconstructs the deterministic
+affinity/cache layer, and compiles the native extension for the current machine. Set
+`NF_RAW_DIR` even when starting at a later stage. Do not combine `--from-raw` with a later
+`--start-at`; rebuild first with `--from-raw --stop-after data`, restore the checkpoints,
+and then issue the recovery command.
+
+Before spending compute, the driver checks:
+
+- initialization/checkpoint lineage and initialization digest;
+- whether additive convergence actually completed;
+- full-versus-smoke profile compatibility;
+- whether the rank basis came from the restored additive iteration;
+- the candidate format and active interaction rank;
+- completion of the household-size stage; and
+- presence, readability, and likelihood certification of reused evaluation outputs.
+
+Checkpoint files created on another computer may contain its old absolute initialization
+path. The loader now relocates that reference to `artifacts/initialization.pt` in the new
+clone. Preserve repository-relative artifact names when copying files. Learned artifacts
+are ignored by Git and must be transferred separately through approved storage.
+
+See [Stage-wise recovery and checkpoint portability](paper/STAGEWISE_RESURRECTION.md) for
+the complete file lists, `rsync` example, validation rules, failure interpretation, and
+recovery decision table.
 
 The full profile has a 30,000-update safety ceiling but must satisfy the convergence gate;
 reaching that ceiling is a nonzero pipeline failure and no interaction/evaluation stage is
@@ -301,9 +352,19 @@ then allowed to run.
 To stop after a stage:
 
 ```bash
+python scripts/run_pipeline.py --stop-after data
+python scripts/run_pipeline.py --stop-after initialize
 python scripts/run_pipeline.py --stop-after additive
 python scripts/run_pipeline.py --stop-after rank
+python scripts/run_pipeline.py --stop-after interaction
 python scripts/run_pipeline.py --stop-after evaluation
+```
+
+`--start-at` and `--stop-after` can be combined to execute one stage deliberately:
+
+```bash
+python scripts/run_pipeline.py --profile full \
+  --start-at evaluation --stop-after evaluation
 ```
 
 `--profile smoke` uses tiny panels, starts with a maximum basis rank of 4, and relaxes
@@ -319,6 +380,7 @@ used for reporting results.
 |---|---|
 | `artifacts/pipeline.log` | complete console log when invoked with `tee` as above |
 | `out/v3_pipeline_additive.log` | exact additive optimizer log |
+| `out/v3_pipeline_additive.pt` | latest additive state used only for interruption recovery |
 | `out/v3_pipeline_additive_best.pt` | best additive parent |
 | `artifacts/interaction_basis_rank*.{npz,json}` | rank audits; rejected ranks remain auditable |
 | `artifacts/candidate.{pt,json}` | interaction candidate before the household-size block update |

@@ -33,13 +33,12 @@ import os
 import numpy as np
 import pandas as pd
 
+from raw_path import resolve_raw_directory
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 DATA = os.path.join(HERE, "..", "..", "data")
 IN = os.path.join(HERE, "..", "..", "basket_input")
-RAW = os.path.join(os.environ.get(
-    "NF_RAW_DIR",
-    os.path.join(HERE, "..", "..", "..", "dunnhumby_The-Complete-Journey",
-                 "dunnhumby_The-Complete-Journey CSV")), "")
+RAW = os.path.join(resolve_raw_directory(), "")
 
 
 def log(m):

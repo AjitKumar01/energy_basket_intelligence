@@ -62,6 +62,10 @@ unobserved large-basket clique phase. Narrow two-item groups retain the original
 The evidence and decision rule are in [`paper/PIPELINE.md`](paper/PIPELINE.md). The full
 model derivation is in [`paper/THEORY.md`](paper/THEORY.md), and estimator details are in
 [`paper/ESTIMATOR.md`](paper/ESTIMATOR.md).
+For a single textbook-style narrative of the complete probability model, the role of the
+price factor \(\beta\), the reason for staged interaction fitting, both appearances of the
+household-size coordinate, and all downstream queries, see
+[`paper/PIPELINE_TEXTBOOK.md`](paper/PIPELINE_TEXTBOOK.md).
 The executable architecture, stage and artifact graph, active-versus-experimental module
 map, and current implementation issue register are in
 [`paper/CODEBASE_ARCHITECTURE.md`](paper/CODEBASE_ARCHITECTURE.md).
@@ -197,8 +201,16 @@ pytest -q
 
 ## Data
 
-Download the dunnhumby CSV bundle and point `NF_RAW_DIR` at the directory containing
-`transaction_data.csv`, `product.csv`, and `causal_data.csv`:
+Download the dunnhumby CSV bundle. The driver automatically recognizes either the usual
+sibling location or this repository-local location:
+
+```text
+dunnhumby_The-Complete-Journey/dunnhumby_The-Complete-Journey CSV/
+```
+
+The repository-local raw-data tree is ignored by Git. To use any other location, point
+`NF_RAW_DIR` at the directory containing `transaction_data.csv`, `product.csv`, and
+`causal_data.csv`:
 
 ```bash
 export NF_RAW_DIR="/absolute/path/to/dunnhumby_The-Complete-Journey CSV/"
@@ -331,10 +343,11 @@ python scripts/run_pipeline.py --profile full --start-at certification \
 ```
 
 Every recovery still audits the raw and derived data, reconstructs the deterministic
-affinity/cache layer, and compiles the native extension for the current machine. Set
-`NF_RAW_DIR` even when starting at a later stage. Do not combine `--from-raw` with a later
-`--start-at`; rebuild first with `--from-raw --stop-after data`, restore the checkpoints,
-and then issue the recovery command.
+affinity/cache layer, and compiles the native extension for the current machine. Keep the
+raw bundle available in an auto-detected location or set `NF_RAW_DIR`, even when starting
+at a later stage. Do not combine `--from-raw` with a later `--start-at`; rebuild first with
+`--from-raw --stop-after data`, restore the checkpoints, and then issue the recovery
+command.
 
 The data stage writes one content-addressed identity to
 `basket_input/model_data_fingerprint.json`. It covers the audited source/derived hashes,

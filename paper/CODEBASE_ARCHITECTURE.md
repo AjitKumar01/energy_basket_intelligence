@@ -1,5 +1,9 @@
 # Codebase architecture and implementation audit
 
+For the model and pipeline as one mathematical narrative, including the staged
+interaction argument and the two household-size updates, read
+[`PIPELINE_TEXTBOOK.md`](PIPELINE_TEXTBOOK.md) alongside this implementation map.
+
 ## 1. Purpose and scope
 
 This document explains how the repository implements the Version-4 energy basket model,

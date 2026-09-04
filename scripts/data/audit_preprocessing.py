@@ -14,15 +14,13 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+from raw_path import resolve_raw_directory
+
 
 ROOT = Path(__file__).resolve().parents[2]
 DATA = ROOT / "data"
 BI = Path(os.environ.get("NF_BASKET_INPUT", ROOT / "basket_input"))
-RAW = Path(os.environ.get(
-    "NF_RAW_DIR",
-    ROOT.parent / "dunnhumby_The-Complete-Journey" /
-    "dunnhumby_The-Complete-Journey CSV",
-))
+RAW = resolve_raw_directory()
 
 EXPECTED_RAW_SHA256 = {
     "transaction_data.csv": "3a685c0729cef664d634486189f774518b84f53cde7cbf701a5963238692b476",

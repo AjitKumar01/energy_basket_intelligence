@@ -20,6 +20,8 @@ ART = ROOT / "artifacts"
 REPORT = ROOT / "reports"
 RAW_DEFAULT = (ROOT.parent / "dunnhumby_The-Complete-Journey" /
                "dunnhumby_The-Complete-Journey CSV")
+RAW_LOCAL = (ROOT / "dunnhumby_The-Complete-Journey" /
+             "dunnhumby_The-Complete-Journey CSV")
 STAGES = ("data", "initialize", "additive", "rank", "interaction",
           "evaluation", "certification")
 
@@ -52,6 +54,16 @@ def current_data_fingerprint(*, dry_run: bool) -> str | None:
 
 def stage_index(stage: str) -> int:
     return STAGES.index(stage)
+
+
+def resolve_raw_directory() -> Path:
+    configured = os.environ.get("NF_RAW_DIR")
+    if configured:
+        return Path(configured).expanduser().resolve()
+    for candidate in (RAW_DEFAULT, RAW_LOCAL):
+        if candidate.is_dir():
+            return candidate.resolve()
+    return RAW_DEFAULT.resolve()
 
 
 def runs_stage(start_at: str, stage: str) -> bool:
@@ -302,7 +314,7 @@ def preflight(*, from_raw: bool, stop_after: str) -> None:
             "missing Python dependencies: " + ", ".join(missing_modules)
             + "; run python -m pip install -r requirements.txt")
 
-    raw = Path(os.environ.get("NF_RAW_DIR", RAW_DEFAULT)).expanduser()
+    raw = resolve_raw_directory()
     missing_raw = [raw / name for name in (
         "transaction_data.csv", "product.csv", "causal_data.csv")
         if not (raw / name).is_file()]
@@ -350,6 +362,7 @@ class Driver:
         self.environment["PYTHONPATH"] = os.pathsep.join(
             [str(native), str(V4)] + ([old] if old else []))
         self.environment["V3_AFFINITY"] = "1"
+        self.environment["NF_RAW_DIR"] = str(resolve_raw_directory())
 
     def run(self, command: list[str], *, allow_failure: bool = False) -> int:
         self.commands.append(command)
@@ -606,6 +619,8 @@ def main() -> None:
                 print(f"[pipeline] convex solve reduced certified basis rank {rank} "
                       f"to active rank {fitted_rank}")
             rank = fitted_rank
+        print("[pipeline] post-interaction size block: retain the additive kappa_h and "
+              "test only a cross-fitted residual household increment", flush=True)
         driver.run(script(
             "fit_household_size_rank1.py",
             "--checkpoint", interaction_candidate,

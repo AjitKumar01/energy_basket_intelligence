@@ -35,13 +35,11 @@ import os
 import numpy as np
 import pandas as pd
 
+from raw_path import resolve_raw_directory
+
 # Raw dunnhumby CSVs.  Defaults to a sibling of the repository; override with
 # NF_RAW_DIR if the download lives somewhere else.
-RAW = os.path.join(os.environ.get(
-    "NF_RAW_DIR",
-    os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "..",
-                 "dunnhumby_The-Complete-Journey",
-                 "dunnhumby_The-Complete-Journey CSV")), "")
+RAW = os.path.join(resolve_raw_directory(), "")
 OUT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "data")
 os.makedirs(OUT, exist_ok=True)
 
@@ -105,7 +103,9 @@ def main():
     #   paid_price     what the shopper actually handed over.  Household specific by
     #                  construction, and <= 0 on 21% of coupon lines, so it is a
     #                  line-level quantity only and never becomes a session price.
-    tx = tx[(tx.QUANTITY > 0) & (tx.SALES_VALUE > 0)]
+    nonpositive = (tx.QUANTITY <= 0) | (tx.SALES_VALUE <= 0)
+    n_nonpositive = int(nonpositive.sum())
+    tx = tx[~nonpositive]
     tx["base_price"] = (tx.SALES_VALUE - tx.RETAIL_DISC - tx.COUPON_MATCH_DISC) / tx.QUANTITY
     tx["loyalty_price"] = (tx.SALES_VALUE - tx.COUPON_MATCH_DISC) / tx.QUANTITY
     tx["paid_price"] = (tx.SALES_VALUE + tx.COUPON_DISC) / tx.QUANTITY
@@ -132,8 +132,10 @@ def main():
     # further lines are float noise at ~1e-16, hence the threshold rather than > 0.
     anom = (tx.RETAIL_DISC > 1e-9) | (tx.COUPON_DISC > 1e-9) | (tx.COUPON_MATCH_DISC > 1e-9)
     bad = ((tx.QUANTITY > 30) | (tx.unit_price > 100) | (tx.unit_price < 0.05) | anom)
-    log(f"dropping {bad.sum():,} of {n0:,} lines (bulk quantity, extreme unit price, "
-        f"or sign-anomalous discount [{int(anom.sum())} lines])")
+    log(f"dropping {n_nonpositive + int(bad.sum()):,} of {n0:,} lines: "
+        f"{n_nonpositive:,} nonpositive quantity/sales; {int(bad.sum()):,} bulk, "
+        f"extreme-price, or sign-anomalous lines "
+        f"[{int(anom.sum())} sign-anomalous]")
     tx = tx[~bad].copy()
 
     # ------------------------------------------------------- calendar handling

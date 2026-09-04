@@ -39,6 +39,28 @@ def test_stage_suffix_contract():
     assert not pipeline.runs_stage("certification", "evaluation")
 
 
+def test_raw_directory_auto_detects_repository_local_bundle(tmp_path, monkeypatch):
+    sibling = tmp_path / "missing-sibling"
+    local = tmp_path / "repository-local"
+    local.mkdir()
+    monkeypatch.delenv("NF_RAW_DIR", raising=False)
+    monkeypatch.setattr(pipeline, "RAW_DEFAULT", sibling)
+    monkeypatch.setattr(pipeline, "RAW_LOCAL", local)
+    assert pipeline.resolve_raw_directory() == local.resolve()
+
+
+def test_explicit_raw_directory_overrides_auto_detection(tmp_path, monkeypatch):
+    explicit = tmp_path / "explicit"
+    sibling = tmp_path / "sibling"
+    local = tmp_path / "repository-local"
+    for path in (explicit, sibling, local):
+        path.mkdir()
+    monkeypatch.setenv("NF_RAW_DIR", str(explicit))
+    monkeypatch.setattr(pipeline, "RAW_DEFAULT", sibling)
+    monkeypatch.setattr(pipeline, "RAW_LOCAL", local)
+    assert pipeline.resolve_raw_directory() == explicit.resolve()
+
+
 def test_additive_resurrection_validates_initialization_lineage(tmp_path, monkeypatch):
     fingerprint = install_data_fingerprint(monkeypatch, tmp_path)
     initialization = tmp_path / "initialization.pt"

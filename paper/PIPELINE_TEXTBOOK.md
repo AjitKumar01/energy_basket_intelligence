@@ -212,114 +212,229 @@ change the relative probability of two baskets of the same size.
 
 ---
 
-## 4. The role of $\beta$
+## 4. The role of $\beta$ in the interaction bridge
 
-### 4.1 $\beta_j$ is a price factor, not an interaction factor
+This is the $\beta$ used by the basket-generation and interaction-tempering algorithm.
+It is an algorithmic bridge coordinate, not a learned model parameter.
 
-The household-product price coefficient is
+### 4.1 Separate the interaction from the rest of the fitted energy
+
+Write the final fitted energy as
+
+\[
+E(S,x)=E_0(S,x)+V_\Phi(S),
+\qquad
+V_\Phi(S)=\sum_{j<k\in S}\phi_j^\top\phi_k.
+\tag{7}
+\]
+
+$E_0$ retains everything except the Gram interaction: contextual item utilities,
+household effects, prices, promotions, affinity-group counts, and the final total-size
+potential. In particular, $\beta=0$ does not discard household information or replace the
+model by a multinomial distribution. It switches off only $V_\Phi$.
+
+Define the bridge law
+
+\[
+p_\beta(S\mid x)
+=
+\frac{\exp\{E_0(S,x)+\beta V_\Phi(S)\}}{Z_\beta(x)},
+\qquad 0\le\beta\le1.
+\tag{8}
+\]
+
+Its endpoints have exact meanings:
+
+- $p_0$ is the no-Gram law. Its normalizer and exact basket sampler are available through
+  the category/cardinality dynamic program.
+- $p_1$ is the complete fitted Version-4 law.
+- Intermediate values do not describe additional fitted models. They form a numerical
+  path between the tractable endpoint and the target endpoint.
+
+Therefore the final generated distribution is independent of how the intermediate
+$\beta$ values are named. Schedule and particle count affect Monte Carlo error and cost,
+not the definition of $p_1$.
+
+### 4.2 Why $\sqrt{\beta}$ appears in the latent Gaussian representation
+
+Let
+
+\[
+m(S)=\sum_{j\in S}\phi_j.
+\]
+
+At bridge value $\beta$, use the augmented density
+
+\[
+\widetilde p_\beta(S,z\mid x)
+\propto
+\exp\left\{
+E_0(S,x)-\frac12\|z\|^2
++\sqrt{\beta}\,z^\top m(S)
+-\frac{\beta}{2}\sum_{j\in S}\|\phi_j\|^2
+\right\}.
+\tag{9}
+\]
+
+Completing the square gives
+
+\[
+-\frac12\|z\|^2+\sqrt{\beta}\,z^\top m(S)
+=
+-\frac12\|z-\sqrt{\beta}\,m(S)\|^2
++\frac{\beta}{2}\|m(S)\|^2.
+\tag{10}
+\]
+
+After integrating out $z$, the basket-dependent remainder is
+
+\[
+E_0(S,x)
++\frac{\beta}{2}\|m(S)\|^2
+-\frac{\beta}{2}\sum_{j\in S}\|\phi_j\|^2
+=
+E_0(S,x)+\beta V_\Phi(S).
+\]
+
+Thus Eq. (9) has exactly the bridge marginal in Eq. (8), and
+
+\[
+z\mid S,x,\beta
+\sim
+\mathcal N\!\left(\sqrt{\beta}\,m(S),I_r\right).
+\tag{11}
+\]
+
+Conditional on $z$, product $j$ has additive log weight
+
+\[
+\eta_j(z,\beta,x)
+=
+b_j(x)-\frac{\beta}{2}\|\phi_j\|^2
++\sqrt{\beta}\,z^\top\phi_j.
+\tag{12}
+\]
+
+The same exact size, affinity-count, and reverse-ESP recursions can therefore draw a
+basket conditional on $z$ at every bridge value.
+
+### 4.3 Why a bridge is needed
+
+A direct proposal would draw $S^{(p)}\sim p_0$ and weight it by
+$\exp\{V_\Phi(S^{(p)})\}$. When interactions are strong, a few baskets can receive nearly
+all the weight. The proposal effective sample size then collapses, and unrepresented
+high-interaction regions cannot be recovered by simply normalizing the available weights.
+
+The bridge breaks that difficult change into overlapping increments. For a schedule
+
+\[
+0=\beta_0<\beta_1<\cdots<\beta_L=1,
+\]
+
+the incremental weight is
+
+\[
+W_\ell^{(p)}
+=
+\exp\left\{
+(\beta_\ell-\beta_{\ell-1})V_\Phi(S_{\ell-1}^{(p)})
+\right\}.
+\tag{13}
+\]
+
+Each incremental exponent is smaller than the one-step exponent. After weighting, the
+particles are resampled and moved with a kernel that preserves $p_{\beta_\ell}$. This
+allows the particle population to move toward interaction-favored baskets before the next
+increment is applied.
+
+The normalized diagnostic is
+
+\[
+\frac{\operatorname{ESS}_\ell}{P}
+=
+\frac{1}{P\sum_{p=1}^P(\overline W_\ell^{(p)})^2}.
+\tag{14}
+\]
+
+A value near one means weights at that particular bridge are balanced. A small value
+means severe concentration. A large ESS is necessary but not sufficient: particles can
+all miss a remote mode and still have similar weights.
+
+### 4.4 The bridge used by the pipeline
+
+With 17 reported levels, there are 16 transitions. The default schedule is
+
+\[
+\beta_\ell
+=
+1-\left(1-\frac{\ell}{16}\right)^2,
+\qquad \ell=0,\ldots,16.
+\]
+
+This places progressively closer levels near $\beta=1$, where the full interaction is
+active. The complete procedure is:
+
+1. Compute $Z_0(x)$ exactly and draw independent baskets exactly from $p_0$ by one
+   forward dynamic program and repeated reverse draws.
+2. At every transition, calculate Eq. (13) and accumulate the log average weight.
+3. Resample baskets according to normalized incremental weights.
+4. At each nonterminal bridge, draw
+   $z\mid S,x,\beta_\ell$ from Eq. (11), then draw a complete
+   $S'\mid z,x,\beta_\ell$ using the exact conditional recursion. This blocked Gibbs
+   update leaves $p_{\beta_\ell}$ invariant.
+5. After the terminal weighting and resampling, apply an additional $\beta=1$ blocked
+   update when actual generated baskets are required. This improves diversity without
+   changing the target law.
+
+### 4.5 What $\beta$ guarantees—and what it does not
+
+The SMC normalizer estimate is
+
+\[
+\widehat Z_1(x)
+=
+Z_0(x)
+\prod_{\ell=1}^L
+\left[
+\frac1P\sum_{p=1}^P W_\ell^{(p)}
+\right].
+\]
+
+With exact $p_0$ initialization, unbiased resampling, and invariant bridge kernels,
+$\widehat Z_1$ is unbiased on the $Z$ scale. Its logarithm is not unbiased:
+
+\[
+\mathbb E[\log\widehat Z_1]\le\log Z_1
+\]
+
+by Jensen's inequality. More particles, better overlap, and repeated independent runs
+reduce and diagnose this finite-particle error.
+
+The terminal particles consistently approximate $p_1$ as the particle count grows, but a
+finite resampled population is not IID. Shared ancestors remain possible even after the
+final rejuvenation.
+
+Most importantly, $\beta$ does not train or shrink $\Phi$, and it does not alter the
+final model. It controls the numerical path used to reach the already fitted interaction
+law. Changing the schedule can improve ESS or runtime; it cannot improve a poorly learned
+interaction embedding. The constrained interaction MCLE fits $C$ and hence $\Phi$ from
+fixed $p_0$ draws before this generation bridge is used; bridge $\beta$ is not an
+additional interaction-training parameter.
+
+### 4.6 The separate price parameter with the same letter
+
+The codebase also stores a learned product price factor named model.beta. It enters
 
 \[
 a_{hj}
 =
 \operatorname{softplus}(\gamma_h)^\top
-\operatorname{softplus}(\beta_j)
-\ge 0.
-\tag{7}
+\operatorname{softplus}(\beta_j)\ge0
 \]
 
-The three product embeddings have different jobs:
-
-\[
-\underbrace{\alpha_j}_{\text{household taste}},
-\qquad
-\underbrace{\beta_j}_{\text{price response}},
-\qquad
-\underbrace{\phi_j}_{\text{basket interaction}}.
-\tag{8}
-\]
-
-$\gamma_h$ describes how household $h$ responds along the price dimensions, while
-$\beta_j$ describes how product $j$ loads on those dimensions. The economically
-meaningful object is their nonnegative dot product $a_{hj}$, not an isolated coordinate
-of either embedding. The nonnegative coordinates can, for example, be jointly permuted or
-oppositely rescaled between the two factors without changing the fitted dot products.
-
-### 4.2 Why nonnegativity matters
-
-For a simple log-price deviation $d_{jt}=\Delta\log p_{jt}$, the price contribution is
-
-\[
-b_j(x)=\cdots-a_{hj}d_{jt}.
-\tag{9}
-\]
-
-Hence
-
-\[
-\frac{\partial b_j(x)}{\partial\log p_{jt}}=-a_{hj}\le0.
-\tag{10}
-\]
-
-Softplus makes the sign restriction structural: a higher own price cannot directly make
-the product more attractive. For a price change that affects only this utility term,
-the derivative of the normalized log basket probability has the familiar observed-minus-
-expected form
-
-\[
-\frac{\partial\log p(S\mid x)}{\partial\log p_{jt}}
-=
--a_{hj}\left[
-\mathbf 1\{j\in S\}-P(j\in S\mid x)
-\right].
-\tag{11}
-\]
-
-This equation also explains why price learning uses the normalizer: changing one utility
-changes both the observed basket energy and the probabilities of every alternative basket.
-
-### 4.3 Common and relative price movement
-
-The implementation decomposes each log-price deviation as
-
-\[
-d_{jt}=\bar d_t+e_{jt},
-\tag{12}
-\]
-
-where $\bar d_t$ is the average movement over the offered catalogue and $e_{jt}$ is
-the product's relative movement. The fitted contribution is
-
-\[
--a_{hj}\left[
-\bar d_t+\operatorname{softplus}(\kappa_p)e_{jt}
-\right].
-\tag{13}
-\]
-
-A common movement shifts many product utilities and can strongly affect total size. A
-relative movement mainly reallocates share among products. The scalar $\kappa_p$ lets
-these responses have different scales without changing the foundational energy model.
-
-$\beta_j$, $\gamma_h$, and $\kappa_p$ are learned in the exact additive stage.
-They are frozen during the later interaction solve, but they continue to affect the
-additive proposal law, the final normalizer, generated baskets, recommendations under a
-new price context, counterfactuals, and retailer decisions. A poor additive price fit can
-also leak price-driven co-purchase structure into the interaction residual; this is one
-reason the additive parent must converge first.
-
-### 4.4 A separate symbol sometimes also called beta
-
-Annealed samplers often call their inverse temperature $\beta\in[0,1]$. That is not
-the learned product parameter $\beta_j$. This document calls the annealing temperature
-$\tau$ throughout:
-
-\[
-\pi_\tau(S,z\mid x)
-\propto
-\pi_0(S,z\mid x)
-\exp\{\tau\,\Delta E_{\mathrm{int}}(S,z,x)\}.
-\tag{14}
-\]
+inside the item price response. That $\beta_j$ is unrelated to the scalar bridge
+$\beta\in[0,1]$. In this document, an unsubscripted scalar $\beta$ means the interaction
+bridge; $\beta_j$ always means the product price factor.
 
 ---
 
@@ -829,7 +944,8 @@ generation.
 
 ### 9.3 Price counterfactuals
 
-For a proposed price change, update the price features in $x$, recompute Eq. (13), and
+For a proposed price change, update the price features in $x$, recompute the contextual
+item utility in Eq. (4), and
 query the resulting basket law. With factual samples from $p_0$, a counterfactual
 expectation can also be estimated by
 
@@ -937,9 +1053,11 @@ with the same Version-4 law, not a replacement of its theorem.
 
 ### What is the role of $\beta$?
 
-The learned $\beta_j$ is the product side of household-product price sensitivity.
-Together with $\gamma_h$, it creates $a_{hj}\ge0$, which controls how product utility
-responds to log price. It affects the original fit and every price-dependent downstream
-query, but it does not represent taste or complementarity. An annealing temperature that
-some sampling papers also call beta is a separate algorithmic quantity, denoted $\tau$
-here.
+The scalar $\beta\in[0,1]$ forms the interaction bridge
+$p_\beta(S\mid x)\propto\exp\{E_0(S,x)+\beta V_\Phi(S)\}$. At zero, only the Gram
+interaction is absent and exact basket draws are available. At one, the law is the full
+fitted Version-4 model. Intermediate values split a difficult importance-weighting step
+into overlapping steps, permitting resampling and invariant blocked updates before the
+next interaction increment. Thus $\beta$ controls SMC overlap, variance, and runtime; it
+is not learned and does not change the final model. The subscripted $\beta_j$ appearing
+elsewhere in the code is a separate product price factor.

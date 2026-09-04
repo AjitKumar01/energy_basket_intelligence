@@ -63,8 +63,9 @@ The evidence and decision rule are in [`paper/PIPELINE.md`](paper/PIPELINE.md). 
 model derivation is in [`paper/THEORY.md`](paper/THEORY.md), and estimator details are in
 [`paper/ESTIMATOR.md`](paper/ESTIMATOR.md).
 For a single textbook-style narrative of the complete probability model, the role of the
-price factor \(\beta\), the reason for staged interaction fitting, both appearances of the
-household-size coordinate, and all downstream queries, see
+interaction-bridge \(\beta\) and its distinction from the price factor \(\beta_j\), the
+reason for staged interaction fitting, both appearances of the household-size coordinate,
+and all downstream queries, see
 [`paper/PIPELINE_TEXTBOOK.md`](paper/PIPELINE_TEXTBOOK.md).
 The executable architecture, stage and artifact graph, active-versus-experimental module
 map, and current implementation issue register are in

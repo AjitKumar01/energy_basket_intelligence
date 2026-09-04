@@ -3,7 +3,8 @@ import torch
 
 from ragged import RaggedModel
 from fit_household_size_rank1 import (
-    cap_households, normalized_tilt, solve_households)
+    cap_households, chronological_folds, household_cluster_se, normalized_tilt,
+    residual_diagnostics, solve_households)
 
 
 def test_rank_one_household_channel_is_common_across_products():
@@ -96,3 +97,36 @@ def test_concave_household_solve_matches_observed_mean_and_cap_is_monotone():
     assert probability[:, 59:].sum(1).max() <= 0.35 + 1e-10
     assert np.all(safe <= unsafe)
     assert np.isfinite(upper).any()
+
+
+def test_crossfit_keeps_same_household_day_in_one_fold():
+    household = np.asarray([0, 0, 0, 0, 1, 1, 1])
+    day = np.asarray([10, 10, 11, 12, 4, 7, 7])
+    fold = chronological_folds(household, day, n_household=2)
+    for h in np.unique(household):
+        for d in np.unique(day[household == h]):
+            values = fold[(household == h) & (day == d)]
+            assert np.unique(values).size == 1
+    assert np.array_equal(fold, np.asarray([0, 0, 1, 0, 0, 1, 1]))
+
+
+def test_residual_diagnostic_detects_repeatable_household_signal():
+    probability = np.tile(np.asarray([0.6, 0.3, 0.1]), (8, 1))
+    log_probability = np.log(probability)
+    household = np.repeat(np.arange(2), 4)
+    fold = np.tile(np.asarray([0, 1, 0, 1]), 2)
+    # Parent mean is 1.5. Household 0 is consistently larger and household 1 smaller.
+    observed = np.asarray([2, 2, 3, 3, 1, 1, 1, 1])
+    got = residual_diagnostics(
+        log_probability, observed, household, fold, n_household=2)
+    assert got["households_present_in_both_folds"] == 2
+    assert np.isclose(got["crossfold_household_residual_correlation"], 1.0)
+    assert np.isclose(got["crossfold_household_residual_sign_agreement"], 1.0)
+
+
+def test_household_cluster_se_does_not_treat_repeat_checkouts_as_independent():
+    # Perfectly repeated outcomes within two households contain two independent units,
+    # not eight. The trip-naive standard error would incorrectly shrink fourfold.
+    values = np.asarray([1.0] * 4 + [-1.0] * 4)
+    household = np.asarray([0] * 4 + [1] * 4)
+    assert np.isclose(household_cluster_se(values, household), 1.0)

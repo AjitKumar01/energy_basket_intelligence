@@ -54,16 +54,28 @@ def parse_args():
     return parser.parse_args()
 
 
+def resolve_initialization_artifact(checkpoint: Path, configured: str | Path) -> Path:
+    """Relocate a checkpoint's initialization artifact after moving to another clone."""
+    configured = Path(configured)
+    if configured.is_file():
+        return configured
+    checkpoint_root = checkpoint.resolve().parents[1]
+    candidates = (
+        checkpoint_root / "artifacts" / configured.name,
+        checkpoint.resolve().parent / configured.name,
+        ROOT / "artifacts" / configured.name,
+    )
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate
+    raise FileNotFoundError(
+        f"checkpoint refers to missing initialization artifact {configured}; "
+        f"restore it as {checkpoint_root / 'artifacts' / configured.name}")
+
+
 def load_checkpoint(path: Path, data):
     blob = torch.load(path, map_location="cpu", weights_only=False)
-    artifact = Path(blob["config"]["artifact"])
-    if not artifact.is_absolute():
-        # A historical checkpoint can live in another clone.  Resolve its relative
-        # initialization artifact beside that clone before falling back to this one.
-        checkpoint_root = path.resolve().parents[1]
-        beside_checkpoint = checkpoint_root / artifact
-        artifact = (beside_checkpoint if beside_checkpoint.exists()
-                    else ROOT / artifact)
+    artifact = resolve_initialization_artifact(path, blob["config"]["artifact"])
     raw = torch.load(artifact, map_location="cpu", weights_only=False)
     meta = raw["metadata"]
     model = RaggedModel(

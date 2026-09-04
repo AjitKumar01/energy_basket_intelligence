@@ -19,6 +19,210 @@ ART = ROOT / "artifacts"
 REPORT = ROOT / "reports"
 RAW_DEFAULT = (ROOT.parent / "dunnhumby_The-Complete-Journey" /
                "dunnhumby_The-Complete-Journey CSV")
+STAGES = ("data", "initialize", "additive", "rank", "interaction",
+          "evaluation", "certification")
+
+
+def stage_index(stage: str) -> int:
+    return STAGES.index(stage)
+
+
+def runs_stage(start_at: str, stage: str) -> bool:
+    """Whether a stage belongs to the requested suffix of the pipeline graph."""
+    return stage_index(stage) >= stage_index(start_at)
+
+
+def require_files(stage: str, paths: tuple[Path, ...], *, dry_run: bool) -> None:
+    """Fail before compute when a resurrected stage is missing its prerequisites."""
+    if dry_run:
+        return
+    missing = [path for path in paths if not path.is_file()]
+    if missing:
+        command = f"python scripts/run_pipeline.py --start-at {stage}"
+        raise SystemExit(
+            f"cannot resurrect stage '{stage}'; missing prerequisite files: "
+            + ", ".join(str(path) for path in missing)
+            + f". Restore them from the original machine or begin at an earlier stage "
+              f"than in: {command}")
+
+
+def load_checkpoint_blob(path: Path, description: str) -> dict:
+    import torch
+    try:
+        blob = torch.load(path, map_location="cpu", weights_only=False)
+    except Exception as exc:
+        raise SystemExit(f"cannot read {description} {path}: {exc}") from exc
+    if not isinstance(blob, dict) or not isinstance(blob.get("model"), dict):
+        raise SystemExit(f"{description} {path} is not a pipeline model checkpoint")
+    return blob
+
+
+def validate_initialization(path: Path, *, dry_run: bool) -> dict | None:
+    require_files("initialize", (path,), dry_run=dry_run)
+    if dry_run:
+        return None
+    import torch
+    try:
+        blob = torch.load(path, map_location="cpu", weights_only=False)
+    except Exception as exc:
+        raise SystemExit(f"cannot read initialization checkpoint {path}: {exc}") from exc
+    required = ("metadata", "model_state", "model_state_sha256")
+    if not isinstance(blob, dict) or any(key not in blob for key in required):
+        raise SystemExit(f"{path} is not a Version-4 initialization artifact")
+    if not blob["metadata"].get("household_size_rank1", False):
+        raise SystemExit(f"{path} does not reserve the household-size rank-one coordinate")
+    return blob
+
+
+def validate_additive(path: Path, initialization: Path, *, dry_run: bool) -> dict | None:
+    require_files("additive", (initialization, path), dry_run=dry_run)
+    initial = validate_initialization(initialization, dry_run=dry_run)
+    if dry_run:
+        return None
+    blob = load_checkpoint_blob(path, "additive checkpoint")
+    if blob.get("estimator") != "exact_version4_no_gram_dynamic_program":
+        raise SystemExit(f"{path} is not an exact additive checkpoint")
+    if blob.get("fresh_artifact_digest") != initial["model_state_sha256"]:
+        raise SystemExit(
+            f"{path} was not trained from {initial}; restore the matching "
+            "artifacts/initialization.pt")
+    return blob
+
+
+def validate_completed_additive(best: Path, latest: Path, initialization: Path,
+                                *, profile: str, dry_run: bool) -> dict | None:
+    """Reject a partial/failed optimizer run even when its best checkpoint exists."""
+    require_files("additive", (best, latest), dry_run=dry_run)
+    best_blob = validate_additive(best, initialization, dry_run=dry_run)
+    latest_blob = validate_additive(latest, initialization, dry_run=dry_run)
+    if dry_run:
+        return None
+    expected_batch = 128 if profile == "full" else 8
+    for label, blob in (("best", best_blob), ("latest", latest_blob)):
+        config = blob.get("config", {})
+        if int(config.get("batch", -1)) != expected_batch:
+            raise SystemExit(
+                f"{label} additive checkpoint belongs to a different profile; "
+                f"expected batch {expected_batch} for --profile {profile}")
+    if int(best_blob.get("best_iteration", -1)) != int(latest_blob.get("best_iteration", -2)):
+        raise SystemExit("best and latest additive checkpoints do not belong to the same fit")
+    if profile == "full":
+        config = latest_blob["config"]
+        scheduler = latest_blob.get("scheduler", {})
+        converged = (
+            bool(config.get("require_convergence", False))
+            and int(latest_blob.get("iter", 0)) >= int(config["convergence_min_updates"])
+            and float(scheduler.get("learning_rate", float("inf")))
+            <= float(config["min_lr"]) + 1e-15
+            and int(scheduler.get("evaluations_since_best", -1))
+            >= int(config["convergence_patience"])
+        )
+        if not converged:
+            raise SystemExit(
+                f"{latest} is partial or reached its ceiling without convergence; "
+                "continue it with --start-at additive --resume-additive "
+                f"{latest}")
+    return best_blob
+
+
+def validate_candidate(path: Path, initialization: Path, *, final: bool,
+                       profile: str, dry_run: bool) -> dict | None:
+    require_files("interaction", (initialization, path), dry_run=dry_run)
+    validate_initialization(initialization, dry_run=dry_run)
+    if dry_run:
+        return None
+    blob = load_checkpoint_blob(path, "final candidate" if final else "interaction candidate")
+    if blob.get("estimator") != "constrained_crn_monte_carlo_mle_version4_natural_block":
+        raise SystemExit(f"{path} is not a constrained Version-4 interaction checkpoint")
+    rank = int(blob.get("active_rank", 0))
+    if rank < 1 or rank > 8:
+        raise SystemExit(f"{path} has invalid active interaction rank {rank}")
+    if final and "household_size_rank1" not in blob:
+        raise SystemExit(f"{path} has not completed the household-size stage")
+    expected_batch = 128 if profile == "full" else 8
+    if int(blob.get("config", {}).get("batch", -1)) != expected_batch:
+        raise SystemExit(
+            f"{path} belongs to a different profile; expected additive batch "
+            f"{expected_batch} for --profile {profile}")
+    return blob
+
+
+def selected_rank_from_report(basis: Path, *, maximum_rank: int,
+                              dry_run: bool,
+                              parent_iteration: int | None = None) -> int:
+    require_files("rank", (basis, basis.with_suffix(".json")), dry_run=dry_run)
+    if dry_run:
+        return maximum_rank
+    try:
+        report = json.loads(basis.with_suffix(".json").read_text())
+    except Exception as exc:
+        raise SystemExit(f"cannot read rank report for {basis}: {exc}") from exc
+    if (parent_iteration is not None
+            and int(report.get("parent_iteration", -1)) != parent_iteration):
+        raise SystemExit(
+            f"{basis.with_suffix('.json')} was built from additive iteration "
+            f"{report.get('parent_iteration')}, not the restored best iteration "
+            f"{parent_iteration}")
+    profiles = report.get("rank_stability", {})
+    for rank in range(maximum_rank, 3, -1):
+        if profiles.get(str(rank), {}).get("accepted"):
+            return rank
+    raise SystemExit(f"{basis.with_suffix('.json')} contains no accepted rank in 4..{maximum_rank}")
+
+
+def basis_from_candidate_report(candidate: Path, *, dry_run: bool,
+                                profile: str) -> Path:
+    report_path = candidate.with_suffix(".json")
+    require_files("evaluation", (report_path,), dry_run=dry_run)
+    if dry_run:
+        return ART / f"interaction_basis_rank{8 if profile == 'full' else 4}.npz"
+    try:
+        report = json.loads(report_path.read_text())
+        reported = Path(report["spectral"])
+    except Exception as exc:
+        raise SystemExit(f"cannot recover spectral basis from {report_path}: {exc}") from exc
+    if reported.is_file():
+        return reported
+    portable = ART / reported.name
+    require_files("evaluation", (portable, portable.with_suffix(".json")), dry_run=False)
+    return portable
+
+
+def validate_evaluation_outputs(*, profile: str, dry_run: bool) -> None:
+    """Ensure certification cannot follow missing, truncated, or rejected evaluations."""
+    json_paths = (
+        REPORT / "likelihood_validation.json",
+        REPORT / "likelihood_test.json",
+        REPORT / "recommendation.json",
+        REPORT / "generation_counterfactual.json",
+        REPORT / "customer_segments.json",
+        REPORT / "interaction_embedding_audit.json",
+    )
+    assignments = ART / "customer_segments.npz"
+    require_files("certification", (*json_paths, assignments), dry_run=dry_run)
+    if dry_run:
+        return
+    parsed = {}
+    for path in json_paths:
+        try:
+            parsed[path.name] = json.loads(path.read_text())
+        except Exception as exc:
+            raise SystemExit(f"cannot resurrect evaluation; invalid {path}: {exc}") from exc
+    if profile == "full":
+        for name in ("likelihood_validation.json", "likelihood_test.json"):
+            accepted = parsed[name].get("numerical_certification", {}).get("passed")
+            if accepted is not True:
+                raise SystemExit(
+                    f"cannot start certification: {name} did not pass its full-profile "
+                    "numerical/likelihood gate; rerun from --start-at evaluation")
+    import numpy as np
+    try:
+        with np.load(assignments) as stored:
+            if not stored.files:
+                raise ValueError("archive contains no arrays")
+    except Exception as exc:
+        raise SystemExit(
+            f"cannot resurrect evaluation; invalid {assignments}: {exc}") from exc
 
 
 def preflight(*, from_raw: bool, stop_after: str) -> None:
@@ -147,12 +351,21 @@ def main() -> None:
     parser.add_argument("--resume-additive", type=Path,
                         help=("continue an exact-additive checkpoint with optimizer and "
                               "minibatch stream intact; downstream stages still rerun"))
-    parser.add_argument("--stop-after", choices=(
-        "data", "initialize", "additive", "rank", "interaction",
-        "evaluation", "certification"), default="certification")
+    parser.add_argument(
+        "--start-at", choices=STAGES,
+        help=("resurrect a partially completed pipeline from this stage; all earlier "
+              "artifacts are validated and reused"))
+    parser.add_argument("--stop-after", choices=STAGES, default="certification")
     args = parser.parse_args()
+    start_at = args.start_at or ("additive" if args.resume_additive else "data")
     if args.from_raw and args.resume_additive is not None:
         parser.error("--from-raw cannot be combined with --resume-additive")
+    if args.from_raw and start_at != "data":
+        parser.error("--from-raw requires --start-at data (or no --start-at)")
+    if args.resume_additive is not None and start_at != "additive":
+        parser.error("--resume-additive requires --start-at additive")
+    if stage_index(args.stop_after) < stage_index(start_at):
+        parser.error("--stop-after must be the same as or later than --start-at")
     if args.threads < 0:
         parser.error("--threads cannot be negative")
     preflight(from_raw=args.from_raw, stop_after=args.stop_after)
@@ -189,6 +402,7 @@ def main() -> None:
                    "the exact normalizer)" if capabilities.cuda_device_count else "")
     print(f"[pipeline] backend={selected_device}, CPU threads={cpu_threads}, "
           f"RAM={capabilities.memory_gib or 'unknown'} GiB{accelerator}", flush=True)
+    print(f"[pipeline] execution window: {start_at} -> {args.stop_after}", flush=True)
     print(f"[pipeline] hardware report: {ART / 'runtime_capabilities.json'}", flush=True)
     driver = Driver(args.dry_run)
 
@@ -209,129 +423,179 @@ def main() -> None:
                 "--build-lib", str(ART / "native" / "lib"),
                 "--build-temp", str(ART / "native" / "temp"), "--force"])
     initialization = ART / "initialization.pt"
-    if args.resume_additive is None:
+    if runs_stage(start_at, "initialize"):
         driver.run(script("initialize_version4.py", "--output", initialization,
                           "--manifest", ART / "initialization.json",
                           "--household-size-rank1", "--threads", cpu_threads))
-    elif not initialization.exists() and not driver.dry_run:
-        raise SystemExit("resume requested but artifacts/initialization.pt is missing")
+    else:
+        validate_initialization(initialization, dry_run=driver.dry_run)
+        print(f"[pipeline] resurrected initialization: {initialization}", flush=True)
     if args.stop_after == "initialize":
         return
 
     full = args.profile == "full"
     additive_iterations = 30000 if full else 10
-    additive_command = script(
-        "fit_exact_additive.py", "--artifact", initialization,
-        "--label", "pipeline_additive", "--iters", additive_iterations,
-        "--batch", 128 if full else 8, "--lr", 0.002,
-        "--weight-decay", 1e-5, "--validation-trips", 1024 if full else 16,
-        "--validation-chunk", 128 if full else 8,
-        "--eval-every", 100 if full else 5, "--size-kl", 1.0,
-        "--lr-patience", 4, "--lr-factor", 0.5, "--min-lr", 6.25e-5,
-        "--convergence-patience", 8,
-        "--convergence-min-updates", 4000 if full else 10,
-        "--validation-min-delta", 0.001,
-        "--rkl-w", 10.0, "--elast-w", 20.0, "--elast-target", -0.121,
-        "--pool-prod", 1.45, "--lam-centre", 1, "--seed", 29001,
-        "--threads", cpu_threads,
-        "--rho-c-max-category-reward", 1.5,
-        *(('--require-convergence',) if full else ()),
-        *(('--resume', args.resume_additive)
-          if args.resume_additive is not None else ()))
-    driver.run(additive_command)
     additive = ROOT / "out" / "v3_pipeline_additive_best.pt"
+    additive_latest = ROOT / "out" / "v3_pipeline_additive.pt"
+    additive_blob = None
+    if runs_stage(start_at, "additive"):
+        if args.resume_additive is not None:
+            resume_path = (args.resume_additive if args.resume_additive.is_absolute()
+                           else ROOT / args.resume_additive)
+            validate_additive(resume_path, initialization, dry_run=driver.dry_run)
+            print(f"[pipeline] validated additive continuation checkpoint: {resume_path}",
+                  flush=True)
+        additive_command = script(
+            "fit_exact_additive.py", "--artifact", initialization,
+            "--label", "pipeline_additive", "--iters", additive_iterations,
+            "--batch", 128 if full else 8, "--lr", 0.002,
+            "--weight-decay", 1e-5, "--validation-trips", 1024 if full else 16,
+            "--validation-chunk", 128 if full else 8,
+            "--eval-every", 100 if full else 5, "--size-kl", 1.0,
+            "--lr-patience", 4, "--lr-factor", 0.5, "--min-lr", 6.25e-5,
+            "--convergence-patience", 8,
+            "--convergence-min-updates", 4000 if full else 10,
+            "--validation-min-delta", 0.001,
+            "--rkl-w", 10.0, "--elast-w", 20.0, "--elast-target", -0.121,
+            "--pool-prod", 1.45, "--lam-centre", 1, "--seed", 29001,
+            "--threads", cpu_threads,
+            "--rho-c-max-category-reward", 1.5,
+            *(('--require-convergence',) if full else ()),
+            *(('--resume', args.resume_additive)
+              if args.resume_additive is not None else ()))
+        driver.run(additive_command)
+    elif start_at != "certification":
+        additive_blob = validate_completed_additive(
+            additive, additive_latest, initialization,
+            profile=args.profile, dry_run=driver.dry_run)
+        print(f"[pipeline] resurrected converged additive parent: {additive}", flush=True)
     if args.stop_after == "additive":
         return
 
-    rank, basis = rank_selection(driver, additive, 50000 if full else 128,
-                                  smoke=not full, threads=cpu_threads)
+    if runs_stage(start_at, "rank"):
+        rank, basis = rank_selection(driver, additive, 50000 if full else 128,
+                                      smoke=not full, threads=cpu_threads)
+    elif start_at == "interaction":
+        basis = ART / f"interaction_basis_rank{8 if full else 4}.npz"
+        rank = selected_rank_from_report(
+            basis, maximum_rank=8 if full else 4, dry_run=driver.dry_run,
+            parent_iteration=(int(additive_blob["iter"])
+                              if additive_blob is not None else None))
+        print(f"[pipeline] resurrected rank selection: rank={rank}, basis={basis}",
+              flush=True)
+    else:
+        # Evaluation recovers the basis from candidate.json. Certification needs only
+        # the active rank stored in the final checkpoint.
+        rank, basis = 0, None
     if args.stop_after == "rank":
         return
 
     interaction_candidate = ART / "candidate.pt"
-    driver.run(script(
-        "fit_convex_natural_interactions.py", "--parent", additive,
-        "--spectral", basis, "--contexts", 12000 if full else 64,
-        "--draws", 64 if full else 4, "--batch", 96 if full else 8,
-        "--rank", rank, "--score-mass", 1.0, "--spectral-max", 1.0,
-        "--threads", cpu_threads,
-        "--minimum-crossfit-gain", 0.005 if full else -1.0,
-        "--minimum-half-gain", 0.0 if full else -1e9,
-        "--minimum-ess-fraction", 0.20 if full else 0.0,
-        "--minimum-ess-p01", 2.0 if full else 0.0,
-        "--output", interaction_candidate))
-    if not driver.dry_run:
-        interaction_report = json.loads(
-            interaction_candidate.with_suffix(".json").read_text())
-        eigenvalues = interaction_report["candidate_c_eigenvalues"]
-        tolerance = max(eigenvalues) * 1e-10 if eigenvalues else 0.0
-        fitted_rank = sum(value > max(tolerance, 1e-12) for value in eigenvalues)
-        if fitted_rank < 1:
-            raise SystemExit("natural-parameter solve produced no positive interaction rank")
-        if fitted_rank != rank:
-            print(f"[pipeline] convex solve reduced certified basis rank {rank} "
-                  f"to active rank {fitted_rank}")
-        rank = fitted_rank
     candidate = ART / "candidate_rank1.pt"
-    driver.run(script(
-        "fit_household_size_rank1.py",
-        "--checkpoint", interaction_candidate,
-        "--rank", rank, "--screen-level", rank + 1,
-        "--contexts", 0 if full else 128,
-        "--screen-tail-cap", 0.35,
-        "--minimum-crossfit-gain", 0.0 if full else -1e9,
-        "--chunk", 48 if full else 8,
-        "--threads", cpu_threads,
-        "--output", candidate,
-        "--report", ART / "candidate_rank1.json",
-        "--population-output", REPORT / "population_size.json"))
+    if runs_stage(start_at, "interaction"):
+        driver.run(script(
+            "fit_convex_natural_interactions.py", "--parent", additive,
+            "--spectral", basis, "--contexts", 12000 if full else 64,
+            "--draws", 64 if full else 4, "--batch", 96 if full else 8,
+            "--rank", rank, "--score-mass", 1.0, "--spectral-max", 1.0,
+            "--threads", cpu_threads,
+            "--minimum-crossfit-gain", 0.005 if full else -1.0,
+            "--minimum-half-gain", 0.0 if full else -1e9,
+            "--minimum-ess-fraction", 0.20 if full else 0.0,
+            "--minimum-ess-p01", 2.0 if full else 0.0,
+            "--output", interaction_candidate))
+        if not driver.dry_run:
+            interaction_report = json.loads(
+                interaction_candidate.with_suffix(".json").read_text())
+            eigenvalues = interaction_report["candidate_c_eigenvalues"]
+            tolerance = max(eigenvalues) * 1e-10 if eigenvalues else 0.0
+            fitted_rank = sum(value > max(tolerance, 1e-12) for value in eigenvalues)
+            if fitted_rank < 1:
+                raise SystemExit(
+                    "natural-parameter solve produced no positive interaction rank")
+            if fitted_rank != rank:
+                print(f"[pipeline] convex solve reduced certified basis rank {rank} "
+                      f"to active rank {fitted_rank}")
+            rank = fitted_rank
+        driver.run(script(
+            "fit_household_size_rank1.py",
+            "--checkpoint", interaction_candidate,
+            "--rank", rank, "--screen-level", rank + 1,
+            "--contexts", 0 if full else 128,
+            "--screen-tail-cap", 0.35,
+            "--minimum-crossfit-gain", 0.0 if full else -1e9,
+            "--on-crossfit-failure", "fallback",
+            "--chunk", 48 if full else 8,
+            "--threads", cpu_threads,
+            "--output", candidate,
+            "--report", ART / "candidate_rank1.json",
+            "--population-output", REPORT / "population_size.json"))
+    else:
+        final_blob = validate_candidate(
+            candidate, initialization, final=True, profile=args.profile,
+            dry_run=driver.dry_run)
+        if final_blob is not None:
+            rank = int(final_blob["active_rank"])
+        else:
+            rank = 8 if full else 4
+        if start_at == "evaluation":
+            basis = basis_from_candidate_report(
+                interaction_candidate, dry_run=driver.dry_run, profile=args.profile)
+        print(f"[pipeline] resurrected final candidate: rank={rank}, "
+              f"checkpoint={candidate}", flush=True)
     if args.stop_after == "interaction":
         return
 
     # All claims use fixed panels and complete support; recommendation is read-only.
-    driver.run(script(
-        "compare_rank8_parent_likelihood.py", "--parent", additive,
-        "--child", candidate, "--split", "validation", "--trips", 4096 if full else 16,
-        "--rank", rank, "--target-level", rank + 2,
-        "--audit-trips", 128 if full else 4,
-        "--threads", cpu_threads,
-        *(('--maximum-audit-error-bound', 0.01, '--require-certified-gain')
-          if full else ()),
-        "--output", REPORT / "likelihood_validation.json"))
-    driver.run(script(
-        "compare_rank8_parent_likelihood.py", "--parent", additive,
-        "--child", candidate, "--split", "test", "--trips", 4096 if full else 16,
-        "--rank", rank, "--target-level", rank + 2,
-        "--audit-trips", 128 if full else 4,
-        "--threads", cpu_threads,
-        *(('--maximum-audit-error-bound', 0.01, '--require-certified-gain')
-          if full else ()),
-        "--output", REPORT / "likelihood_test.json"))
-    driver.run(script(
-        "eval_smolyak_rank8_mrr.py", "--ckpt", candidate, "--split", "test",
-        "--trips", 2000 if full else 16, "--rank", rank,
-        "--level", rank + 2, "--threads", cpu_threads,
-        "--output", REPORT / "recommendation.json"))
-    driver.run(script(
-        "audit_particle_counterfactual_generation.py", "--ckpt", candidate,
-        "--trips", 64 if full else 2, "--particles", 64 if full else 4,
-        "--threads", cpu_threads,
-        "--output", REPORT / "generation_counterfactual.json"))
-    driver.run(script(
-        "audit_customer_segments.py", "--ckpt", candidate,
-        "--candidate-segments", 3, 4, 5, 6,
-        "--contexts-per-segment", 48 if full else 2,
-        "--particles", 32 if full else 4,
-        "--threads", cpu_threads,
-        "--output", REPORT / "customer_segments.json",
-        "--assignments", ART / "customer_segments.npz"))
-    driver.run(script(
-        "audit_interaction_embeddings.py", "--checkpoint", candidate,
-        "--spectral-report", basis.with_suffix(".json"),
-        "--minimum-training-lines", 100 if full else 1,
-        "--pairs", 2000 if full else 32,
-        "--listed-pairs", 20 if full else 5,
-        "--output", REPORT / "interaction_embedding_audit.json"))
+    if runs_stage(start_at, "evaluation"):
+        driver.run(script(
+            "compare_rank8_parent_likelihood.py", "--parent", additive,
+            "--child", candidate, "--split", "validation",
+            "--trips", 4096 if full else 16,
+            "--rank", rank, "--target-level", rank + 2,
+            "--audit-trips", 128 if full else 4,
+            "--threads", cpu_threads,
+            *(('--maximum-audit-error-bound', 0.01, '--require-certified-gain')
+              if full else ()),
+            "--output", REPORT / "likelihood_validation.json"))
+        driver.run(script(
+            "compare_rank8_parent_likelihood.py", "--parent", additive,
+            "--child", candidate, "--split", "test",
+            "--trips", 4096 if full else 16,
+            "--rank", rank, "--target-level", rank + 2,
+            "--audit-trips", 128 if full else 4,
+            "--threads", cpu_threads,
+            *(('--maximum-audit-error-bound', 0.01, '--require-certified-gain')
+              if full else ()),
+            "--output", REPORT / "likelihood_test.json"))
+        driver.run(script(
+            "eval_smolyak_rank8_mrr.py", "--ckpt", candidate, "--split", "test",
+            "--trips", 2000 if full else 16, "--rank", rank,
+            "--level", rank + 2, "--threads", cpu_threads,
+            "--output", REPORT / "recommendation.json"))
+        driver.run(script(
+            "audit_particle_counterfactual_generation.py", "--ckpt", candidate,
+            "--trips", 64 if full else 2, "--particles", 64 if full else 4,
+            "--threads", cpu_threads,
+            "--output", REPORT / "generation_counterfactual.json"))
+        driver.run(script(
+            "audit_customer_segments.py", "--ckpt", candidate,
+            "--candidate-segments", 3, 4, 5, 6,
+            "--contexts-per-segment", 48 if full else 2,
+            "--particles", 32 if full else 4,
+            "--threads", cpu_threads,
+            "--output", REPORT / "customer_segments.json",
+            "--assignments", ART / "customer_segments.npz"))
+        driver.run(script(
+            "audit_interaction_embeddings.py", "--checkpoint", candidate,
+            "--spectral-report", basis.with_suffix(".json"),
+            "--minimum-training-lines", 100 if full else 1,
+            "--pairs", 2000 if full else 32,
+            "--listed-pairs", 20 if full else 5,
+            "--output", REPORT / "interaction_embedding_audit.json"))
+    else:
+        validate_evaluation_outputs(profile=args.profile, dry_run=driver.dry_run)
+        print("[pipeline] resurrected completed evaluation artifacts", flush=True)
     if args.stop_after == "evaluation":
         return
 

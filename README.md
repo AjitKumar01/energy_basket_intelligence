@@ -30,9 +30,9 @@ The selected pipeline is:
 5. one cross-fitted constrained Monte Carlo likelihood solve for the PSD interaction
    kernel and the original total-size potential correction, using fixed exact draws from
    the additive law;
-6. one strictly concave household-size block update in an identified catalogue-common
-   direction of the existing household/product utility, selected by within-household
-   cross-fit and capped by the population tail screen;
+6. one strictly concave post-interaction household-size recalibration in the identified
+   catalogue-common direction already learned by the exact parent, selected by
+   within-household-day cross-fit and capped by the population tail screen;
 7. locked complete-support likelihood, recommendation, generation, price, and
    population-tail audits.
 
@@ -62,6 +62,9 @@ unobserved large-basket clique phase. Narrow two-item groups retain the original
 The evidence and decision rule are in [`paper/PIPELINE.md`](paper/PIPELINE.md). The full
 model derivation is in [`paper/THEORY.md`](paper/THEORY.md), and estimator details are in
 [`paper/ESTIMATOR.md`](paper/ESTIMATOR.md).
+Stage-wise interruption recovery, checkpoint prerequisites, cross-machine transfer and
+all `--start-at` commands are documented in
+[`paper/STAGEWISE_RESURRECTION.md`](paper/STAGEWISE_RESURRECTION.md).
 The completed corrected-data fit and its fail-closed production decision are reported in
 [`paper/CORRECTED_PIPELINE_RESULTS.md`](paper/CORRECTED_PIPELINE_RESULTS.md).
 The completed rank-one successor, including its locked likelihood, recommendation,
@@ -277,6 +280,20 @@ python scripts/run_pipeline.py --resume-additive out/v3_pipeline_additive.pt \
   2>&1 | tee -a artifacts/pipeline.log
 ```
 
+After a stage has completed, skip it with `--start-at`. For example:
+
+```bash
+python scripts/run_pipeline.py --start-at rank 2>&1 | tee -a artifacts/pipeline.log
+python scripts/run_pipeline.py --start-at interaction 2>&1 | tee -a artifacts/pipeline.log
+python scripts/run_pipeline.py --start-at evaluation 2>&1 | tee -a artifacts/pipeline.log
+python scripts/run_pipeline.py --start-at certification 2>&1 | tee -a artifacts/pipeline.log
+```
+
+The driver validates the required checkpoint lineage, convergence state, active rank and
+full/smoke profile before spending compute. See the
+[stage-wise recovery guide](paper/STAGEWISE_RESURRECTION.md) before copying artifacts from
+another machine.
+
 The full profile has a 30,000-update safety ceiling but must satisfy the convergence gate;
 reaching that ceiling is a nonzero pipeline failure and no interaction/evaluation stage is
 then allowed to run.
@@ -325,6 +342,20 @@ the pipeline exit nonzero, while preserving the reports and candidate for diagno
 means the fitted law is not safe for production simulation; it is not an estimator crash.
 Only the smoke profile converts that statistical rejection into a successful integration
 exit, because smoke is deliberately too small to certify a model.
+
+The household-size stage itself is nested and cannot strand the pipeline. The exact
+additive fit has already learned the catalogue-common household coordinate. The later
+stage asks only whether an additional correction is supported after interactions are
+introduced. If its 95% cross-fit lower bound is not positive, it records
+`parent_preserved_no_supported_incremental_correction` and applies the exact zero
+likelihood correction. If the parent violates the localized tail constraint, it applies
+only the smallest downward safety projection and records `safety_projection_only`.
+Either way, the candidate must still pass the independent high-rule likelihood and
+population-tail audits; fallback prevents an avoidable runtime abort, not a statistical
+failure from being relabelled as success. The full diagnosis is always written to
+`artifacts/candidate_rank1.json`. Checkouts on the same household-day stay in the same
+cross-fit half, and the reported uncertainty is household-cluster robust rather than
+incorrectly treating a household's repeat checkouts as independent evidence.
 
 The main command runs the complete Version-4 model fit and its declared evaluations.
 Converged external competitors are intentionally a second command because they are three

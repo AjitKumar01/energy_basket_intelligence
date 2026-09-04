@@ -9,6 +9,13 @@ conditional size law:
 Each household problem is one-dimensional and strictly concave. Ridge is selected by
 swapped within-household trip halves. The final scalar is capped by a deterministic
 screen-tail constraint. No basket-composition probability conditional on size changes.
+
+The checkpoint already contains the rank-one coordinate because it is learned in the
+exact additive stage.  This script profiles an *incremental* correction after the
+interaction block.  The zero correction is therefore the exact nested fallback: lack of
+evidence for a further correction must not abort an otherwise valid pipeline. A parent
+that violates the declared localized-tail limit still receives the smallest feasible
+downward safety projection and must pass the independent downstream audits.
 """
 from __future__ import annotations
 
@@ -83,12 +90,63 @@ def gain(log_probability: np.ndarray, observed: np.ndarray,
 
 def chronological_folds(household: np.ndarray, day: np.ndarray,
                         n_household: int) -> np.ndarray:
+    """Alternate distinct household-days, never checkouts from the same day."""
     fold = np.zeros(len(household), dtype=np.int8)
     for h in range(n_household):
         index = np.flatnonzero(household == h)
-        index = index[np.argsort(day[index], kind="stable")]
-        fold[index[1::2]] = 1
+        if not len(index):
+            continue
+        distinct_day = np.unique(day[index])
+        fold[index[np.isin(day[index], distinct_day[1::2])]] = 1
     return fold
+
+
+def residual_diagnostics(log_probability: np.ndarray, observed: np.ndarray,
+                         household: np.ndarray, fold: np.ndarray,
+                         n_household: int) -> dict:
+    """Explain whether a repeatable post-parent household size signal remains."""
+    size = np.arange(1, log_probability.shape[1] + 1, dtype=np.float64)
+    expected = np.exp(log_probability) @ size
+    residual = observed - expected
+    fold_sum = np.zeros((n_household, 2), dtype=np.float64)
+    fold_count = np.zeros((n_household, 2), dtype=np.int64)
+    for side in (0, 1):
+        index = np.flatnonzero(fold == side)
+        np.add.at(fold_sum[:, side], household[index], residual[index])
+        np.add.at(fold_count[:, side], household[index], 1)
+    eligible = (fold_count > 0).all(axis=1)
+    if int(eligible.sum()) >= 2:
+        correlation = float(np.corrcoef(
+            fold_sum[eligible, 0] / fold_count[eligible, 0],
+            fold_sum[eligible, 1] / fold_count[eligible, 1])[0, 1])
+        sign_agreement = float(np.mean(
+            np.sign(fold_sum[eligible, 0]) == np.sign(fold_sum[eligible, 1])))
+    else:
+        correlation = float("nan")
+        sign_agreement = float("nan")
+    return {
+        "observed_size_mean": float(observed.mean()),
+        "parent_expected_size_mean": float(expected.mean()),
+        "parent_size_residual_mean": float(residual.mean()),
+        "parent_size_residual_rmse": float(np.sqrt(np.mean(residual ** 2))),
+        "households_present_in_both_folds": int(eligible.sum()),
+        "crossfold_household_residual_correlation": correlation,
+        "crossfold_household_residual_sign_agreement": sign_agreement,
+    }
+
+
+def household_cluster_se(values: np.ndarray, household: np.ndarray) -> float:
+    """Standard error of the trip-weighted mean with household-level dependence."""
+    values = np.asarray(values, dtype=np.float64)
+    household = np.asarray(household, dtype=np.int64)
+    unique, inverse = np.unique(household, return_inverse=True)
+    if len(values) < 2 or len(unique) < 2:
+        return float("inf")
+    centred_sum = np.bincount(
+        inverse, weights=values - values.mean(), minlength=len(unique))
+    variance = (len(unique) / (len(unique) - 1.0)
+                * float(np.square(centred_sum).sum()) / len(values) ** 2)
+    return float(np.sqrt(max(variance, 0.0)))
 
 
 def cap_households(log_probability: np.ndarray, household: np.ndarray,
@@ -160,6 +218,10 @@ def main() -> None:
     parser.add_argument("--ridge-grid", type=float, nargs="+",
                         default=[800, 1600, 2400, 3200, 4800, 6400, 9600])
     parser.add_argument("--minimum-crossfit-gain", type=float, default=0.0)
+    parser.add_argument(
+        "--on-crossfit-failure", choices=("fallback", "error"), default="fallback",
+        help=("fallback writes the exact nested zero correction and continues; error "
+              "writes the diagnostic report and exits nonzero"))
     parser.add_argument("--chunk", type=int, default=48)
     parser.add_argument("--contexts", type=int, default=0,
                         help="training contexts; 0 uses the complete population")
@@ -173,8 +235,8 @@ def main() -> None:
     args = parser.parse_args()
     if not 0 < args.screen_tail_cap < 0.5:
         raise ValueError("screen-tail-cap must lie strictly between zero and 0.5")
-    if any(value < 0 for value in args.ridge_grid):
-        raise ValueError("ridge values must be nonnegative")
+    if any(value <= 0 for value in args.ridge_grid):
+        raise ValueError("ridge values must be strictly positive for a finite solve")
 
     torch.set_num_threads(args.threads)
     data = build()
@@ -202,6 +264,8 @@ def main() -> None:
     day = data["trip_day"][population].astype(np.int64, copy=False)
     n_household = int(data["n_user"])
     fold = chronological_folds(household, day, n_household)
+    diagnostics = residual_diagnostics(
+        base_log_probability, observed, household, fold, n_household)
     audit = []
     for ridge in args.ridge_grid:
         kappa_0 = solve_households(
@@ -217,25 +281,42 @@ def main() -> None:
             base_log_probability, observed, household,
             np.flatnonzero(fold == 1), kappa_0)
         heldout = np.concatenate((gain_0, gain_1))
+        heldout_household = np.concatenate((
+            household[np.flatnonzero(fold == 0)],
+            household[np.flatnonzero(fold == 1)]))
+        cluster_se = household_cluster_se(heldout, heldout_household)
         audit.append({
             "ridge": float(ridge),
             "gain": float(heldout.mean()),
-            "gain_se": float(heldout.std(ddof=1) / np.sqrt(len(heldout))),
-            "gain_lcb95": float(
-                heldout.mean() - 1.96 * heldout.std(ddof=1) / np.sqrt(len(heldout))),
+            "gain_se": cluster_se,
+            "gain_se_method": "household_cluster_robust",
+            "gain_trip_naive_se": float(
+                heldout.std(ddof=1) / np.sqrt(len(heldout))),
+            "gain_lcb95": float(heldout.mean() - 1.96 * cluster_se),
             "fold_0_gain": float(gain_0.mean()),
             "fold_1_gain": float(gain_1.mean()),
         })
     selected = max(audit, key=lambda row: row["gain"])
-    if selected["gain_lcb95"] <= args.minimum_crossfit_gain:
-        raise RuntimeError(
-            "rank-one household size gain did not pass its cross-fit gate")
-    kappa = solve_households(
-        base_log_probability, observed, household,
-        np.arange(len(population)), n_household, selected["ridge"])
+    correction_supported = bool(
+        selected["gain_lcb95"] > args.minimum_crossfit_gain)
+    if correction_supported:
+        kappa = solve_households(
+            base_log_probability, observed, household,
+            np.arange(len(population)), n_household, selected["ridge"])
+    else:
+        # The parent already contains the trained household-common coordinate.  The
+        # identity correction is in the candidate class, has exactly zero gain, and
+        # preserves every parent probability.  Never force a noisy correction merely to
+        # make an optional refinement appear successful.
+        kappa = np.zeros(n_household, dtype=np.float64)
+    # Safety is not optional. Even when no likelihood recalibration is supported, project
+    # the zero increment downward where the parent itself violates the localized tail cap.
+    # This is the smallest feasible change in this one-dimensional direction and remains
+    # subject to the downstream high-rule likelihood and population certification gates.
     kappa, upper_bound = cap_households(
         base_log_probability, household, kappa, n_household,
         args.screen_tail_cap)
+    safety_projection_applied = bool(np.isfinite(upper_bound).any())
     final_gain = gain(
         base_log_probability, observed, household,
         np.arange(len(population)), kappa)
@@ -245,46 +326,32 @@ def main() -> None:
     tail = probability[:, 59:].sum(1)
     expected = probability @ size
 
-    # theta_c subtracts the unweighted household mean. Transfer the removed global
-    # utility shift into rho_0 so the implemented law receives exactly kappa_h.
-    mean_kappa = float(kappa.mean())
-    with torch.no_grad():
-        model.theta[:, -1].add_(torch.as_tensor(
-            kappa, dtype=model.theta.dtype, device=model.theta.device))
-        model.project_context_gauges()
-        model.rho_0_free.sub_(mean_kappa * torch.arange(
-            1, model.nmax + 1, dtype=model.rho_0_free.dtype,
-            device=model.rho_0_free.device))
-    output = args.output if args.output.is_absolute() else ROOT / args.output
-    output.parent.mkdir(parents=True, exist_ok=True)
-    result_blob = dict(blob)
-    result_blob["model"] = model.state_dict()
-    result_blob["household_size_rank1"] = {
-        "selected_ridge": selected["ridge"],
-        "screen_tail_cap": args.screen_tail_cap,
-        "mean_gauge_transfer": mean_kappa,
-    }
-    temporary = Path(str(output) + ".tmp")
-    torch.save(result_blob, temporary)
-    temporary.replace(output)
+    parent_kappa = model.theta_c()[:, -1].detach().cpu().numpy()
 
-    population_output = (
-        args.population_output if args.population_output.is_absolute()
-        else ROOT / args.population_output)
-    cache_prefix = seed_population_cache(
-        output, population_output, population, args.rank, levels,
-        tilted, observed)
     result = {
         "method": "identified_rank_one_household_common_utility",
         "parent": str(checkpoint),
-        "output": str(output),
+        "output": str(args.output if args.output.is_absolute() else ROOT / args.output),
+        "status": (
+            "incremental_correction_applied" if correction_supported else
+            "safety_projection_only" if safety_projection_applied else
+            "parent_preserved_no_supported_incremental_correction"),
+        "incremental_recalibration_supported": correction_supported,
+        "safety_projection_applied": safety_projection_applied,
+        "failure_policy": args.on_crossfit_failure,
         "contexts": int(len(population)),
         "households": n_household,
+        "parent_rank1_kappa_sd": float(parent_kappa.std()),
+        "parent_rank1_kappa_abs_max": float(np.abs(parent_kappa).max()),
+        "parent_residual_diagnostics": diagnostics,
         "crossfit_ridge_audit": audit,
         "selected_ridge": selected["ridge"],
+        "proposed_ridge": selected["ridge"],
+        "applied_ridge": selected["ridge"] if correction_supported else None,
         "selected_crossfit_gain": selected["gain"],
         "selected_crossfit_gain_se": selected["gain_se"],
         "selected_crossfit_gain_lcb95": selected["gain_lcb95"],
+        "minimum_required_crossfit_gain": args.minimum_crossfit_gain,
         "full_fit_gain": float(final_gain.mean()),
         "full_fit_gain_se": float(
             final_gain.std(ddof=1) / np.sqrt(len(final_gain))),
@@ -298,12 +365,55 @@ def main() -> None:
         "contexts_tail_probability_ge_half": int((tail >= .5).sum()),
         "contexts_expected_size_ge_40": int((expected >= 40).sum()),
         "base_screen": provenance,
-        "final_population_cache_prefix": cache_prefix,
         "interpretation": (
-            "The common household shift is an existing b_jv direction. It changes only "
-            "the size marginal; fixed-size composition and the sampling recursion are "
-            "unchanged. Confirmation quadrature remains mandatory."),
+            "The checkpoint already learned the common household coordinate during "
+            "exact additive fitting. This stage tests only a post-interaction "
+            "increment. When unsupported, its likelihood correction is kappa=0; the "
+            "parent is preserved unless a downward localized-tail safety projection is "
+            "required. The common shift changes only the size marginal; fixed-size "
+            "composition and the sampling recursion are unchanged. High-rule likelihood "
+            "and population confirmation remain mandatory."),
     }
+    if not correction_supported and args.on_crossfit_failure == "error":
+        report_path.write_text(json.dumps(result, indent=2) + "\n")
+        print(json.dumps(result, indent=2), flush=True)
+        raise RuntimeError(
+            "incremental rank-one recalibration was unsupported; diagnostic report written")
+
+    # theta_c subtracts the unweighted household mean. Transfer the removed global
+    # utility shift into rho_0 so the implemented law receives exactly kappa_h.
+    mean_kappa = float(kappa.mean())
+    if np.any(kappa != 0.0):
+        with torch.no_grad():
+            model.theta[:, -1].add_(torch.as_tensor(
+                kappa, dtype=model.theta.dtype, device=model.theta.device))
+            model.project_context_gauges()
+            model.rho_0_free.sub_(mean_kappa * torch.arange(
+                1, model.nmax + 1, dtype=model.rho_0_free.dtype,
+                device=model.rho_0_free.device))
+    output = args.output if args.output.is_absolute() else ROOT / args.output
+    output.parent.mkdir(parents=True, exist_ok=True)
+    result_blob = dict(blob)
+    result_blob["model"] = model.state_dict()
+    result_blob["household_size_rank1"] = {
+        "incremental_recalibration_supported": correction_supported,
+        "safety_projection_applied": safety_projection_applied,
+        "selected_ridge": selected["ridge"] if correction_supported else None,
+        "screen_tail_cap": args.screen_tail_cap,
+        "mean_gauge_transfer": mean_kappa,
+    }
+    temporary = Path(str(output) + ".tmp")
+    torch.save(result_blob, temporary)
+    temporary.replace(output)
+
+    population_output = (
+        args.population_output if args.population_output.is_absolute()
+        else ROOT / args.population_output)
+    cache_prefix = seed_population_cache(
+        output, population_output, population, args.rank, levels,
+        tilted, observed)
+    result["output"] = str(output)
+    result["final_population_cache_prefix"] = cache_prefix
     report_path.write_text(json.dumps(result, indent=2) + "\n")
     print(json.dumps(result, indent=2), flush=True)
 

@@ -217,7 +217,47 @@ change the relative probability of two baskets of the same size.
 This is the $\beta$ used by the basket-generation and interaction-tempering algorithm.
 It is an algorithmic bridge coordinate, not a learned model parameter.
 
-### 4.1 Separate the interaction from the rest of the fitted energy
+### 4.1 What “Sequential Monte Carlo” means
+
+Sequential Monte Carlo, abbreviated SMC, represents a probability distribution by a
+population of random candidates.
+
+- **Monte Carlo** means that random draws are used to approximate probabilities and
+  expectations.
+- **Sequential** means that the population is passed through a sequence of intermediate
+  probability distributions rather than being moved from an easy law to a difficult law
+  in one step.
+- A **particle** is one complete candidate basket for one customer context. It is not one
+  product and it is not a model parameter.
+
+In this application, SMC can be summarized as
+
+\[
+\boxed{
+\text{exact no-Gram base baskets}
+\longrightarrow
+\text{slightly interaction-weighted baskets}
+\longrightarrow\cdots\longrightarrow
+\text{full Version-4 interaction baskets}.}
+\]
+
+The important SMC terms are:
+
+| Term | Meaning in this basket model |
+|---|---|
+| Particle | One complete nonempty basket |
+| Particle population | Several candidate baskets for the same context |
+| Weight | How much more compatible a basket is with the next interaction level |
+| Resampling | Copy high-weight baskets more often and remove low-weight baskets |
+| Ancestor | The earlier particle from which a resampled particle was copied |
+| Mutation or rejuvenation | Generate a new basket through an invariant blocked update |
+| ESS | Effective number of meaningfully weighted particles before resampling |
+
+SMC is not an additional predictive model. It is also not the procedure that originally
+learns the interaction embedding. It is an inference algorithm used after fitting when we
+need complete interaction-aware basket draws or a randomized normalizer estimate.
+
+### 4.2 Separate the interaction from the rest of the fitted energy
 
 Write the final fitted energy as
 
@@ -255,7 +295,7 @@ Therefore the final generated distribution is independent of how the intermediat
 $\beta$ values are named. Schedule and particle count affect Monte Carlo error and cost,
 not the definition of $p_1$.
 
-### 4.2 Why $\sqrt{\beta}$ appears in the latent Gaussian representation
+### 4.3 Why $\sqrt{\beta}$ appears in the latent Gaussian representation
 
 Let
 
@@ -318,7 +358,7 @@ b_j(x)-\frac{\beta}{2}\|\phi_j\|^2
 The same exact size, affinity-count, and reverse-ESP recursions can therefore draw a
 basket conditional on $z$ at every bridge value.
 
-### 4.3 Why a bridge is needed
+### 4.4 Why a bridge is needed
 
 A direct proposal would draw $S^{(p)}\sim p_0$ and weight it by
 $\exp\{V_\Phi(S^{(p)})\}$. When interactions are strong, a few baskets can receive nearly
@@ -360,7 +400,35 @@ A value near one means weights at that particular bridge are balanced. A small v
 means severe concentration. A large ESS is necessary but not sufficient: particles can
 all miss a remote mode and still have similar weights.
 
-### 4.4 The bridge used by the pipeline
+### 4.5 Why weighting, resampling, and rejuvenation are all necessary
+
+Weighting alone retains the original no-Gram baskets. It changes their importance but
+cannot create an interaction-favored basket that was never drawn.
+
+Resampling converts unequal weights into an approximately equally weighted population.
+For example, if baskets containing a supported complement pair receive large weights,
+those baskets obtain more descendants. But resampling alone creates duplicates and can
+reduce diversity, a phenomenon called particle impoverishment.
+
+Rejuvenation repairs this problem. At the current $\beta_\ell$, the algorithm draws a
+latent state from the exact conditional law in Eq. (11), then draws a new complete basket
+using the conditional weights in Eq. (12) and the exact polynomial recursion. This
+blocked Gibbs step may change size,
+affinity-group allocation, and actual products while preserving the current bridge law.
+It can therefore create nearby interaction-compatible alternatives rather than merely
+copying the same basket.
+
+The three operations have complementary roles:
+
+\[
+\underbrace{\text{weight}}_{\text{identify promising particles}}
+\quad\longrightarrow\quad
+\underbrace{\text{resample}}_{\text{allocate particles to them}}
+\quad\longrightarrow\quad
+\underbrace{\text{rejuvenate}}_{\text{restore movement and diversity}}.
+\]
+
+### 4.6 The bridge used by the pipeline
 
 With 17 reported levels, there are 16 transitions. The default schedule is
 
@@ -386,7 +454,7 @@ active. The complete procedure is:
    update when actual generated baskets are required. This improves diversity without
    changing the target law.
 
-### 4.5 What $\beta$ guarantees—and what it does not
+### 4.7 What $\beta$ guarantees—and what it does not
 
 The SMC normalizer estimate is
 
@@ -421,7 +489,34 @@ interaction embedding. The constrained interaction MCLE fits $C$ and hence $\Phi
 fixed $p_0$ draws before this generation bridge is used; bridge $\beta$ is not an
 additional interaction-training parameter.
 
-### 4.6 The separate price parameter with the same letter
+### 4.8 How SMC differs from the other estimators in the pipeline
+
+The pipeline deliberately uses different numerical tools for different questions:
+
+| Method | Main role | Random? | Produces baskets? |
+|---|---|---:|---:|
+| Exact dynamic program | Normalize and sample the no-Gram law | No for normalization | Yes |
+| Fixed-draw interaction MCLE | Fit the small natural interaction block | Draws fixed during solve | Uses proposal baskets |
+| Smolyak quadrature | Deterministic final likelihood certification | No | No |
+| SMC bridge | Generate from the full interaction law and estimate $Z_1/Z_0$ | Yes | Yes |
+
+SMC is also different from running a single Markov chain. It maintains a population,
+reweights that population across successive targets, and resamples. Its rejuvenation step
+is a short Gibbs/Markov transition inside SMC, but the overall algorithm is a population
+method rather than one uninterrupted chain.
+
+The generation result should be judged using more than one number. Relevant checks are:
+
+1. minimum bridge ESS, to detect immediate weight collapse;
+2. repeated-seed stability, to detect Monte Carlo sensitivity;
+3. duplicate and ancestry concentration, to detect particle impoverishment;
+4. generated size, tail, category, item, and pair moments against held-out data; and
+5. agreement with deterministic Smolyak likelihood on manageable audit panels.
+
+Passing ESS alone is insufficient because an entire remote mode can be absent from every
+particle.
+
+### 4.9 The separate price parameter with the same letter
 
 The codebase also stores a learned product price factor named model.beta. It enters
 
@@ -937,10 +1032,11 @@ Marginalizing $z$ gives exactly Eq. (1). Conditional on $z$, a basket is drawn b
 
 The nontrivial step is drawing $z$. Its target marginal is the Gaussian density times
 the complete polynomial integrand, not a standard Gaussian. The implemented SMC bridge
-starts from exact additive basket draws, gradually turns on the interaction contribution,
-reweights particles, and applies invariant rejuvenation moves. The bridge is a sampling
-algorithm for Eq. (1); it is not an added model term and does not correct the basket after
-generation.
+starts from exact no-Gram base-basket draws, gradually turns on the interaction
+contribution, reweights particles, and applies invariant rejuvenation moves. The bridge
+is a sampling algorithm for Eq. (1); it is not an added model term and does not correct
+the basket after generation. Section 4 defines every SMC operation and gives the bridge
+invariance and normalizer guarantees.
 
 ### 9.3 Price counterfactuals
 

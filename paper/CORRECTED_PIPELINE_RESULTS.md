@@ -128,15 +128,20 @@ On 1,615 valid cases:
 | Recall@10 | \(0.162229\) |
 | Recall@20 | \(0.209907\) |
 
-The matched additive parent has MRR \(0.094897\). The paired interaction increment is
+The historical evaluator's bare additive-utility score has MRR \(0.094897\). The paired
+full-minus-bare-utility increment is
 
 \[
 +0.000247\pm0.000372,
 \qquad 95\%\ \mathrm{CI}=[-0.000481,0.000976],
 \]
 
-which is not statistically established. Interactions reduce mean rank by 2.79 positions,
-but the present test does not support a positive MRR claim. The strong total MRR and the
+which is not statistically established. This contrast combines affinity-group and Gram
+effects because the clean no-Gram score is `structured_no_gram`, not `additive_utility`.
+The archived means give the clean Gram paired point increment
+\(0.0951444521-0.0947725542=0.0003718980\), but the legacy output did not retain the ranks
+needed for its paired standard error. The present test therefore does not establish a
+positive Gram-only MRR claim. The strong total MRR and the
 significant likelihood gain are distinct facts; one does not mathematically imply the
 other because likelihood scores the entire basket distribution while MRR tests one
 conditional ranking functional.

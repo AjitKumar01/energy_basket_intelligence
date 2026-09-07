@@ -54,6 +54,66 @@ def midrank(score, position):
     return 1.0 + greater + 0.5 * (tied - 1)
 
 
+def paired_rank_metrics(candidate_ranks, reference_ranks, *, candidate, reference):
+    """Summarize one explicitly named paired recommendation contrast.
+
+    Rank differences are candidate minus reference, so a negative value is better.
+    Reciprocal-rank differences are candidate minus reference, so a positive value is
+    better.  Keeping the model names in the payload prevents a broad structural contrast
+    from being mislabeled as a Gram-interaction-only effect.
+    """
+    candidate_ranks = np.asarray(candidate_ranks, dtype=np.float64)
+    reference_ranks = np.asarray(reference_ranks, dtype=np.float64)
+    if candidate_ranks.shape != reference_ranks.shape:
+        raise ValueError("paired rank arrays must have the same shape")
+    if candidate_ranks.ndim != 1 or candidate_ranks.size < 2:
+        raise ValueError("paired rank arrays must contain at least two cases")
+    if (not np.all(np.isfinite(candidate_ranks)) or
+            not np.all(np.isfinite(reference_ranks)) or
+            np.any(candidate_ranks <= 0) or np.any(reference_ranks <= 0)):
+        raise ValueError("paired ranks must be finite and strictly positive")
+
+    reciprocal_gain = 1.0 / candidate_ranks - 1.0 / reference_ranks
+    gain = float(reciprocal_gain.mean())
+    gain_se = float(
+        reciprocal_gain.std(ddof=1) / math.sqrt(reciprocal_gain.size))
+    return {
+        "candidate": candidate,
+        "reference": reference,
+        "cases": int(candidate_ranks.size),
+        "candidate_beats_reference_fraction": float(
+            np.mean(candidate_ranks < reference_ranks)),
+        "candidate_ties_reference_fraction": float(
+            np.mean(candidate_ranks == reference_ranks)),
+        "mean_rank_change_candidate_minus_reference": float(
+            np.mean(candidate_ranks - reference_ranks)),
+        "mrr_gain_candidate_minus_reference": gain,
+        "mrr_gain_standard_error": gain_se,
+        "mrr_gain_95_interval": [
+            float(gain - 1.96 * gain_se), float(gain + 1.96 * gain_se)],
+    }
+
+
+def recommendation_comparisons(ranks):
+    """Return the three distinct paired effects in the add-one score decomposition."""
+    return {
+        # This is the clean marginal effect of phi_i^T phi_j because the two scores
+        # differ only by the Gram increment.
+        "gram_interaction_vs_structured_no_gram": paired_rank_metrics(
+            ranks["full_interaction"], ranks["structured_no_gram"],
+            candidate="full_interaction", reference="structured_no_gram"),
+        # This isolates the affinity-category term while holding the Gram term absent.
+        "category_structure_vs_additive_utility": paired_rank_metrics(
+            ranks["structured_no_gram"], ranks["additive_utility"],
+            candidate="structured_no_gram", reference="additive_utility"),
+        # This is useful as an overall structural ablation, but is not an
+        # interaction-only estimand.
+        "full_structure_vs_additive_utility": paired_rank_metrics(
+            ranks["full_interaction"], ranks["additive_utility"],
+            candidate="full_interaction", reference="additive_utility"),
+    }
+
+
 @torch.no_grad()
 def locked_add_one(model, batcher, data, trips, seed):
     """Exact conditional add-one ranks on one common hidden-item manifest."""
@@ -109,18 +169,16 @@ def locked_add_one(model, batcher, data, trips, seed):
                                  float(category[position]),
                                  float(gram[position])))
     summaries = {name: metrics(value) for name, value in ranks.items()}
-    full = np.asarray(ranks["full_interaction"], dtype=np.float64)
-    additive = np.asarray(ranks["additive_utility"], dtype=np.float64)
-    gain = 1.0 / full - 1.0 / additive
-    gain_se = float(gain.std(ddof=1) / math.sqrt(len(gain)))
-    summaries["comparison"] = {
-        "full_beats_additive_fraction": float(np.mean(full < additive)),
-        "full_ties_additive_fraction": float(np.mean(full == additive)),
-        "mean_rank_change_full_minus_additive": float(np.mean(full - additive)),
-        "mrr_gain_full_minus_additive": float(gain.mean()),
-        "mrr_gain_standard_error": gain_se,
-        "mrr_gain_95_interval": [float(gain.mean() - 1.96 * gain_se),
-                                 float(gain.mean() + 1.96 * gain_se)],
+    summaries["comparisons"] = recommendation_comparisons(ranks)
+    summaries["score_decomposition"] = {
+        "additive_utility": "contextual item utility only",
+        "structured_no_gram": "contextual item utility plus category increment",
+        "full_interaction": (
+            "contextual item utility plus category increment plus Gram increment"),
+        "primary_interaction_estimand": (
+            "gram_interaction_vs_structured_no_gram"),
+    }
+    summaries["diagnostics"] = {
         "mean_candidates": float(np.mean(candidate_counts)),
         "hidden_energy_terms_mean": dict(zip(
             ("additive", "category", "gram"),
@@ -185,6 +243,7 @@ def main():
         recommendation = locked_add_one(model, batcher, data, trips, args.seed)
         output = {
             **base,
+            "recommendation_schema_version": 2,
             "protocol": (
                 "hide one test-basket item; exact conditional add-one energy over "
                 "the complete contemporaneous store assortment, with midranks for ties"),

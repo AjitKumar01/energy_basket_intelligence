@@ -62,14 +62,25 @@ unobserved large-basket clique phase. Narrow two-item groups retain the original
 The evidence and decision rule are in [`paper/PIPELINE.md`](paper/PIPELINE.md). The full
 model derivation is in [`paper/THEORY.md`](paper/THEORY.md), and estimator details are in
 [`paper/ESTIMATOR.md`](paper/ESTIMATOR.md).
-For a single textbook-style narrative of the complete probability model, the role of the
-interaction-bridge \(\beta\) and its distinction from the price factor \(\beta_j\), the
-reason for staged interaction fitting, both appearances of the household-size coordinate,
-and all downstream queries, see
-[`paper/PIPELINE_TEXTBOOK.md`](paper/PIPELINE_TEXTBOOK.md).
+For a single dependency-ordered, textbook-style narrative of the complete probability
+model, all notation, the tractability proof, staged estimation, numerical certification,
+the interaction bridge, and the downstream retail queries, see
+[`paper/PIPELINE_TEXTBOOK_RESTRUCTURED.md`](paper/PIPELINE_TEXTBOOK_RESTRUCTURED.md).
+The earlier [`paper/PIPELINE_TEXTBOOK.md`](paper/PIPELINE_TEXTBOOK.md) is retained as an
+archived draft while the restructured edition is reviewed.
+The research-novelty assessment, closest prior art, defensible claims, and remaining
+evidence needed for publication are in
+[`paper/NOVELTY_AUDIT.md`](paper/NOVELTY_AUDIT.md).
 The executable architecture, stage and artifact graph, active-versus-experimental module
 map, and current implementation issue register are in
 [`paper/CODEBASE_ARCHITECTURE.md`](paper/CODEBASE_ARCHITECTURE.md).
+The catalogue, household, interaction-rank, likelihood, recommendation, generation, and
+policy scaling limits are analyzed in
+[`paper/SCALABILITY.md`](paper/SCALABILITY.md).
+The proposed joint no-visit/store/empty-purchase/Version-4 extension is derived in
+[`paper/COMPLETE_DEMAND_MODEL.md`](paper/COMPLETE_DEMAND_MODEL.md), with replicated exact
+synthetic evidence in
+[`paper/COMPLETE_DEMAND_SYNTHETIC_RESULTS.md`](paper/COMPLETE_DEMAND_SYNTHETIC_RESULTS.md).
 Stage-wise interruption recovery, checkpoint prerequisites, cross-machine transfer and
 all `--start-at` commands are documented in
 [`paper/STAGEWISE_RESURRECTION.md`](paper/STAGEWISE_RESURRECTION.md).
@@ -113,6 +124,31 @@ costs and a 28-day promotion budget. Every one of the 60,459 supported baskets i
 have no numerical-integration error. Synthetic results validate recovery under declared
 truth; they do not replace real held-out evaluation or randomized commercial trials.
 
+### Joint complete-demand audit
+
+The newer complete-demand experiment replaces the independent arrival/store heads with
+one inclusive-value-linked probability over no visit, empty visits, and Version-4
+baskets. Run the quick mechanical check with:
+
+```bash
+python scripts/run_complete_demand_experiment.py --profile smoke --threads 4
+```
+
+Run the full predeclared matrix—three strong-signal replicates, one weak-signal world,
+one null-interaction world, both ablations, and catalogue scaling through 10,000
+products—with:
+
+```bash
+python scripts/run_complete_demand_experiment.py --profile full --threads 8 \
+  --replicates 3 2>&1 | tee artifacts/complete_demand_synthetic.log
+```
+
+Smoke mode checks execution and normalization but is intentionally too small for
+statistical recovery claims. Full mode exits nonzero when any predeclared evidence gate
+fails. Reports are written to `reports/synthetic_complete_demand_*.json`; the summarized
+certification record is
+[`paper/COMPLETE_DEMAND_SYNTHETIC_RESULTS.md`](paper/COMPLETE_DEMAND_SYNTHETIC_RESULTS.md).
+
 ## Historical empirical status and current certification state
 
 The numerical results below were produced by commit `06b49ad`, before the artifact-
@@ -127,8 +163,12 @@ locked 4,096-trip panels, improves over its matched exact additive parent by
 \(0.02671\pm0.00211\) nats/basket on validation and \(0.03275\pm0.00239\) on test. The
 q8 numerical-error upper bounds are \(0.000318\) and \(0.000468\) nats respectively, so
 the positive likelihood gains are not quadrature artifacts. Locked test MRR is
-\(0.09525\pm0.00607\). The interaction-only MRR gain is positive but its 95% interval
-still crosses zero.
+\(0.09525\pm0.00607\). The archived score means give a clean Gram-only paired point
+increment of \(0.00134528\), obtained from `full_interaction` minus
+`structured_no_gram`. Its paired standard error is not recoverable from the old aggregate
+report, so no historical significance claim is made. The evaluator now emits this clean
+contrast, the category-only contrast, and the broader full-structure contrast separately;
+certification rejects reports using the former ambiguous schema.
 
 The three declared external baselines were then trained from fresh lineages to their
 validation convergence certificates and scored on the identical locked 4,096-trip test

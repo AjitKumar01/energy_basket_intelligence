@@ -1775,7 +1775,7 @@ Recommendation is also evaluated from the same law. Total MRR is
 \tag{88}
 \]
 
-but the interaction increment over additive MRR is only
+but the historical full-minus-bare-utility MRR increment is only
 
 \[
 0.000247\pm0.000372,
@@ -1784,9 +1784,13 @@ but the interaction increment over additive MRR is only
 \tag{89}
 \]
 
-Therefore an interaction recommendation gain is not established. This does not contradict
-Eq. (87): log likelihood is a proper score for the whole basket distribution, whereas MRR
-is a discontinuous one-hidden-item ranking functional.
+The bare utility score excludes both the affinity-group and Gram increments, so Eq. (89)
+is not a clean interaction-only ablation. The archived score means give the clean Gram
+paired point increment \(0.0951444521-0.0947725542=0.0003718980\), but the old output did
+not retain the paired ranks needed for its standard error. Its statistical significance
+is therefore not established. This does not
+contradict Eq. (87): log likelihood is a proper score for the whole basket distribution,
+whereas MRR is a discontinuous one-hidden-item ranking functional.
 
 Generation has no invalid-assortment or duplicate-item baskets and price counterfactuals
 move in the theoretically required direction. Production certification nevertheless

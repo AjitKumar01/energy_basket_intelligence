@@ -294,7 +294,7 @@ locked validation/test manifests.
 | Validation likelihood | child \(-43.687816\); paired gain \(0.026714\pm0.002107\) nats | pass |
 | Test likelihood | child \(-46.064895\); paired gain \(0.032750\pm0.002393\) nats | pass |
 | Numerical audit | q8 error upper bounds \(0.000318\) validation, \(0.000468\) test | pass |
-| Recommendation | MRR \(0.095246\pm0.006075\); interaction gain \(0.001165\pm0.000627\) | total pass; interaction effect inconclusive |
+| Recommendation | MRR \(0.095246\pm0.006075\); clean Gram paired point gain \(0.001345\), historical paired SE unavailable | total pass; clean Gram significance not established |
 | Complete-population tail | calibrated q7 upper \(0.002013 < 0.004250\) allowed | pass |
 | Local extreme-tail safety | no majority-tail context in q6 screen or q7 confirmation; confirmed maximum \(0.402682\) | pass |
 | Generator mechanics | no unavailable products or duplicates; minimum normalized SMC ESS \(0.99938\) | pass |

@@ -1,5 +1,10 @@
 # The Version-4 energy-basket pipeline
 
+> **Archived draft.** The dependency-ordered replacement is
+> [`PIPELINE_TEXTBOOK_RESTRUCTURED.md`](PIPELINE_TEXTBOOK_RESTRUCTURED.md). It defines
+> notation before use and presents the model, tractability result, training stages,
+> numerical estimators, and retail functions in one connected sequence.
+
 ## A textbook explanation of the model, estimator, training stages, and outputs
 
 ## 1. The complete story in one page
@@ -153,21 +158,27 @@ Each block has a distinct interpretation:
 | $-\rho_c{n_c(S)\choose2}$ | Shared within-affinity-group pair effect |
 | $-\rho_0(|S|)$ | Flexible global potential for total basket size |
 
-The Gram interaction matrix is $K=\Phi\Phi^\top\succeq0$. Consequently the Gram
-part represents attractive low-rank directions. The explicit category-count term can
-represent broader attraction or repulsion within a group, depending on the sign of
-$\rho_c$.
+The Gram interaction matrix is $K=\Phi\Phi^\top\succeq0$. This constrains the global
+geometry of the interaction kernel, but it does **not** make every off-diagonal pair
+coefficient positive: an individual dot product $\phi_j^\top\phi_k$ may be positive,
+zero, or negative. Positive values raise the relative score of baskets containing the
+pair; negative values lower it. The explicit category-count term represents an additional
+shared attraction or repulsion within an affinity group, depending on the sign of
+$\rho_c$. Thus Version-4 is more restrictive than an arbitrary indefinite $J\times J$
+pair-interaction matrix, while still allowing pair-specific effects of both signs.
 
 ### 3.2 Contextual product utility
 
-The fitted utility can be written schematically as
+The fitted utility is
 
 \[
 \begin{aligned}
 b_j(x)
 ={}&\lambda_j
 +\theta_h^\top\alpha_j
--a_{hj}\,d_{jt}^{\mathrm{price}}
+-a_{hj}\left[
+\bar d_t+\operatorname{softplus}(\kappa_p)(d_{jt}-\bar d_t)
+\right]
 +w_j^{\mathrm{dsp}}D_{jt}
 +w_j^{\mathrm{mlr}}M_{jt} \\
 &+\mu_j^\top\delta_{w(t)}
@@ -176,11 +187,30 @@ b_j(x)
 \tag{4}
 \]
 
+The nonnegative household--product price coefficient is
+
+\[
+a_{hj}
+=
+\sum_{k=1}^{K_p}
+\operatorname{softplus}(\gamma_{hk})
+\operatorname{softplus}(\beta_{jk})
+\ge 0.
+\tag{4a}
+\]
+
+Here $d_{jt}$ is the product's log-price deviation and $\bar d_t$ is its mean over the
+trip's offered assortment. The common component $\bar d_t$ moves all offered-item
+utilities together and therefore affects total basket size. The centered component
+$d_{jt}-\bar d_t$ primarily reallocates choice between products. The learned positive
+scale $\operatorname{softplus}(\kappa_p)$ lets those two empirically different responses
+have different magnitudes without permitting a positive own-price derivative.
+
 Here:
 
 - $\lambda_j$ is product popularity after the other effects are controlled;
 - $\theta_h^\top\alpha_j$ is household-specific taste;
-- $a_{hj}$ is a nonnegative price-response coefficient;
+- $a_{hj}$ is the nonnegative household--product price-response coefficient in Eq. (4a);
 - $D_{jt}$ and $M_{jt}$ indicate display and mailer exposure;
 - $\mu_j^\top\delta_w$ captures low-rank seasonal variation; and
 - $\zeta_j^\top\xi_s$ captures low-rank store variation.
@@ -983,21 +1013,22 @@ optimization error, or model misspecification.
 
 ### 9.1 Recommendation follows by conditioning
 
-Let $R$ be the observed remainder of a basket when exactly one product is hidden. For
-a candidate $j\notin R$, define $s_j(R,x)=E(R\cup\{j\},x)$. Then
+Let $R$ be the observed remainder of a basket when exactly one product is hidden. For an
+offered candidate $j\in\mathcal A_x\setminus R$, define
+$s_j(R,x)=E(R\cup\{j\},x)$. Then
 
 \[
 \begin{aligned}
 P(j\text{ completes }R\mid x,R,\text{one missing})
 &=
 \frac{p(R\cup\{j\}\mid x)}
-{\sum_{k\notin R}p(R\cup\{k\}\mid x)} \\
+{\sum_{k\in\mathcal A_x\setminus R}p(R\cup\{k\}\mid x)} \\
 &=
 \frac{e^{s_j(R,x)}/Z_+(x)}
-{\sum_{k\notin R}e^{s_k(R,x)}/Z_+(x)} \\
+{\sum_{k\in\mathcal A_x\setminus R}e^{s_k(R,x)}/Z_+(x)} \\
 &=
 \frac{e^{s_j(R,x)}}
-{\sum_{k\notin R}e^{s_k(R,x)}}.
+{\sum_{k\in\mathcal A_x\setminus R}e^{s_k(R,x)}}.
 \end{aligned}
 \tag{40}
 \]
@@ -1157,3 +1188,52 @@ into overlapping steps, permitting resampling and invariant blocked updates befo
 next interaction increment. Thus $\beta$ controls SMC overlap, variance, and runtime; it
 is not learned and does not change the final model. The subscripted $\beta_j$ appearing
 elsewhere in the code is a separate product price factor.
+
+---
+
+## 13. Verification against the selected implementation
+
+This document was re-audited against the selected executable pipeline on 5 September
+2026. The audit checked the probability law and fitted utility in `ragged.py`, the stage
+graph and gates in `run_pipeline.py`, the exact no-Gram dynamic program, the spectral-rank
+builder, the constrained natural-parameter fit, the household-size residual fit, the
+Smolyak likelihood comparison, the locked recommendation evaluator, and the
+interaction-tempered SMC implementation.
+
+| Textbook claim | Implementation evidence | Result |
+|---|---|---|
+| Stage order is data, initialization, additive, rank, interaction, evaluation, certification | `scripts/run_pipeline.py` | Verified |
+| The observed-basket energy and normalizer use the same contextual item utility | `RaggedModel.b_at`, `RaggedModel.energy`, and `differentiable_logz_beta0` | Verified |
+| The additive stage fixes $\Phi=0$ and fits the listed incidence blocks with an exact normalizer | `fit_exact_additive.py` | Verified |
+| Rank selection tests every candidate rank from 4 through 8 and returns the largest accepted one | `build_spectral_phi_initialization.py` and `run_pipeline.rank_selection` | Verified |
+| The interaction solve is deterministic and concave after fixing the parent draws | `fit_convex_natural_interactions.py` | Verified for the sampled objective |
+| The late household block fits only an incremental common-utility tilt and can fall back to zero | `fit_household_size_rank1.py` | Verified |
+| Validation requires a positive audited gain; test is reported without a positive-gain acceptance requirement | the two `compare_rank8_parent_likelihood.py` calls in `run_pipeline.py` | Verified |
+| Reported likelihood uses $q=r+2$ and audits a smaller panel at $q=r+3$ | `run_pipeline.py` and `compare_rank8_parent_likelihood.py` | Verified |
+| SMC uses the stated quadratic 17-level schedule, resamples at every bridge, mutates at nonterminal bridges, and uses a final $\beta=1$ update for generated baskets | `audit_particle_counterfactual_generation.py` and `tempered_ais.py` | Verified |
+| Locked add-one recommendation does not evaluate $Z_+$ | `eval_smolyak_rank8_mrr.py` | Verified |
+
+Four qualifications remain important.
+
+1. The historical numerical results in the repository predate the latest artifact-lineage
+   and simultaneous ridge-selection hardening. They are evidence about the same model law,
+   but a fresh full execution is required to certify the current code revision.
+2. The recommendation evaluator computes all of `additive_utility`,
+   `structured_no_gram`, and `full_interaction`. It now reports three explicitly named
+   paired contrasts. The primary Gram-only estimand compares `full_interaction` with
+   `structured_no_gram`; the broader full-versus-utility contrast is retained separately
+   and is never labelled interaction-only. From the archived historical means, the clean
+   Gram paired point gain is \(0.0013452822\). Its historical paired standard error is
+   unavailable because the legacy report did not retain the case ranks, so significance
+   awaits a hardened-pipeline evaluation.
+3. The current full-profile certification checks checkpoint lineage, likelihood evidence,
+   numerical quadrature error, rank/interaction gates, and localized population-size
+   safety. It records generation diagnostics, but segment-level generation calibration is
+   not presently a hard pass/fail gate. The held-out generation-size mismatch must
+   therefore remain visible in any production-readiness statement.
+4. The real-data checkpoint fits conditional nonempty product incidence. Quantity,
+   visit/no-purchase, inventory, cost, and causal intervention capabilities are not implied
+   by the presence of corresponding experimental or synthetic code paths.
+
+Subject to these qualifications, the mathematical derivations and the selected stage
+flow in Sections 1--12 match the implementation.

@@ -78,10 +78,35 @@ do not depend on q7.
 | Recall@10 | \(0.160991\) |
 | Recall@20 | \(0.207430\) |
 
-The interaction-minus-additive MRR gain is
-\(0.0011649\pm0.0006271\), with 95% interval
-\([-0.000064,0.002394]\). Total recommendation quality is useful, but this panel does not
-establish a separate interaction-only recommendation improvement at the 5% level.
+The archived score decomposition is:
+
+| Score | MRR |
+|---|---:|
+| Bare contextual item utility | \(0.0940812576\) |
+| Utility plus affinity-group term, no Gram term | \(0.0939008375\) |
+| Full score including the Gram term | \(0.0952461197\) |
+
+Because every score was evaluated on the same 1,615 hidden-item cases, linearity gives the
+clean paired Gram point estimate exactly:
+
+\[
+\frac1{1615}\sum_i\left(\frac1{r_i^{\mathrm{full}}}
+-\frac1{r_i^{\mathrm{no\ Gram}}}\right)
+=0.0952461197-0.0939008375
+=\boxed{0.0013452822}.
+\]
+
+The affinity-group-only point increment is \(-0.0001804201\). Their sum is the historical
+full-minus-bare-utility increment \(0.0011648621\), whose paired standard error was
+\(0.0006270694\) and whose 95% interval was
+\([-0.000064,0.002394]\).
+
+The old report retained the three marginal summaries but not the per-case ranks. A paired
+standard error for the clean Gram contrast depends on their covariance and cannot be
+reconstructed from marginal standard errors. Therefore the clean historical point
+estimate is positive, but its statistical significance is not established. The corrected
+evaluator now computes all three paired contrasts directly and the pipeline refuses to
+certify a legacy ambiguous recommendation report.
 
 ## 5. Interaction-embedding audit
 

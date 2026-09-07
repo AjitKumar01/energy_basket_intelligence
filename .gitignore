@@ -11,3 +11,4 @@ __pycache__/
 *.log
 *.so
 build/
+.DS_Store

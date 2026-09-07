@@ -210,6 +210,24 @@ def test_certification_rejects_failed_or_corrupt_evaluation_bundle(tmp_path, mon
     for name in names:
         payload = ({"numerical_certification": {"passed": True}}
                    if name.startswith("likelihood_") else {"complete": True})
+        if name == "recommendation.json":
+            payload["recommendation_schema_version"] = 2
+            def contrast(candidate, reference):
+                return {
+                    "candidate": candidate,
+                    "reference": reference,
+                    "mrr_gain_candidate_minus_reference": 0.0,
+                    "mrr_gain_standard_error": 0.0,
+                    "mrr_gain_95_interval": [0.0, 0.0],
+                }
+            payload["recommendation"] = {"comparisons": {
+                "gram_interaction_vs_structured_no_gram": contrast(
+                    "full_interaction", "structured_no_gram"),
+                "category_structure_vs_additive_utility": contrast(
+                    "structured_no_gram", "additive_utility"),
+                "full_structure_vs_additive_utility": contrast(
+                    "full_interaction", "additive_utility"),
+            }}
         payload.update({
             "checkpoint_sha256": candidate_digest,
             "data_fingerprint_sha256": fingerprint,
@@ -229,6 +247,46 @@ def test_certification_rejects_failed_or_corrupt_evaluation_bundle(tmp_path, mon
         "data_fingerprint_sha256": fingerprint,
     }))
     with pytest.raises(SystemExit, match="did not pass"):
+        pipeline.validate_evaluation_outputs(
+            profile="full", candidate=candidate, dry_run=False)
+
+
+def test_certification_rejects_ambiguous_legacy_recommendation_metric(
+        tmp_path, monkeypatch):
+    fingerprint = install_data_fingerprint(monkeypatch, tmp_path)
+    report = tmp_path / "reports"
+    artifact = tmp_path / "artifacts"
+    report.mkdir()
+    artifact.mkdir()
+    monkeypatch.setattr(pipeline, "REPORT", report)
+    monkeypatch.setattr(pipeline, "ART", artifact)
+    candidate = artifact / "candidate_rank1.pt"
+    candidate.write_bytes(b"test-candidate")
+    lineage = {
+        "checkpoint_sha256": pipeline.file_sha256(candidate),
+        "data_fingerprint_sha256": fingerprint,
+    }
+    for name in (
+            "likelihood_validation.json", "likelihood_test.json",
+            "generation_counterfactual.json", "customer_segments.json",
+            "interaction_embedding_audit.json"):
+        payload = dict(lineage)
+        if name.startswith("likelihood_"):
+            payload["numerical_certification"] = {"passed": True}
+        (report / name).write_text(json.dumps(payload))
+    (report / "recommendation.json").write_text(json.dumps({
+        **lineage,
+        "recommendation": {"comparison": {
+            "mrr_gain_full_minus_additive": 0.001,
+        }},
+    }))
+    np.savez(artifact / "customer_segments.npz", assignment=np.asarray([0, 1]))
+    segment = json.loads((report / "customer_segments.json").read_text())
+    segment["assignments_sha256"] = pipeline.file_sha256(
+        artifact / "customer_segments.npz")
+    (report / "customer_segments.json").write_text(json.dumps(segment))
+
+    with pytest.raises(SystemExit, match="paired-MRR schema version 2"):
         pipeline.validate_evaluation_outputs(
             profile="full", candidate=candidate, dry_run=False)
 

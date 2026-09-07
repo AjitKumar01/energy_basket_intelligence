@@ -283,6 +283,32 @@ def validate_evaluation_outputs(*, profile: str, candidate: Path,
         if parsed[path.name].get("data_fingerprint_sha256") != data_digest:
             raise SystemExit(
                 f"cannot resurrect evaluation: {path.name} belongs to another dataset")
+    recommendation_report = parsed["recommendation.json"]
+    if recommendation_report.get("recommendation_schema_version") != 2:
+        raise SystemExit(
+            "cannot resurrect evaluation: recommendation.json predates paired-MRR "
+            "schema version 2; rerun from --start-at evaluation")
+    recommendation = recommendation_report.get("recommendation", {})
+    comparisons = recommendation.get("comparisons", {})
+    required_comparisons = {
+        "gram_interaction_vs_structured_no_gram": (
+            "full_interaction", "structured_no_gram"),
+        "category_structure_vs_additive_utility": (
+            "structured_no_gram", "additive_utility"),
+        "full_structure_vs_additive_utility": (
+            "full_interaction", "additive_utility"),
+    }
+    for name, (candidate_name, reference_name) in required_comparisons.items():
+        contrast = comparisons.get(name, {})
+        if (contrast.get("candidate") != candidate_name or
+                contrast.get("reference") != reference_name or
+                "mrr_gain_candidate_minus_reference" not in contrast or
+                "mrr_gain_standard_error" not in contrast or
+                "mrr_gain_95_interval" not in contrast):
+            raise SystemExit(
+                "cannot resurrect evaluation: recommendation.json predates the "
+                f"explicit paired-MRR schema or has an invalid {name} contrast; "
+                "rerun from --start-at evaluation")
     if profile == "full":
         for name in ("likelihood_validation.json", "likelihood_test.json"):
             accepted = parsed[name].get("numerical_certification", {}).get("passed")

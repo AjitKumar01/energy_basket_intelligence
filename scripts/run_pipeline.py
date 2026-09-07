@@ -600,6 +600,7 @@ def main() -> None:
             "--spectral", basis, "--contexts", 12000 if full else 64,
             "--draws", 64 if full else 4, "--batch", 96 if full else 8,
             "--rank", rank, "--score-mass", 1.0, "--spectral-max", 1.0,
+            "--joint-additive-polish", "--additive-polish-ridge", 1e-3,
             "--threads", cpu_threads,
             "--minimum-crossfit-gain", 0.005 if full else -1.0,
             "--minimum-half-gain", 0.0 if full else -1e9,

@@ -4,9 +4,12 @@
 The additive model is an exact proposal.  In a fixed orthonormal product basis U,
 
     K = U C U',                 0 <= C <= spectral_max^2 I,
-    Delta rho_0(n) = a (n/10) + c (n/10)^2,
+    Delta b_j = a' v_j,
+    Delta rho_0(n) = s_1 (n/10) + s_2 (n/10)^2,
 
-so the log-density ratio is linear in the natural parameters (C, a, c).  Fixed
+where v_j is a centred orthonormal basis spanning the selected interaction directions.
+The additive correction is optional; when enabled, the log-density ratio is linear in
+the natural parameters (C, a, s_1, s_2).  Fixed
 common-random-number draws from the additive parent turn the likelihood-ratio
 objective into a deterministic concave function.  Projected gradient ascent with
 Armijo backtracking therefore has one global target and every accepted optimization
@@ -65,6 +68,21 @@ def pair_statistic(items: torch.Tensor, basis: torch.Tensor) -> np.ndarray:
     return (0.5 * (torch.outer(total, total) - rows.T @ rows)).cpu().numpy()
 
 
+def additive_statistic(items: torch.Tensor, basis: torch.Tensor) -> np.ndarray:
+    """Sufficient statistic for a centred low-rank product-utility correction."""
+    return basis[torch.unique(items)].sum(0).cpu().numpy()
+
+
+def centered_additive_basis(basis: np.ndarray) -> np.ndarray:
+    """Orthonormal centred span used to polish item intercepts without a size gauge."""
+    centered = np.asarray(basis, dtype=np.float64) - np.asarray(
+        basis, dtype=np.float64).mean(axis=0, keepdims=True)
+    value, singular, _ = np.linalg.svd(centered, full_matrices=False)
+    if singular[-1] <= max(float(singular[0]), 1.0) * 1e-10:
+        raise RuntimeError("centred interaction span loses an additive direction")
+    return value
+
+
 def size_statistic(size: np.ndarray | float) -> np.ndarray:
     z = np.asarray(size, dtype=np.float64) / 10.0
     return np.stack((-z, -z * z), axis=-1)
@@ -76,6 +94,18 @@ def flatten_parameters(c_matrix: np.ndarray, theta: np.ndarray) -> np.ndarray:
 
 def split_parameters(vector: np.ndarray, rank: int) -> tuple[np.ndarray, np.ndarray]:
     return vector[:rank * rank].reshape(rank, rank), vector[rank * rank:]
+
+
+def split_joint_parameters(vector: np.ndarray, rank: int,
+                           additive_rank: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    interaction_width = rank * rank
+    expected = interaction_width + additive_rank + 2
+    if len(vector) != expected:
+        raise ValueError(f"expected {expected} natural parameters, received {len(vector)}")
+    c_matrix = vector[:interaction_width].reshape(rank, rank)
+    additive = vector[interaction_width:interaction_width + additive_rank]
+    size = vector[-2:]
+    return c_matrix, additive, size
 
 
 def project_size(theta: np.ndarray, zmax: float) -> np.ndarray:
@@ -94,17 +124,20 @@ def project_size(theta: np.ndarray, zmax: float) -> np.ndarray:
 
 
 def project(vector: np.ndarray, rank: int, spectral_max: float,
-            zmax: float) -> np.ndarray:
-    c_matrix, theta = split_parameters(vector, rank)
+            zmax: float, additive_rank: int = 0) -> np.ndarray:
+    c_matrix, additive, theta = split_joint_parameters(
+        vector, rank, additive_rank)
     c_matrix = 0.5 * (c_matrix + c_matrix.T)
     eigenvalue, eigenvector = np.linalg.eigh(c_matrix)
     eigenvalue = np.clip(eigenvalue, 0.0, spectral_max * spectral_max)
     c_matrix = (eigenvector * eigenvalue[None, :]) @ eigenvector.T
-    return flatten_parameters(c_matrix, project_size(theta, zmax))
+    return np.concatenate((c_matrix.reshape(-1), additive,
+                           project_size(theta, zmax)))
 
 
 def objective_gradient(vector: np.ndarray, observed: np.ndarray, draws: np.ndarray,
-                       rank: int, ridge: float, size_ridge: float
+                       rank: int, ridge: float, size_ridge: float,
+                       additive_rank: int = 0, additive_ridge: float = 0.0
                        ) -> tuple[float, np.ndarray, np.ndarray]:
     logits = np.einsum("mdp,p->md", draws, vector, optimize=True)
     log_normalizer = logsumexp(logits, axis=1) - np.log(draws.shape[1])
@@ -116,24 +149,31 @@ def objective_gradient(vector: np.ndarray, observed: np.ndarray, draws: np.ndarr
     second = np.einsum("md,mdp->mp", weight, np.square(draws), optimize=True)
     fisher_diagonal = np.mean(second - np.square(expectation), axis=0)
     interaction_width = rank * rank
+    additive_slice = slice(interaction_width, interaction_width + additive_rank)
+    size_slice = slice(interaction_width + additive_rank, None)
     objective -= 0.5 * ridge * float(vector[:interaction_width] @
                                      vector[:interaction_width])
-    objective -= 0.5 * size_ridge * float(vector[interaction_width:] @
-                                          vector[interaction_width:])
+    objective -= 0.5 * additive_ridge * float(
+        vector[additive_slice] @ vector[additive_slice])
+    objective -= 0.5 * size_ridge * float(vector[size_slice] @ vector[size_slice])
     gradient[:interaction_width] -= ridge * vector[:interaction_width]
-    gradient[interaction_width:] -= size_ridge * vector[interaction_width:]
+    gradient[additive_slice] -= additive_ridge * vector[additive_slice]
+    gradient[size_slice] -= size_ridge * vector[size_slice]
     fisher_diagonal[:interaction_width] += ridge
-    fisher_diagonal[interaction_width:] += size_ridge
+    fisher_diagonal[additive_slice] += additive_ridge
+    fisher_diagonal[size_slice] += size_ridge
     return objective, gradient, fisher_diagonal
 
 
 def projected_solve(observed: np.ndarray, draws: np.ndarray, rank: int,
                     spectral_max: float, zmax: float, ridge: float,
                     size_ridge: float, max_iterations: int, tolerance: float,
-                    label: str) -> tuple[np.ndarray, dict]:
-    vector = np.zeros(rank * rank + 2, dtype=np.float64)
+                    label: str, *, additive_rank: int = 0,
+                    additive_ridge: float = 0.0) -> tuple[np.ndarray, dict]:
+    vector = np.zeros(rank * rank + additive_rank + 2, dtype=np.float64)
     objective, gradient, fisher_diagonal = objective_gradient(
-        vector, observed, draws, rank, ridge, size_ridge)
+        vector, observed, draws, rank, ridge, size_ridge,
+        additive_rank, additive_ridge)
     initial_objective = objective
     step = 1.0
     history = [objective]
@@ -141,7 +181,7 @@ def projected_solve(observed: np.ndarray, draws: np.ndarray, rank: int,
     projected_norm = float("inf")
     for iteration in range(1, max_iterations + 1):
         unit_projection = project(
-            vector + gradient, rank, spectral_max, zmax) - vector
+            vector + gradient, rank, spectral_max, zmax, additive_rank) - vector
         projected_norm = float(np.linalg.norm(unit_projection))
         if projected_norm <= tolerance:
             converged = True
@@ -154,20 +194,26 @@ def projected_solve(observed: np.ndarray, draws: np.ndarray, rank: int,
         trial_step = step
         for _ in range(40):
             candidate = project(
-                vector + trial_step * direction_seed, rank, spectral_max, zmax)
+                vector + trial_step * direction_seed,
+                rank, spectral_max, zmax, additive_rank)
             direction = candidate - vector
             directional = float(gradient @ direction)
             if directional <= 0.0:
                 candidate = project(
-                    vector + trial_step * gradient, rank, spectral_max, zmax)
+                    vector + trial_step * gradient,
+                    rank, spectral_max, zmax, additive_rank)
                 direction = candidate - vector
                 directional = float(gradient @ direction)
             if np.linalg.norm(direction) <= tolerance * 0.1:
-                converged = projected_norm <= 10.0 * tolerance
-                accepted = True
-                break
+                if projected_norm <= 10.0 * tolerance:
+                    converged = True
+                    accepted = True
+                    break
+                raise RuntimeError(
+                    f"{label}: line search stalled above convergence tolerance")
             candidate_objective, candidate_gradient, candidate_fisher_diagonal = objective_gradient(
-                candidate, observed, draws, rank, ridge, size_ridge)
+                candidate, observed, draws, rank, ridge, size_ridge,
+                additive_rank, additive_ridge)
             if candidate_objective >= objective + 1e-4 * directional:
                 vector = candidate
                 objective = candidate_objective
@@ -205,9 +251,8 @@ def projected_solve(observed: np.ndarray, draws: np.ndarray, rank: int,
 
 
 def evaluate(vector: np.ndarray, observed: np.ndarray, draws: np.ndarray) -> dict:
+    gain = likelihood_gain(vector, observed, draws)
     logits = np.einsum("mdp,p->md", draws, vector, optimize=True)
-    gain = observed @ vector - (
-        logsumexp(logits, axis=1) - np.log(draws.shape[1]))
     normalized = np.exp(logits - logsumexp(logits, axis=1, keepdims=True))
     ess = 1.0 / np.square(normalized).sum(axis=1)
     observed_size = -10.0 * observed[:, -2]
@@ -231,6 +276,48 @@ def evaluate(vector: np.ndarray, observed: np.ndarray, draws: np.ndarray) -> dic
     }
 
 
+def likelihood_gain(vector: np.ndarray, observed: np.ndarray,
+                    draws: np.ndarray) -> np.ndarray:
+    """Per-context CRN likelihood-ratio gain over the additive proposal."""
+    logits = np.einsum("mdp,p->md", draws, vector, optimize=True)
+    return observed @ vector - (
+        logsumexp(logits, axis=1) - np.log(draws.shape[1]))
+
+
+def paired_gain_summary(delta: np.ndarray) -> dict:
+    value = np.asarray(delta, dtype=np.float64)
+    if value.ndim != 1 or len(value) < 2 or not np.isfinite(value).all():
+        raise ValueError("paired gain requires at least two finite contexts")
+    mean = float(value.mean())
+    standard_error = float(value.std(ddof=1) / np.sqrt(len(value)))
+    return {
+        "contexts": int(len(value)),
+        "mean": mean,
+        "standard_error": standard_error,
+        "lower_95": mean - 1.96 * standard_error,
+        "upper_95": mean + 1.96 * standard_error,
+    }
+
+
+def additive_polish_decision(delta_a_on_b: np.ndarray,
+                             delta_b_on_a: np.ndarray,
+                             minimum_lower_95: float = 0.0) -> dict:
+    """Predeclared nested-model gate for the optional additive correction."""
+    summary_a = paired_gain_summary(delta_a_on_b)
+    summary_b = paired_gain_summary(delta_b_on_a)
+    combined = paired_gain_summary(np.concatenate((delta_a_on_b, delta_b_on_a)))
+    accepted = bool(
+        summary_a["mean"] > 0.0 and summary_b["mean"] > 0.0
+        and combined["lower_95"] > minimum_lower_95)
+    return {
+        "accepted": accepted,
+        "minimum_required_combined_lower_95": minimum_lower_95,
+        "a_fit_b_increment": summary_a,
+        "b_fit_a_increment": summary_b,
+        "combined_increment": combined,
+    }
+
+
 def atomic_save(path: Path, payload: dict) -> None:
     temporary = Path(str(path) + ".tmp")
     torch.save(payload, temporary)
@@ -251,6 +338,13 @@ def main() -> None:
     parser.add_argument("--ridges", type=float, nargs="+",
                         default=[1e-4, 3e-4, 1e-3, 3e-3, 1e-2])
     parser.add_argument("--size-ridge", type=float, default=1e-6)
+    parser.add_argument("--joint-additive-polish", action="store_true",
+                        help=("jointly fit a centred rank-r correction to the existing "
+                              "product intercepts in the accepted interaction span"))
+    parser.add_argument("--additive-polish-ridge", type=float, default=1e-3)
+    parser.add_argument("--minimum-additive-polish-lcb", type=float, default=0.0,
+                        help=("minimum paired 95%% lower bound for accepting the joint "
+                              "additive correction over the restricted interaction fit"))
     parser.add_argument("--max-iterations", type=int, default=300)
     parser.add_argument("--tolerance", type=float, default=1e-3,
                         help=("Euclidean projected-gradient tolerance; 1e-3 leaves "
@@ -286,6 +380,10 @@ def main() -> None:
             "data_fingerprint_sha256"):
         raise RuntimeError("spectral basis and additive checkpoint data differ")
     basis = torch.as_tensor(basis_np, dtype=model.phi.dtype)
+    additive_rank = args.rank if args.joint_additive_polish else 0
+    additive_basis_np = (centered_additive_basis(basis_np)
+                         if additive_rank else np.empty((len(basis_np), 0)))
+    additive_basis = torch.as_tensor(additive_basis_np, dtype=model.phi.dtype)
 
     population = supported_trips(data, 0, int(meta["nmax"]))
     context_count = len(population) if args.contexts == 0 else args.contexts
@@ -296,7 +394,7 @@ def main() -> None:
     half = rng.random(context_count) < 0.5
     if half.all() or (~half).all():
         raise RuntimeError("degenerate cross-fit split")
-    width = args.rank * args.rank + 2
+    width = args.rank * args.rank + additive_rank + 2
     observed = np.empty((context_count, width), dtype=np.float64)
     draws = np.empty((context_count, args.draws, width), dtype=np.float64)
     features = Features(int(data["n_item"]), int(data["n_store"]), 712,
@@ -313,33 +411,53 @@ def main() -> None:
             observed_items = li[lt == local]
             observed[start + local, :args.rank * args.rank] = pair_statistic(
                 observed_items, basis).reshape(-1)
-            observed[start + local, args.rank * args.rank:] = size_statistic(
+            if additive_rank:
+                begin = args.rank * args.rank
+                observed[start + local, begin:begin + additive_rank] = \
+                    additive_statistic(observed_items, additive_basis)
+            observed[start + local, -2:] = size_statistic(
                 float(torch.unique(observed_items).numel()))
             for draw_index, state in enumerate(states):
                 items = ix.item[state[local]]
                 unique_size = float(torch.unique(items).numel())
                 draws[start + local, draw_index, :args.rank * args.rank] = \
                     pair_statistic(items, basis).reshape(-1)
-                draws[start + local, draw_index, args.rank * args.rank:] = \
+                if additive_rank:
+                    begin = args.rank * args.rank
+                    draws[start + local, draw_index,
+                          begin:begin + additive_rank] = \
+                        additive_statistic(items, additive_basis)
+                draws[start + local, draw_index, -2:] = \
                     size_statistic(unique_size)
         if (start // args.batch + 1) % 10 == 0 or start + args.batch >= context_count:
             print(f"[natural-mcle] sampled {min(start + args.batch, context_count)}/"
                   f"{context_count} contexts", flush=True)
 
     zmax = float(model.rho_0_free.numel()) / 10.0
+    # Ridge selection remains anchored to the established interaction-plus-size model.
+    # The additive polish is tested only after that choice, so it cannot hijack interaction
+    # acceptance or choose its own favorable regularization from the same cross-fit panel.
+    restricted_columns = np.r_[np.arange(args.rank * args.rank),
+                               np.arange(width - 2, width)]
+    restricted_observed = observed[:, restricted_columns]
+    restricted_draws = draws[:, :, restricted_columns]
     ridge_rows = []
-    candidates = {}
+    restricted_candidates = {}
     for ridge in args.ridges:
         vector_a, solve_a = projected_solve(
-            observed[half], draws[half], args.rank, args.spectral_max, zmax,
+            restricted_observed[half], restricted_draws[half],
+            args.rank, args.spectral_max, zmax,
             ridge, args.size_ridge, args.max_iterations, args.tolerance,
             f"ridge={ridge:g}/half-a")
         vector_b, solve_b = projected_solve(
-            observed[~half], draws[~half], args.rank, args.spectral_max, zmax,
+            restricted_observed[~half], restricted_draws[~half],
+            args.rank, args.spectral_max, zmax,
             ridge, args.size_ridge, args.max_iterations, args.tolerance,
             f"ridge={ridge:g}/half-b")
-        a_on_b = evaluate(vector_a, observed[~half], draws[~half])
-        b_on_a = evaluate(vector_b, observed[half], draws[half])
+        a_on_b = evaluate(
+            vector_a, restricted_observed[~half], restricted_draws[~half])
+        b_on_a = evaluate(
+            vector_b, restricted_observed[half], restricted_draws[half])
         row = {
             "ridge": ridge,
             "a_fit_b": a_on_b,
@@ -350,25 +468,101 @@ def main() -> None:
             "solve_b": solve_b,
         }
         ridge_rows.append(row)
-        candidates[ridge] = (vector_a, vector_b)
+        restricted_candidates[float(ridge)] = (vector_a, vector_b)
     eligible = [row for row in ridge_rows
                 if row["minimum_crossfit_gain"] > args.minimum_half_gain]
     selected = max(eligible or ridge_rows, key=lambda row: row["mean_crossfit_gain"])
     selected_ridge = float(selected["ridge"])
-    vector, full_solve = projected_solve(
-        observed, draws, args.rank, args.spectral_max, zmax, selected_ridge,
-        args.size_ridge, args.max_iterations, args.tolerance, "full")
+    restricted_a, restricted_b = restricted_candidates[selected_ridge]
+    additive_gate = {
+        "requested": bool(additive_rank),
+        "accepted": False,
+        "reason": "not requested",
+    }
+    if additive_rank:
+        try:
+            joint_a, joint_solve_a = projected_solve(
+                observed[half], draws[half], args.rank, args.spectral_max, zmax,
+                selected_ridge, args.size_ridge, args.max_iterations, args.tolerance,
+                "joint-polish/half-a", additive_rank=additive_rank,
+                additive_ridge=args.additive_polish_ridge)
+            joint_b, joint_solve_b = projected_solve(
+                observed[~half], draws[~half], args.rank, args.spectral_max, zmax,
+                selected_ridge, args.size_ridge, args.max_iterations, args.tolerance,
+                "joint-polish/half-b", additive_rank=additive_rank,
+                additive_ridge=args.additive_polish_ridge)
+        except RuntimeError as exc:
+            polish_accepted = False
+            additive_gate = {
+                "requested": True,
+                "accepted": False,
+                "minimum_required_combined_lower_95": (
+                    args.minimum_additive_polish_lcb),
+                "reason": f"joint correction solver rejected safely: {exc}",
+            }
+        else:
+            delta_a_on_b = (
+                likelihood_gain(joint_a, observed[~half], draws[~half])
+                - likelihood_gain(restricted_a, restricted_observed[~half],
+                                  restricted_draws[~half]))
+            delta_b_on_a = (
+                likelihood_gain(joint_b, observed[half], draws[half])
+                - likelihood_gain(restricted_b, restricted_observed[half],
+                                  restricted_draws[half]))
+            decision = additive_polish_decision(
+                delta_a_on_b, delta_b_on_a,
+                args.minimum_additive_polish_lcb)
+            polish_accepted = decision["accepted"]
+            additive_gate = {
+                "requested": True,
+                **decision,
+                "solve_a": joint_solve_a,
+                "solve_b": joint_solve_b,
+                "reason": ("cross-fitted paired likelihood improvement"
+                           if polish_accepted else
+                           "joint correction did not beat the restricted fit out of fold"),
+            }
+    else:
+        polish_accepted = False
+
+    if polish_accepted:
+        try:
+            vector, full_solve = projected_solve(
+                observed, draws, args.rank, args.spectral_max, zmax, selected_ridge,
+                args.size_ridge, args.max_iterations, args.tolerance, "full-joint",
+                additive_rank=additive_rank,
+                additive_ridge=args.additive_polish_ridge)
+        except RuntimeError as exc:
+            polish_accepted = False
+            additive_gate["accepted"] = False
+            additive_gate["reason"] = (
+                f"full joint correction solver rejected safely: {exc}")
+    if polish_accepted:
+        a_on_b = evaluate(joint_a, observed[~half], draws[~half])
+        b_on_a = evaluate(joint_b, observed[half], draws[half])
+    else:
+        restricted_full, full_solve = projected_solve(
+            restricted_observed, restricted_draws, args.rank,
+            args.spectral_max, zmax, selected_ridge, args.size_ridge,
+            args.max_iterations, args.tolerance, "full-restricted")
+        vector = np.zeros(width, dtype=np.float64)
+        vector[:args.rank * args.rank] = restricted_full[:args.rank * args.rank]
+        vector[-2:] = restricted_full[-2:]
+        a_on_b = evaluate(
+            restricted_a, restricted_observed[~half], restricted_draws[~half])
+        b_on_a = evaluate(
+            restricted_b, restricted_observed[half], restricted_draws[half])
     full = evaluate(vector, observed, draws)
-    c_matrix, theta = split_parameters(vector, args.rank)
+    c_matrix, additive_delta, theta = split_joint_parameters(
+        vector, args.rank, additive_rank)
     c_eigenvalues = np.linalg.eigvalsh(c_matrix)[::-1]
     crossfit_ess_fraction = min(
-        selected["a_fit_b"]["ess_fraction_median"],
-        selected["b_fit_a"]["ess_fraction_median"])
-    crossfit_ess_p01 = min(
-        selected["a_fit_b"]["ess_p01"], selected["b_fit_a"]["ess_p01"])
+        a_on_b["ess_fraction_median"], b_on_a["ess_fraction_median"])
+    crossfit_ess_p01 = min(a_on_b["ess_p01"], b_on_a["ess_p01"])
     accepted = bool(
-        selected["minimum_crossfit_gain"] > args.minimum_half_gain
-        and selected["mean_crossfit_gain"] >= args.minimum_crossfit_gain
+        min(a_on_b["gain"], b_on_a["gain"]) > args.minimum_half_gain
+        and 0.5 * (a_on_b["gain"] + b_on_a["gain"])
+        >= args.minimum_crossfit_gain
         and crossfit_ess_fraction >= args.minimum_ess_fraction
         and crossfit_ess_p01 >= args.minimum_ess_p01
         and full_solve["converged"] and full_solve["accepted_steps_monotone"])
@@ -384,6 +578,15 @@ def main() -> None:
         "draws_per_context": args.draws,
         "rank": args.rank,
         "natural_parameters": width,
+        "joint_additive_polish": bool(args.joint_additive_polish),
+        "additive_polish_rank": additive_rank,
+        "additive_polish_ridge": args.additive_polish_ridge,
+        "additive_polish_coefficients": additive_delta.tolist(),
+        "additive_polish_gate": additive_gate,
+        "additive_polish_catalogue_mean": float(
+            (additive_basis_np @ additive_delta).mean()) if additive_rank else 0.0,
+        "additive_polish_catalogue_rms": float(np.sqrt(np.mean(np.square(
+            additive_basis_np @ additive_delta)))) if additive_rank else 0.0,
         "interaction_products": keep_count,
         "score_mass": args.score_mass,
         "half_contexts": [int(half.sum()), int((~half).sum())],
@@ -393,8 +596,8 @@ def main() -> None:
                                   "nmax": int(model.rho_0_free.numel())},
         "ridge_audit": ridge_rows,
         "selected_ridge": selected_ridge,
-        "selected_crossfit_gain": selected["mean_crossfit_gain"],
-        "selected_minimum_half_gain": selected["minimum_crossfit_gain"],
+        "selected_crossfit_gain": 0.5 * (a_on_b["gain"] + b_on_a["gain"]),
+        "selected_minimum_half_gain": min(a_on_b["gain"], b_on_a["gain"]),
         "crossfit_ess_fraction": crossfit_ess_fraction,
         "crossfit_ess_p01": crossfit_ess_p01,
         "minimum_required_crossfit_gain": args.minimum_crossfit_gain,
@@ -424,6 +627,9 @@ def main() -> None:
     with torch.no_grad():
         model.phi.zero_()
         model.phi[:, :phi.shape[1]].copy_(torch.as_tensor(phi, dtype=model.phi.dtype))
+        if additive_rank:
+            model.lam.add_(torch.as_tensor(
+                additive_basis_np @ additive_delta, dtype=model.lam.dtype))
         n = torch.arange(1, model.rho_0_free.numel() + 1,
                          dtype=model.rho_0_free.dtype)
         model.rho_0_free.add_(theta[0] * n / 10.0 + theta[1] * n.square() / 100.0)

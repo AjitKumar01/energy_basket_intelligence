@@ -70,6 +70,9 @@ and all downstream queries, see
 The executable architecture, stage and artifact graph, active-versus-experimental module
 map, and current implementation issue register are in
 [`paper/CODEBASE_ARCHITECTURE.md`](paper/CODEBASE_ARCHITECTURE.md).
+The experimental restricted joint additive--interaction refinement, its fail-closed gate,
+synthetic efficacy result and scalability calculation are documented in
+[`paper/JOINT_INTERACTION_POLISH_AUDIT.md`](paper/JOINT_INTERACTION_POLISH_AUDIT.md).
 Stage-wise interruption recovery, checkpoint prerequisites, cross-machine transfer and
 all `--start-at` commands are documented in
 [`paper/STAGEWISE_RESURRECTION.md`](paper/STAGEWISE_RESURRECTION.md).

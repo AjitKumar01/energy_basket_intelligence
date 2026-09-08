@@ -248,9 +248,11 @@ K=\Phi\Phi^\top
 \tag{11}
 \]
 
-is positive semidefinite. Thus the Gaussian interaction represents attractive low-rank
-structure. The explicit category term can represent structured repulsion that a real
-Gaussian Gram matrix cannot.
+is positive semidefinite. This is a restriction on the complete matrix, not an
+entry-by-entry sign restriction: an off-diagonal inner product \(K_{jk}\) may be positive,
+zero or negative. The Gaussian term therefore represents a low-rank PSD interaction
+geometry; it does not declare every product pair complementary. The explicit category
+term supplies an additional structured within-category effect.
 
 ### 4.1 Identified pair-specific complement coefficient
 
@@ -826,6 +828,40 @@ because it is the first-order nuisance direction created by a positive Gram kern
 Independent high-order Smolyak likelihood, rather than the sampled training objective,
 decides whether the resulting block update is accepted.
 
+### Phase D2 — canonical size-stratified natural-parameter estimator
+
+Ordinary additive-parent draws can omit a rare size range. ESS among the baskets that were
+drawn cannot detect a range that received no draw. The canonical estimator therefore
+partitions \(1{:}120\) into declared size bands and uses
+
+\[
+\frac{Z_{\eta,+}(x)}{Z_{0,+}(x)}
+=
+\sum_\ell P_0(N\in\mathcal B_\ell\mid x)
+\mathbb E_0[e^{h_\eta(S)}\mid N\in\mathcal B_\ell,x].
+\tag{40g}
+\]
+
+The additive DP supplies the exact band probabilities and exact draws conditional on
+size. With fixed draws, the objective is still linear minus log-sum-exp. The general
+implementation can jointly fit \(C\), a bounded correction to the existing \(\rho_c\), and
+a smooth piecewise-linear correction written into the existing
+\(\rho_0(1{:}120)\) table. It does not introduce a new probability factor or remove any
+basket from support.
+
+The bounded audit did not support freeing all three blocks: the category corrections
+overfit the sampled bank and one cross-fit half lost likelihood. The canonical estimator
+therefore freezes the already fitted \(\rho_c\) and optimizes only \(C\) and the smooth
+\(\rho_0\) correction. This is a result-driven restriction of the estimation block, not a
+change to the probability law. The 300 frozen category coordinates are omitted from the
+draw bank and optimizer rather than retained as redundant zeros.
+
+The partition-ratio estimator is unbiased before taking its logarithm. Its logarithm is
+finite-sample biased, so an independently evaluated Smolyak likelihood remains the
+acceptance authority. Overall ESS is replaced by within-size-band ESS. Complete
+derivations, variance allocation, complexity, bounded results, and gates are in
+[SIZE_STRATIFIED_JOINT_ESTIMATOR.md](SIZE_STRATIFIED_JOINT_ESTIMATOR.md).
+
 ### Phase E — convergence and test
 
 Use a fixed representative validation panel for scheduling and checkpoint selection. Read
@@ -1209,6 +1245,21 @@ Finally, for orthogonal \(Q\),
 
 Only the Gram matrix is substantively identified; the orientation of latent columns is not.
 
+There is a further interaction/size gauge whenever the transformed kernel remains
+admissible. The change
+
+\[
+K^+=K+a\mathbf1\mathbf1^\top,
+\qquad
+\rho_0^+(n)=\rho_0(n)+a{n\choose2}
+\tag{61a}
+\]
+
+adds and subtracts the same \(a{n\choose2}\) basket energy. Absolute pair coefficients are
+therefore not automatically identified against a quadratic size component. Reported
+complementarity should rely on energy cross-differences such as (11b), invariant Gram
+contrasts, and an explicitly declared numerical gauge or penalty.
+
 ---
 
 ## 17. Basket-size response and price counterfactuals
@@ -1575,8 +1626,10 @@ V_\tau(b)=
 \tag{80c}
 \]
 
-Upward cost rounding and a tightened terminal grid guarantee at least 95% planned budget
-utilization without overspending the supplied budget. The result is a conservative
+Upward cost rounding and a tightened terminal grid guarantee no planned overspend. At
+least 95% planned utilization is required as an acceptance gate when it is feasible under
+the discrete action costs and finite horizon; the recursion cannot manufacture such a
+plan when the action set makes it infeasible. A passing result is a conservative
 budget-allocation policy among modeled arriving trips. Because the basket law is
 conditional on a nonempty trip and represents incidence rather than units, the reward is
 not causal profit: it omits visit response, unit quantities, wholesale cost, inventory and
@@ -1652,15 +1705,19 @@ The next approved run should not declare convergence from a flat noisy trace alo
 1. Energy (8) remains unchanged.
 2. All offered products remain in each likelihood normalizer.
 3. Support remains \(1\le n\le120\).
-4. Rank seven remains fixed unless a new split-stability audit approves another rank.
+4. Rank is selected by the predeclared split-stability audit; the current certified rank
+   is five. A higher rank requires a new stable residual direction and a fresh audit.
 5. No empirical size factorization or recommendation loss is introduced.
 
 ### 22.2 Estimator contract
 
 1. ESP/category computation is exact at every node.
-2. Direct \(q=8\) is permitted only in the coarse phase.
-3. The final phase uses the unbiased level-9 score (51), or direct level 9.
-4. Level 10 audits both value and gradient.
+2. Quadrature levels are stated relative to active rank; labels inherited from rank seven
+   are not a model contract.
+3. A multifidelity score is unbiased for its declared finite quadrature target, not for
+   the exact Gaussian integral.
+4. The next higher rules audit value and gradient. Adjacent-rule agreement is an empirical
+   numerical diagnostic, not a formal deterministic error bound.
 5. No estimator-difficult trip is skipped.
 6. A non-positive signed partition is rejected, never clamped.
 7. Fidelity failure stops gracefully and preserves the last certified best.
@@ -1743,44 +1800,42 @@ Executable enumeration tests establish that:
 - revealed-set conditioning is the conditional of the same joint law; and
 - conditional generation matches enumerable laws within Monte Carlo error.
 
-The corrected end-to-end execution additionally establishes the following empirical facts.
-The exact additive parent converged from \(-49.622960\) to \(-44.748944\) nats/basket on
-its fixed validation panel. A split-half score audit selected rank five, with mean squared
-subspace overlap \(0.549018\). The constrained fixed-draw natural-parameter solve then
-found a cross-fitted gain of approximately \(0.0243\) nats/basket with median effective
-sample fraction \(0.9981\).
+The canonical size-stratified execution completed on 2026-09-08. The exact additive parent
+selected iteration 13,100 and the split-half score audit selected rank five. The
+12,000-context, 64-draw stratified natural-parameter solve found a mean cross-fitted gain
+of \(0.019865\) nats/basket; its weaker half gained \(0.019596\), and its minimum
+within-band ESS fraction was \(0.3993\).
 
 On locked 4,096-trip panels, the interaction child improves over its matched exact
 additive parent by
 
 \[
 \widehat\Delta_{\mathrm{val}}
-=0.021630\pm0.001581
+=0.026754\pm0.002376
 \quad\text{and}\quad
 \widehat\Delta_{\mathrm{test}}
-=0.023908\pm0.001647
+=0.031009\pm0.002645
 \quad\text{nats/basket}.
 \tag{87}
 \]
 
-The higher-rule numerical error bounds are \(0.000510\) and \(0.000720\) nats,
-respectively, so both paired gains remain positive after numerical allowance. This is the
-first corrected-data result that statistically establishes a Gram-interaction likelihood
-gain over the exact additive parent.
+The lower 95% bounds after the adjacent higher-rule empirical numerical allowances are
+\(0.021744\) and \(0.025290\) nats, respectively. Both paired gains therefore remain
+positive after numerical allowance.
 
 Recommendation is also evaluated from the same law. Total MRR is
 
 \[
-0.095144\pm0.006083,
+0.095246\pm0.006075,
 \tag{88}
 \]
 
 but the interaction increment over additive MRR is only
 
 \[
-0.000247\pm0.000372,
+0.001165\pm0.000627,
 \qquad
-95\%\ \mathrm{CI}=[-0.000481,0.000976].
+95\%\ \mathrm{CI}=[-0.000064,0.002394].
 \tag{89}
 \]
 
@@ -1789,14 +1844,17 @@ Eq. (87): log likelihood is a proper score for the whole basket distribution, wh
 is a discontinuous one-hidden-item ranking functional.
 
 Generation has no invalid-assortment or duplicate-item baskets and price counterfactuals
-move in the theoretically required direction. Production certification nevertheless
-fails. The aggregate \(N\ge60\) rate passes its calibrated bound, but the high-accuracy
-audit finds 12 high-risk contexts with \(P(N\ge60)\ge0.5\), including a maximum of
-\(0.73837\) when observed size is below 40. Hence the current fitted parameters are a
-research candidate, not a safe retailer simulator.
+move in the theoretically required direction. On all 160,007 supported training contexts,
+zero contexts have \(P(N\ge60)\ge0.5\). The bias-corrected population tail rate is
+\(0.003445\), with 95% upper bound \(0.003570\) below the declared \(0.003700\) limit,
+so population certification passes with a narrow margin. The generation panel nevertheless
+remains under-dispersed: generated size mean and variance are \(7.26\) and \(72.97\), compared
+with observed \(10.03\) and \(136.28\). Since SMC ESS is approximately one, this is a
+fitted size/heterogeneity calibration problem rather than particle collapse.
 
-All exact numbers, panels and artifact paths are in
-[CORRECTED_PIPELINE_RESULTS.md](CORRECTED_PIPELINE_RESULTS.md).
+Estimator derivations, bounded gates, and the canonical full-run contract are in
+[SIZE_STRATIFIED_JOINT_ESTIMATOR.md](SIZE_STRATIFIED_JOINT_ESTIMATOR.md); current
+machine-readable results are under `reports/`.
 
 ---
 
@@ -1811,10 +1869,11 @@ also be respected:
 2. the interaction MRR claim is not accepted;
 3. historical baseline results are not comparable until those baselines converge on the
    corrected cohort and identical manifests;
-4. the current candidate is not authorized for production generation or policy
-   simulation; and
-5. the next fit must address the localized extreme-size phase within the existing
-   \(\rho_0,\rho_c,\Phi\) theory and then rerun every locked gate.
+4. the localized majority-tail certification now passes, but generation calibration is
+   not yet strong enough for an unconditional production simulator; and
+5. explicit size-stratum coverage with the regularized \(C,\rho_0\) update is now the
+   canonical estimator; the former ordinary draw estimator is retained only for
+   reproducibility.
 
 No numerical averaging over contexts may replace the local tail gate, and no post-hoc
 checkpoint choice may replace a fresh end-to-end execution.

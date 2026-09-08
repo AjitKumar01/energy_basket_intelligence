@@ -22,7 +22,7 @@ The ordered stages are:
 
 | Stage | Work performed | Principal durable output |
 |---|---|---|
-| `data` | preprocessing audit, training-only affinity partition, ragged cache | `basket_input/preprocessing_manifest.json` |
+| `data` | preprocessing audit, training-only affinity partition, ragged cache and immutable model-data identity | `basket_input/model_data_fingerprint.json` |
 | `initialize` | fresh Version-4 parameter initialization | `artifacts/initialization.pt` |
 | `additive` | exact complete-support additive maximum likelihood | `out/v3_pipeline_additive_best.pt` and `out/v3_pipeline_additive.pt` |
 | `rank` | split-half interaction-rank audit and spectral basis | `artifacts/interaction_basis_rank8.{npz,json}` for full runs |
@@ -37,6 +37,12 @@ Every recovery invocation still performs the data-integrity audit, reconstructs 
 deterministic affinity partition and ragged cache, and rebuilds the local native extension.
 This is intentional: a checkpoint must never be evaluated against silently different data
 or an incompatible local binary.
+
+The regenerated `basket_input/model_data_fingerprint.json` is the root of the artifact
+lineage. It hashes the preprocessing manifest, explicit price-basis metadata, affinity
+partition and manifest, basket metadata and ragged index. Every checkpoint and report
+must name that exact fingerprint. Matching dimensions, filenames or iteration numbers
+are not substitutes for matching content.
 
 ## 3. Fresh execution and deliberate stopping
 
@@ -88,6 +94,7 @@ If `--resume-additive` is supplied without `--start-at`, the driver automaticall
 Before restarting compute, the driver verifies that:
 
 - the initialization artifact uses the rank-one household-size parameterization;
+- its model-data fingerprint equals the freshly audited local fingerprint;
 - the checkpoint is an exact Version-4 additive checkpoint;
 - its stored initialization digest matches `artifacts/initialization.pt`; and
 - the resumed batch and seed contract match the original run.
@@ -158,7 +165,8 @@ python scripts/run_pipeline.py --profile full --start-at interaction \
 ```
 
 The driver reads the largest accepted rank from the JSON report and verifies that the
-basis was built from the restored best additive iteration. It then runs both parts of the
+basis was built from the restored best additive checkpoint and that the NPZ content hash
+matches the JSON receipt. It then runs both parts of the
 interaction stage: the constrained natural-parameter fit and the post-interaction
 household-size recalibration/safety projection.
 
@@ -203,6 +211,11 @@ artifacts/initialization.pt
 artifacts/candidate_rank1.pt
 ```
 
+Required data-lineage files include `data/build_meta.json`,
+`basket_input/preprocessing_manifest.json`, and
+`basket_input/model_data_fingerprint.json`; the driver regenerates and verifies the latter
+before accepting any model file.
+
 Required evaluation files:
 
 ```text
@@ -214,6 +227,11 @@ reports/customer_segments.json
 reports/interaction_embedding_audit.json
 artifacts/customer_segments.npz
 ```
+
+Each JSON report must contain the SHA-256 of `candidate_rank1.pt` and the same data
+fingerprint. `customer_segments.json` additionally binds the exact
+`customer_segments.npz` content. Copying only some reports from another run is therefore
+rejected before certification compute begins.
 
 Command:
 

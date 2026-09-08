@@ -14,7 +14,6 @@ one-time score calculation, not a log-normalizer estimator used during training.
 from __future__ import annotations
 
 import argparse
-import json
 import os
 from pathlib import Path
 
@@ -23,11 +22,12 @@ os.environ.setdefault("V3_AFFINITY", "1")
 import numpy as np
 import torch
 
-from audit_particle_counterfactual_generation import ROOT, load_checkpoint
+from checkpoint_io import ROOT, load_checkpoint
 from data import build
 from features import Features
 from fit import Batcher, build_observed_phi_operator
-from fit_interaction_particles import supported_trips
+from pipeline_support import supported_trips
+from provenance import file_sha256, strict_json_dumps
 from tempered_block_gibbs import conditional_slots_repeated
 
 
@@ -85,7 +85,8 @@ def main():
     torch.set_num_threads(args.threads)
     data = build()
     parent = args.parent if args.parent.is_absolute() else ROOT / args.parent
-    model, blob, meta = load_checkpoint(parent, data)
+    model, blob, meta = load_checkpoint(
+        parent, data, required_capabilities=("conditional_nonempty_incidence",))
     if float(model.phi.detach().abs().max()) != 0.0:
         raise RuntimeError("spectral score initialization requires an exact Phi=0 parent")
     train = supported_trips(data, 0, int(meta["nmax"]))
@@ -96,8 +97,9 @@ def main():
     half_a = rng.random(args.trips) < 0.5
     if half_a.all() or (~half_a).all():
         raise RuntimeError("degenerate split-half assignment")
-    batcher = Batcher(data, Features(int(data["n_item"]), int(data["n_store"]), 712),
-                      int(meta["nmax"]))
+    features = Features(int(data["n_item"]), int(data["n_store"]), 712,
+                        include_recency=False)
+    batcher = Batcher(data, features, int(meta["nmax"]), include_recency=False)
     generator = torch.Generator().manual_seed(args.seed + 1)
     rows = [[], [], []]
     cols = [[], [], []]
@@ -151,13 +153,26 @@ def main():
         eig.append(leading(score, max(args.rank + 4, 12), args.seed + 10 + i))
     values, vectors = eig[0]
     positive = values > 0
-    if int(positive.sum()) < args.rank:
-        raise RuntimeError(f"only {int(positive.sum())} positive pair-score directions")
-    selected_values = values[:args.rank]
-    selected_vectors = vectors[:, :args.rank]
+    full_positive = int(positive.sum())
+    if full_positive < 4:
+        raise RuntimeError(
+            f"only {full_positive} positive pair-score directions; rank 4 is unsupported")
+    stored_rank = min(args.rank, full_positive)
+    selected_values = values[:stored_rank]
+    selected_vectors = vectors[:, :stored_rank]
     counts, row_mass = mass_counts(selected_vectors, selected_values)
     rank_stability = {}
     for candidate_rank in range(4, args.rank + 1):
+        if candidate_rank > full_positive:
+            rank_stability[str(candidate_rank)] = {
+                "split_half_subspace_cosines": [],
+                "split_half_mean_squared_subspace_overlap": 0.0,
+                "enough_positive_full_directions": False,
+                "enough_positive_half_directions": False,
+                "accepted": False,
+                "rejection_reason": "insufficient positive full-score directions",
+            }
+            continue
         half_rank = min(candidate_rank, int((eig[1][0] > 0).sum()),
                         int((eig[2][0] > 0).sum()))
         candidate_overlap = np.linalg.svd(
@@ -168,33 +183,48 @@ def main():
         rank_stability[str(candidate_rank)] = {
             "split_half_subspace_cosines": candidate_overlap.tolist(),
             "split_half_mean_squared_subspace_overlap": candidate_score,
+            "enough_positive_full_directions": True,
             "enough_positive_half_directions": bool(
                 half_rank == candidate_rank),
             "accepted": bool(half_rank == candidate_rank
                              and candidate_score >= args.minimum_stability),
         }
-    selected_profile = rank_stability[str(args.rank)]
+    largest_stable_rank = max(
+        (rank for rank in range(4, args.rank + 1)
+         if rank_stability[str(rank)]["accepted"]), default=None)
+    selected_profile = rank_stability[
+        str(largest_stable_rank if largest_stable_rank is not None else 4)]
     overlap = np.asarray(selected_profile["split_half_subspace_cosines"])
     overlap_score = selected_profile[
         "split_half_mean_squared_subspace_overlap"]
-    accepted = selected_profile["accepted"]
+    accepted = largest_stable_rank is not None
     output = args.output if args.output.is_absolute() else ROOT / args.output
+    output.parent.mkdir(parents=True, exist_ok=True)
     np.savez_compressed(
         output, eigenvalues=selected_values, eigenvectors=selected_vectors,
         row_mass=row_mass, trips=trips, half_a=half_a,
-        parent=np.asarray(str(parent)), parent_iteration=np.asarray(int(blob["iter"])))
+        parent=np.asarray(str(parent)), parent_iteration=np.asarray(int(blob["iter"])),
+        parent_sha256=np.asarray(file_sha256(parent)),
+        data_fingerprint_sha256=np.asarray(blob["data_fingerprint_sha256"]))
+    basis_digest = file_sha256(output)
     report = {
         "parent": str(parent),
         "parent_iteration": int(blob["iter"]),
+        "parent_sha256": file_sha256(parent),
+        "data_fingerprint_sha256": blob["data_fingerprint_sha256"],
+        "basis_sha256": basis_digest,
         "contexts": int(args.trips),
         "model_draws_per_context": int(args.draws),
         "leading_full_score_eigenvalues": values.tolist(),
-        "selected_rank": int(args.rank),
+        "requested_maximum_rank": int(args.rank),
+        "stored_basis_rank": stored_rank,
+        "selected_rank": largest_stable_rank,
         "products_for_cumulative_score_mass": counts,
         "split_half_subspace_cosines": overlap.tolist(),
         "split_half_mean_squared_subspace_overlap": overlap_score,
         "predeclared_stability_threshold": args.minimum_stability,
         "rank_stability": rank_stability,
+        "largest_stable_rank": largest_stable_rank,
         "stable_for_scale_profile": accepted,
         "observed_pair_nnz": int(observed[0].nnz),
         "expected_pair_nnz": int(expected[0].nnz),
@@ -203,10 +233,10 @@ def main():
             "positive eigenvalues are locally supported PSD Gram directions; split-half "
             "cosines diagnose whether their span is stable enough to train"),
     }
-    output.with_suffix(".json").write_text(json.dumps(report, indent=2) + "\n")
-    print(json.dumps(report, indent=2))
-    if not accepted:
-        print("[spectral-score] rank rejected by the predeclared split-half "
+    output.with_suffix(".json").write_text(strict_json_dumps(report))
+    print(strict_json_dumps(report), end="")
+    if report["largest_stable_rank"] is None:
+        print("[spectral-score] no candidate rank passed the predeclared split-half "
               "stability gate", flush=True)
         raise SystemExit(2)
 

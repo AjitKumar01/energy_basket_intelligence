@@ -1,19 +1,22 @@
 """Train one audited basket baseline with resumable, provenance-complete checkpoints."""
 import argparse
-import fcntl
 import hashlib
-import json
 import os
 import time
+import sys
+from pathlib import Path
 
 import numpy as np
 import torch
 
-import evalall as EA
 from baselines import Batches, Bernoulli, DPP
 from baselines2 import Multinomial, NDPP, Shopper, size_law
 from data import build
 from features import Features
+from provenance import load_data_fingerprint, strict_json_dumps
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from file_lock import acquire_process_lock
 
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -28,16 +31,10 @@ def acquire_training_lock(model, tag):
     """Ensure exactly one writer exists for a model/tag checkpoint lineage."""
     suffix = f"_{tag}" if tag else ""
     path = os.path.join(OUT, f"baseline_verified_{model}{suffix}.lock")
-    stream = open(path, "a+")
     try:
-        fcntl.flock(stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except BlockingIOError as error:
+        return acquire_process_lock(path)
+    except RuntimeError as error:
         raise SystemExit(f"another trainer holds {path}") from error
-    stream.seek(0)
-    stream.truncate()
-    stream.write(f"pid={os.getpid()}\n")
-    stream.flush()
-    return stream
 
 
 def hash_ids(ids):
@@ -191,7 +188,7 @@ def evaluate(model, name, batcher, trips, a, seed):
 
 
 def save(path, model, opt, sched, iteration, best, a, name, tr, va, te,
-         rng, order_gen, convergence, lineage, history):
+         rng, order_gen, convergence, lineage, history, data_fingerprint):
     blob = dict(format=3, kind="verified-basket-baseline", model_name=name,
                 model=model.state_dict(), optimizer=opt.state_dict(),
                 scheduler=sched.state_dict(), iteration=iteration, best=best,
@@ -202,6 +199,7 @@ def save(path, model, opt, sched, iteration, best, a, name, tr, va, te,
                                            valid_n=len(va), valid_hash=hash_ids(va),
                                            test_n=len(te), test_hash=hash_ids(te)),
                 lineage=lineage, convergence_state=convergence.state_dict(),
+                data_fingerprint_sha256=data_fingerprint,
                 history=history,
                 rng_np=rng.bit_generator.state, rng_torch=order_gen.get_state())
     tmp = path + ".tmp"
@@ -217,6 +215,9 @@ def main(a):
     torch.set_default_dtype(torch.float64)
     torch.manual_seed(a.seed)
     D = build()
+    root = Path(__file__).resolve().parents[2]
+    data_fingerprint = load_data_fingerprint(
+        root, verify_files=True)["fingerprint_sha256"]
     J, S = int(D["n_item"]), int(D["n_store"])
     batcher = Batches(D, Features(J, S, 712))
     tr = supported_training(D, a.nmax, a.R)
@@ -277,6 +278,8 @@ def main(a):
             raise RuntimeError("resume checkpoint is not the requested verified baseline")
         if not blob.get("lineage", {}).get("fresh_initialization"):
             raise RuntimeError("resume checkpoint lacks a fresh-initialization lineage")
+        if blob.get("data_fingerprint_sha256") != data_fingerprint:
+            raise RuntimeError("resume checkpoint belongs to a different audited dataset")
         model.load_state_dict(blob["model"], strict=True)
         opt.load_state_dict(blob["optimizer"]); sched.load_state_dict(blob["scheduler"])
         start, best = int(blob["iteration"]), blob["best"]
@@ -330,9 +333,11 @@ def main(a):
             if val["per_basket"] > best["per_basket"]:
                 best = dict(per_basket=val["per_basket"], iteration=iteration)
                 save(best_path, model, opt, sched, iteration, best, a, a.model,
-                     tr, va, te, rng, order_gen, convergence, lineage, history)
+                     tr, va, te, rng, order_gen, convergence, lineage, history,
+                     data_fingerprint)
             save(path, model, opt, sched, iteration, best, a, a.model,
-                 tr, va, te, rng, order_gen, convergence, lineage, history)
+                 tr, va, te, rng, order_gen, convergence, lineage, history,
+                 data_fingerprint)
             if a.require_convergence and status["converged"]:
                 log(f"convergence certified at iteration {iteration}: "
                     f"{status['epochs']:.2f} epochs, lr floor {minimum_lr:.3g}, "
@@ -361,9 +366,10 @@ def main(a):
     result = dict(model=a.model, best=best_blob["best"], convergence=certificate,
                   history=history,
                   valid=valid, test=test,
+                  data_fingerprint_sha256=data_fingerprint,
                   checkpoint=os.path.basename(best_path), config=vars(a))
-    with open(os.path.join(OUT, f"baseline_verified_{a.model}{suffix}.json"), "w") as stream:
-        json.dump(result, stream, indent=2)
+    Path(OUT, f"baseline_verified_{a.model}{suffix}.json").write_text(
+        strict_json_dumps(result))
     suffix = (f", test {test['per_basket']:.4f}" if test is not None
               else "; test remains locked for the paired audit")
     log(f"best iteration {best['iteration']}: valid {valid['per_basket']:.4f}{suffix}")

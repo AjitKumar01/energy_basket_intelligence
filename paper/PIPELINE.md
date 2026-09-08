@@ -119,50 +119,66 @@ In the accepted basis \(U\), write
 K=\Phi\Phi^\top=UCU^\top,\qquad C\succeq0.
 \]
 
-Let \(S_{md}\) be fixed exact draws from the fitted additive law for context \(m\),
-and let
+Partition sizes \(1{:}120\) into the seven bands
 
 \[
-h_{C,a,c}(S)=\operatorname{tr}\{C F_U(S)\}
--a\frac{|S|}{10}-c\left(\frac{|S|}{10}\right)^2.
+1{:}4,\;5{:}10,\;11{:}20,\;21{:}40,\;41{:}59,\;60{:}80,\;81{:}120.
 \]
 
-The sampled log-likelihood gain over the additive parent is
+For each context, the additive dynamic program computes each band's exact probability
+\(p_{m\ell}\). It then draws baskets exactly conditional on that band. Let
+\(S_{m\ell d}\) denote those fixed draws and define
 
 \[
-\widehat G(C,a,c)=\frac1M\sum_{m=1}^M\left[
-h(S_m^{\rm obs})-log\left\{\frac1D\sum_{d=1}^D
-e^{h(S_{md})}\right\}\right].
+h_{C,q}(S)=\operatorname{tr}\{C F_U(S)\}-q(|S|),
 \]
 
-This is concave because a linear term minus log-sum-exp is concave. The feasible set
+where \(q\) is piecewise linear between 12 knots and is written back into the existing
+\(\rho_0(1{:}120)\) table. The exact partition-ratio identity is
+
+\[
+\frac{Z_{C,q,+}(x_m)}{Z_{0,+}(x_m)}
+=
+\sum_\ell p_{m\ell}
+\mathbb E_0[e^{h_{C,q}(S)}\mid N\in\mathcal B_\ell,x_m].
+\]
+
+Its fixed-bank estimate gives the sampled log-likelihood gain
+
+\[
+\widehat G(C,q)=\frac1M\sum_{m=1}^M\left[
+h(S_m^{\rm obs})-\log\left\{
+\sum_\ell\frac{p_{m\ell}}{D_\ell}
+\sum_{d=1}^{D_\ell}e^{h(S_{m\ell d})}
+\right\}\right].
+\]
+
+The ratio estimate is unbiased before taking its logarithm. Its logarithm is not exactly
+unbiased at finite draw count, which is why independent Smolyak evaluation remains the
+acceptance authority.
+
+With the bank fixed, the objective is concave because a linear term minus log-sum-exp is
+concave. The feasible set
 
 \[
 0\preceq C\preceq \sigma_{\max}^2I,\qquad
-c\ge0,\qquad a+(n_{\max}/10)c\ge0
+q(1)=0,\qquad |q(n_k)|\le q_{\max}
 \]
 
-is convex. The last two inequalities prevent the correction from creating an attractive
-large-size tail while permitting the negative linear coefficient needed to preserve the
-mean. A diagonal conditional-Fisher preconditioner removes the scale mismatch between
-size and pair statistics; projection and Armijo backtracking still decide acceptance, so
-the recorded objective is monotone.
+is convex. Quadratic magnitude and second-difference penalties regularize the size curve.
+The already fitted category penalty \(\rho_c\) is frozen: an explicit
+\(C,\rho_c,\rho_0\) experiment failed cross-validation. Alternating bounded L-BFGS for
+\(q\) and projected Armijo ascent for \(C\) optimize the same concave objective.
 
 Ridge is selected by swapped context halves. Both held-out directions must improve and
-importance effective sample size must pass its declared floor. The full solve then
+within-band effective sample size must pass its declared floor. The full solve then
 recovers \(\Phi=U C^{1/2}\). This trains an interaction vector for every one of the 5,455
 products without optimizing 5,455 by \(r\) unidentified factor coordinates.
 
-Positive interactions alter basket-size moments, so the same solve fits a low-dimensional
-correction inside the existing \(\rho_0(n)\):
-
-\[
-\Delta\rho_0(n)=a n+c n^2.
-\]
-
-The correction is not a new size factor or a change to the Version-4 joint law. It is a
-two-direction update of the already-defined unrestricted size potential. There is no
-initialization search: concavity supplies one global sampled optimum.
+The correction is not a new size factor or a change to the Version-4 joint law. It uses
+capacity already declared in the unrestricted size potential. The fixed draw bank is
+content-addressed and automatically reused after interruption. Hard conditional-Bernoulli
+draws fall back to exact log-domain dynamic programming rather than aborting.
 
 ### Stage E — identified household-size block
 
@@ -278,9 +294,9 @@ The diagnosis and frozen-law evidence motivating Stage E are reported separately
 [HOUSEHOLD_SIZE_AUDIT.md](HOUSEHOLD_SIZE_AUDIT.md). This section is retained as the
 historical parent result; the successor result follows.
 
-## 9. Rank-one successor full-run outcome
+## 9. Historical ordinary-draw rank-one outcome
 
-The selected pipeline then ran from fresh initialization on the same corrected cohort.
+The former ordinary-draw pipeline ran from fresh initialization on the same corrected cohort.
 It converged at additive update 14,300, selected rank 5, fitted the interaction and
 household-size blocks using training data, and evaluated the final checkpoint once on the
 locked validation/test manifests.
@@ -318,6 +334,28 @@ The main model's paired gains were respectively
 \(1.812247\pm0.092393\) nats/basket. The exact additive parent and multinomial remain
 ablations; SHOPPER remains a separate sequential/posterior protocol rather than part of
 this three-model external headline.
+
+## 10. Canonical size-stratified outcome
+
+The size-stratified pipeline completed on 2026-09-08 using the same converged additive
+parent and rank-five spectral basis. It is now the selected pipeline.
+
+| Gate | Measured outcome | Decision |
+|---|---|---|
+| Interaction cross-fit | mean gain \(0.019865\); minimum half gain \(0.019596\); minimum within-band ESS fraction \(0.3993\) | pass |
+| Household-size cross-fit | gain \(0.006103\); simultaneous lower bound \(0.004003\) | pass |
+| Validation likelihood | child \(-43.687776\); paired gain \(0.026754\pm0.002376\) nats | pass |
+| Test likelihood | child \(-46.066637\); paired gain \(0.031009\pm0.002645\) nats | pass |
+| Numerical audit | post-allowance lower bounds \(0.021744\) validation and \(0.025290\) test | pass |
+| Recommendation | MRR \(0.095246\pm0.006075\); interaction gain \(0.001165\pm0.000627\) | total pass; interaction effect inconclusive |
+| Complete-population tail | calibrated upper \(0.003570 < 0.003700\) allowed | pass, narrow margin |
+| Local extreme-tail safety | no majority-tail context; confirmed maximum \(0.454705\) | pass |
+| Generator mechanics | no unavailable products or duplicates; minimum normalized SMC ESS \(0.99963\) | pass |
+| Generation calibration | generated mean/variance \(7.26/72.97\) versus observed \(10.03/136.28\) | calibration caveat |
+
+The current accepted artifact is artifacts/candidate_rank1.pt and the complete execution
+log is artifacts/stratified_full.log. Earlier ordinary-draw results remain reproducibility
+records, not an alternative selected pipeline.
 
 Passing the technical gates means the implementation is numerically usable for declared
 full-support likelihood and constrained model rollouts. It does not establish causal

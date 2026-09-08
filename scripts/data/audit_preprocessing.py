@@ -14,15 +14,13 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+from raw_path import resolve_raw_directory
+
 
 ROOT = Path(__file__).resolve().parents[2]
 DATA = ROOT / "data"
 BI = Path(os.environ.get("NF_BASKET_INPUT", ROOT / "basket_input"))
-RAW = Path(os.environ.get(
-    "NF_RAW_DIR",
-    ROOT.parent / "dunnhumby_The-Complete-Journey" /
-    "dunnhumby_The-Complete-Journey CSV",
-))
+RAW = resolve_raw_directory()
 
 EXPECTED_RAW_SHA256 = {
     "transaction_data.csv": "3a685c0729cef664d634486189f774518b84f53cde7cbf701a5963238692b476",
@@ -46,13 +44,23 @@ def require(ok: bool, message: str) -> None:
 
 def main() -> None:
     meta = json.loads((BI / "meta.json").read_text())
+    build_meta_path = DATA / "build_meta.json"
+    require(build_meta_path.is_file(), "missing Stage-01 build_meta.json")
+    build_meta = json.loads(build_meta_path.read_text())
+    price_basis = build_meta.get("price_basis")
+    require(price_basis in {"loyalty", "base"}, "invalid Stage-01 price basis")
+    require(meta.get("price_basis") == price_basis,
+            "basket metadata and Stage-01 price basis differ")
     items = pd.read_parquet(BI / "items.parquet")
     baskets = pd.read_parquet(BI / "baskets.parquet")
     tx = pd.read_parquet(
         DATA / "tx.parquet",
         columns=["household_key", "DAY", "WEEK_NO", "PRODUCT_ID", "BASKET_ID",
-                 "QUANTITY", "STORE_ID"],
+                 "QUANTITY", "STORE_ID", "unit_price", "loyalty_price", "base_price"],
     )
+    expected_unit_price = tx[f"{price_basis}_price"].to_numpy()
+    require(np.array_equal(tx.unit_price.to_numpy(), expected_unit_price),
+            f"unit_price is not the declared {price_basis} price basis")
 
     first = int(meta["analysis_first_week"])
     last = int(meta["analysis_last_week"])
@@ -198,6 +206,8 @@ def main() -> None:
     manifest = {
         "schema_version": 1,
         "status": "passed",
+        "price_basis": price_basis,
+        "stage01_build_meta_sha256": sha256(build_meta_path),
         "raw_sha256": raw_hashes,
         "derived_sha256": {name: sha256(BI / name) for name in derived_names},
         "cohort": {
@@ -216,6 +226,7 @@ def main() -> None:
             "modal weekly price reconstruction",
             "modal store-week price reconstruction",
             "training-only price centring",
+            "declared price-basis identity",
             "raw source digests",
         ],
     }

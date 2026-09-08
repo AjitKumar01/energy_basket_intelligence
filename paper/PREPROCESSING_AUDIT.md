@@ -141,7 +141,7 @@ The audit independently verifies:
 11. sorted, unique promotion keys and checksummed derived artifacts.
 
 The full raw-to-index command has been executed successfully, followed by fresh model
-initialization and the repository test suite (28 tests). Because the cohort, prices,
+initialization and the repository test suite. Because the cohort, prices,
 partition, choice support, and test period changed, all old checkpoints and their reported
 likelihood/MRR values are incompatible with this corrected dataset. Final empirical claims
 require a fresh end-to-end fit.

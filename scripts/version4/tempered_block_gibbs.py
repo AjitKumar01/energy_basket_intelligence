@@ -73,6 +73,60 @@ def _numpy_log_reverse_weights(log_poly: np.ndarray, log_prefix: np.ndarray,
     return answer
 
 
+def _exact_conditional_bernoulli(
+        logits: np.ndarray, take: int, draws: int,
+        rng: np.random.Generator) -> np.ndarray:
+    """Sample weighted fixed-cardinality subsets without rejection.
+
+    A subset A of size take has probability proportional to
+    exp(sum(logits[A])).  The suffix elementary-symmetric table gives each
+    sequential inclusion probability exactly.  This is the guaranteed fallback for a
+    sharply concentrated law whose faster mean-matched Bernoulli rejection is slow.
+    """
+    logits = np.asarray(logits, dtype=np.float64)
+    take, draws = int(take), int(draws)
+    items = len(logits)
+    if take < 0 or take > items or draws < 1:
+        raise ValueError("invalid fixed-cardinality sampling request")
+    selected = np.zeros((items, draws), dtype=bool)
+    if take == 0:
+        return selected
+    if take == items:
+        selected[:] = True
+        return selected
+    suffix = np.full((items + 1, take + 1), -np.inf, dtype=np.float64)
+    suffix[items, 0] = 0.0
+    for item in range(items - 1, -1, -1):
+        suffix[item, 0] = 0.0
+        highest = min(take, items - item)
+        for need in range(1, highest + 1):
+            suffix[item, need] = np.logaddexp(
+                suffix[item + 1, need],
+                logits[item] + suffix[item + 1, need - 1])
+    if not np.isfinite(suffix[0, take]):
+        raise RuntimeError("fixed-cardinality subset has zero total probability")
+    for draw in range(draws):
+        need = take
+        for item in range(items):
+            if need == 0:
+                break
+            remaining = items - item
+            if remaining == need:
+                selected[item:, draw] = True
+                need = 0
+                break
+            log_include = (
+                logits[item] + suffix[item + 1, need - 1]
+                - suffix[item, need])
+            probability = float(np.exp(min(0.0, log_include)))
+            if rng.random() < probability:
+                selected[item, draw] = True
+                need -= 1
+        if need:
+            raise RuntimeError("exact conditional-Bernoulli backtrack left items unfilled")
+    return selected
+
+
 def _numpy_backtrack(log_g: torch.Tensor, centred: torch.Tensor,
                      log_size: torch.Tensor, ix, generator
                      ) -> List[List[torch.Tensor]]:
@@ -173,12 +227,13 @@ def _numpy_backtrack(log_g: torch.Tensor, centred: torch.Tensor,
                             -np.clip(logits + 0.5 * (lo + hi_shift), -745, 709)))
                         # At the mean-matched shift the probability of the requested
                         # count is O(1/sqrt(take)); rejection is short in this use case.
-                        for _ in range(10000):
+                        for _ in range(256):
                             selected = rng.random(len(q)) < q
                             if int(selected.sum()) == take:
                                 break
                         else:
-                            raise RuntimeError("conditional-Bernoulli rejection did not mix")
+                            selected = _exact_conditional_bernoulli(
+                                logits, take, 1, rng)[:, 0]
                     chosen.extend(slots[selected].tolist())
                 left -= take
             if left:
@@ -189,7 +244,8 @@ def _numpy_backtrack(log_g: torch.Tensor, centred: torch.Tensor,
 
 
 def _numpy_backtrack_repeated(log_g: torch.Tensor, centred: torch.Tensor,
-                              log_size: torch.Tensor, ix, draws: int, generator
+                              log_size: torch.Tensor, ix, draws: int, generator,
+                              fixed_sizes: Optional[np.ndarray] = None,
                               ) -> List[List[torch.Tensor]]:
     """Many independent reverse draws from one already-computed conditional DP.
 
@@ -219,6 +275,14 @@ def _numpy_backtrack_repeated(log_g: torch.Tensor, centred: torch.Tensor,
     trip_start = trip_end - trip_count
     result: List[List[torch.Tensor | None]] = [
         [None for _ in range(ix.B)] for _ in range(draws)]
+    if fixed_sizes is not None:
+        fixed_sizes = np.asarray(fixed_sizes, dtype=np.int64)
+        if fixed_sizes.shape != (draws, ix.B):
+            raise ValueError(
+                f"fixed_sizes must have shape {(draws, ix.B)}, received "
+                f"{fixed_sizes.shape}")
+        if np.any(fixed_sizes < 1) or np.any(fixed_sizes > ls.shape[1]):
+            raise ValueError("fixed sizes lie outside the declared nonempty support")
 
     def probabilities_from_log(values):
         finite = np.isfinite(values)
@@ -234,8 +298,14 @@ def _numpy_backtrack_repeated(log_g: torch.Tensor, centred: torch.Tensor,
 
     for b in range(ix.B):
         size_probability = probabilities_from_log(ls[b])
-        sizes = rng.choice(len(size_probability), size=draws,
-                           p=size_probability).astype(np.int64) + 1
+        if fixed_sizes is None:
+            sizes = rng.choice(len(size_probability), size=draws,
+                               p=size_probability).astype(np.int64) + 1
+        else:
+            sizes = fixed_sizes[:, b].copy()
+            if np.any(~np.isfinite(ls[b, sizes - 1])):
+                raise ValueError(
+                    f"fixed size has zero conditional probability for trip {b}")
         rows = trip_order[trip_start[b]:trip_end[b]]
         max_n = int(sizes.max())
         polys = []
@@ -311,16 +381,17 @@ def _numpy_backtrack_repeated(log_g: torch.Tensor, centred: torch.Tensor,
                 pending = np.arange(len(group))
                 selected = np.zeros((len(slots), len(group)), dtype=bool)
                 attempts = 0
-                while len(pending):
+                while len(pending) and attempts < 256:
                     attempts += 1
-                    if attempts > 10000:
-                        raise RuntimeError("conditional-Bernoulli rejection did not mix")
                     candidate = rng.random((len(slots), len(pending))) < q[:, None]
                     good = candidate.sum(0) == take
                     if good.any():
                         accepted_columns = pending[good]
                         selected[:, accepted_columns] = candidate[:, good]
                         pending = pending[~good]
+                if len(pending):
+                    selected[:, pending] = _exact_conditional_bernoulli(
+                        logits, take, len(pending), rng)
                 for column, draw in enumerate(group):
                     chosen[draw].extend(slots[selected[:, column]].tolist())
 
@@ -419,6 +490,122 @@ def conditional_slots_repeated(model, ix, z: torch.Tensor, beta: float, draws: i
     log_g, centred, log_size = conditional_log_tables_levels(
         model, ix, z.unsqueeze(0), [float(beta)])
     return _numpy_backtrack_repeated(log_g, centred, log_size, ix, draws, generator)
+
+
+def default_size_bands(nmax: int) -> list[tuple[int, int]]:
+    """Declared non-overlapping size bands covering ``1..nmax`` exactly."""
+    if int(nmax) < 1:
+        raise ValueError("nmax must be positive")
+    # Sixty is the declared production extreme-basket threshold.  Giving N>=60 its own
+    # stratum prevents an unbiased but broad 41:80 band from spending all of its draws
+    # below the safety boundary.
+    cut = (1, 5, 11, 21, 41, 60, 81, int(nmax) + 1)
+    bands = []
+    for lo, hi_exclusive in zip(cut[:-1], cut[1:]):
+        if lo > nmax:
+            break
+        bands.append((lo, min(hi_exclusive - 1, int(nmax))))
+    if bands[0][0] != 1 or bands[-1][1] != nmax:
+        raise RuntimeError("internal size bands do not cover the declared support")
+    return bands
+
+
+@torch.no_grad()
+def conditional_slots_fixed_sizes(
+        model, ix, z: torch.Tensor, beta: float, sizes: np.ndarray,
+        generator: Optional[torch.Generator] = None
+        ) -> List[List[torch.Tensor]]:
+    """Draw exact baskets conditional on predeclared total sizes.
+
+    ``sizes[d,b]`` is the requested nonempty basket size for draw ``d`` and trip ``b``.
+    The forward category/ESP program is evaluated once.  Conditioning changes only the
+    reverse draw: the size stage is fixed and the category-count and item-subset stages
+    retain their exact Version-4 conditional probabilities.
+    """
+    sizes = np.asarray(sizes, dtype=np.int64)
+    if sizes.ndim != 2 or sizes.shape[1] != ix.B:
+        raise ValueError(f"sizes must have shape [draws,{ix.B}]")
+    if z.shape != (ix.B, model.Kz):
+        raise ValueError(f"z must have shape {(ix.B, model.Kz)}")
+    if not 0.0 <= float(beta) <= 1.0:
+        raise ValueError("beta must lie in [0,1]")
+    log_g, centred, log_size = conditional_log_tables_levels(
+        model, ix, z.unsqueeze(0), [float(beta)])
+    return _numpy_backtrack_repeated(
+        log_g, centred, log_size, ix, sizes.shape[0], generator,
+        fixed_sizes=sizes)
+
+
+@torch.no_grad()
+def conditional_slots_stratified(
+        model, ix, z: torch.Tensor, beta: float,
+        bands: Sequence[tuple[int, int]], draws_per_band: Sequence[int],
+        generator: Optional[torch.Generator] = None
+        ) -> tuple[List[List[torch.Tensor]], torch.Tensor, np.ndarray]:
+    """Draw a fixed bank stratified by total basket size.
+
+    For band ``b``, sizes are sampled from the exact conditional parent law
+    ``P(N=n | N in band b,x)`` and baskets are then sampled exactly conditional on that
+    size.  The returned ``log_weights[trip,draw]`` equal
+    ``log P(N in band|x) - log D_band``.  Consequently
+
+        sum_draw exp(log_weight + h(S_draw))
+
+    is an unbiased estimator of the likelihood ratio ``Z_child/Z_parent`` for every
+    fixed context.  A zero-mass band receives weight ``-inf`` and a harmless feasible
+    placeholder draw; it contributes exactly zero.
+    """
+    bands = [(int(lo), int(hi)) for lo, hi in bands]
+    allocation = np.asarray(draws_per_band, dtype=np.int64)
+    if len(bands) == 0 or allocation.shape != (len(bands),):
+        raise ValueError("bands and draws_per_band must be nonempty and aligned")
+    if np.any(allocation < 1):
+        raise ValueError("every declared size band needs at least one draw")
+    expected_lo = 1
+    for lo, hi in bands:
+        if lo != expected_lo or hi < lo:
+            raise ValueError("size bands must be ordered, contiguous and nonempty")
+        expected_lo = hi + 1
+    if bands[-1][1] != int(model.nmax):
+        raise ValueError("size bands must cover the complete declared support")
+    if z.shape != (ix.B, model.Kz):
+        raise ValueError(f"z must have shape {(ix.B, model.Kz)}")
+
+    log_g, centred, log_size = conditional_log_tables_levels(
+        model, ix, z.unsqueeze(0), [float(beta)])
+    normalized = log_size[0] - torch.logsumexp(log_size[0], dim=1, keepdim=True)
+    total_draws = int(allocation.sum())
+    fixed_sizes = np.ones((total_draws, ix.B), dtype=np.int64)
+    log_weights = torch.full(
+        (ix.B, total_draws), -float("inf"), dtype=normalized.dtype,
+        device=normalized.device)
+    band_of_draw = np.empty(total_draws, dtype=np.int64)
+    cursor = 0
+    for band_index, ((lo, hi), count) in enumerate(zip(bands, allocation.tolist())):
+        band_log = normalized[:, lo - 1:hi]
+        log_mass = torch.logsumexp(band_log, dim=1)
+        stop = cursor + count
+        band_of_draw[cursor:stop] = band_index
+        positive = torch.isfinite(log_mass)
+        log_weights[positive, cursor:stop] = (
+            log_mass[positive, None] - math.log(count))
+        for trip in range(ix.B):
+            if not bool(positive[trip]):
+                # Its likelihood-ratio contribution has exact zero coefficient.  Size one
+                # is feasible for every supported context and lets the shared reverse pass
+                # retain a rectangular draw bank.
+                fixed_sizes[cursor:stop, trip] = 1
+                continue
+            probability = torch.softmax(band_log[trip], dim=0)
+            sampled = torch.multinomial(
+                probability, count, replacement=True, generator=generator)
+            fixed_sizes[cursor:stop, trip] = sampled.cpu().numpy() + lo
+        cursor = stop
+
+    states = _numpy_backtrack_repeated(
+        log_g, centred, log_size, ix, total_draws, generator,
+        fixed_sizes=fixed_sizes)
+    return states, log_weights, band_of_draw
 
 
 def _log_poly_prefix(polys: Sequence[torch.Tensor], degree: int) -> List[torch.Tensor]:

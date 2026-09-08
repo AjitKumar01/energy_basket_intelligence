@@ -49,13 +49,12 @@ import os
 import numpy as np
 import pandas as pd
 
+from raw_path import resolve_raw_directory
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 DATA = os.path.join(HERE, "..", "..", "data")
 OUT = os.path.join(HERE, "..", "..", "basket_input")
-RAW = os.path.join(os.environ.get(
-    "NF_RAW_DIR",
-    os.path.join(HERE, "..", "..", "..", "dunnhumby_The-Complete-Journey",
-                 "dunnhumby_The-Complete-Journey CSV")), "")
+RAW = os.path.join(resolve_raw_directory(), "")
 
 DAY_STRIDE = 1024          # > 711, so group_id * DAY_STRIDE + day never collides
 
@@ -69,6 +68,14 @@ def main(a):
     if a.outdir:
         OUT = os.path.join(HERE, "..", "..", a.outdir)
     os.makedirs(OUT, exist_ok=True)
+    build_meta_path = os.path.join(DATA, "build_meta.json")
+    if not os.path.isfile(build_meta_path):
+        raise SystemExit("missing data/build_meta.json; rebuild Stage 01 to bind price basis")
+    with open(build_meta_path) as stream:
+        build_meta = json.load(stream)
+    price_basis = build_meta.get("price_basis")
+    if price_basis not in ("loyalty", "base"):
+        raise SystemExit("data/build_meta.json has an invalid price_basis")
     tx0 = pd.read_parquet(os.path.join(DATA, "tx.parquet"),
                           columns=["household_key", "DAY", "WEEK_NO", "PRODUCT_ID",
                                    "BASKET_ID", "QUANTITY", "STORE_ID",
@@ -420,6 +427,8 @@ def main(a):
         "assortment_share": float(carried.mean()),
         "price_obs_share": obs_share,
         "median_repurchase_gap_days": float(gaps.median()),
+        "price_basis": price_basis,
+        "unit_price_source_column": build_meta.get("unit_price_source_column"),
     }
     with open(os.path.join(OUT, "meta.json"), "w") as f:
         json.dump(meta, f, indent=2)

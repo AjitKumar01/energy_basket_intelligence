@@ -9,7 +9,6 @@ interactions are added as a separate residual stage only after this exact block 
 from __future__ import annotations
 
 import argparse
-import json
 import math
 import os
 import sys
@@ -26,9 +25,10 @@ from data import build
 from category_safety import category_capacities, project_category_reward_
 from features import Features
 from fit import Batcher
-from fit_interaction_particles import supported_trips
+from pipeline_support import supported_trips
 from interaction_particles import (differentiable_log_size_beta0,
                                    differentiable_logz_beta0)
+from provenance import require_fingerprint, strict_json_dumps
 from ragged import RaggedModel
 from sparse_artifact import load_sparse_initialization_artifact
 
@@ -107,6 +107,7 @@ def atomic_save(path, payload):
 def load_model(artifact, data):
     raw = torch.load(artifact, map_location="cpu", weights_only=False)
     meta = raw["metadata"]
+    require_fingerprint(meta.get("data_fingerprint_sha256"), ROOT)
     model = RaggedModel(
         int(data["n_item"]), int(data["n_user"]), int(data["n_cat"]),
         K=int(meta["K"]), Kz=int(meta["Kz"]), nmax=int(meta["nmax"]),
@@ -197,8 +198,10 @@ def main():
     model, meta, restored = load_model(artifact, data)
     if int(meta["active_rank"]) != 8:
         raise RuntimeError("expected the certified rank-8 parent artifact")
-    batcher = Batcher(data, Features(int(data["n_item"]), int(data["n_store"]), 712),
-                      int(meta["nmax"]))
+    features = Features(int(data["n_item"]), int(data["n_store"]), 712,
+                        include_recency=not bool(meta.get("no_rec", False)))
+    batcher = Batcher(data, features, int(meta["nmax"]),
+                      include_recency=not bool(meta.get("no_rec", False)))
     train = supported_trips(data, 0, int(meta["nmax"]))
     empirical_count = np.bincount(
         np.clip(data["trip_nlines"][train], 1, int(meta["nmax"])),
@@ -223,6 +226,8 @@ def main():
         resumed = torch.load(resume_path, map_location="cpu", weights_only=False)
         if resumed.get("estimator") != "exact_version4_no_gram_dynamic_program":
             raise RuntimeError("resume checkpoint is not from the exact Phi=0 stage")
+        if resumed.get("data_fingerprint_sha256") != meta["data_fingerprint_sha256"]:
+            raise RuntimeError("resume checkpoint belongs to a different audited dataset")
         prior = resumed["config"]
         for key in ("batch", "seed"):
             if int(prior[key]) != int(getattr(args, key)):
@@ -303,11 +308,19 @@ def main():
             "format": 2,
             "estimator": "exact_version4_no_gram_dynamic_program",
             "fresh_artifact_digest": restored["model_state_sha256"],
+            "data_fingerprint_sha256": meta["data_fingerprint_sha256"],
             "iter": iteration,
             "model": model.state_dict(),
             "optimizer": optimizer.state_dict(),
             "config": vars(args),
             "objective": "exact normalized joint likelihood with Phi=0",
+            "trained_capabilities": {
+                "conditional_nonempty_incidence": True,
+                "gram_interactions": False,
+                "recency": False,
+                "quantities": False,
+                "arrival_or_null_basket": False,
+            },
             "parent_active_rank": 8,
             "best_validation": best_score,
             "best_iteration": best_iteration,
@@ -479,7 +492,7 @@ def main():
                 milestone = output / f"v3_{args.label}_iter{iteration}.pt"
                 atomic_save(milestone, payload(iteration))
                 print(f"[exact-additive] milestone: {milestone}", flush=True)
-            history_path.write_text(json.dumps({
+            history_path.write_text(strict_json_dumps({
                 "initial_validation": initial,
                 "latest_validation": current,
                 "best_validation": best_score,
@@ -487,7 +500,7 @@ def main():
                 "evaluations": evaluations,
                 "records": records,
                 "wall_seconds": time.perf_counter() - started,
-            }, indent=2) + "\n")
+            }))
             if (iteration >= args.convergence_min_updates
                     and float(optimizer.param_groups[0]["lr"]) <= args.min_lr
                     and evaluations_since_best >= args.convergence_patience):

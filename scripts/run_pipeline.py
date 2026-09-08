@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import importlib.util
 import json
 import os
@@ -19,12 +20,50 @@ ART = ROOT / "artifacts"
 REPORT = ROOT / "reports"
 RAW_DEFAULT = (ROOT.parent / "dunnhumby_The-Complete-Journey" /
                "dunnhumby_The-Complete-Journey CSV")
+RAW_LOCAL = (ROOT / "dunnhumby_The-Complete-Journey" /
+             "dunnhumby_The-Complete-Journey CSV")
 STAGES = ("data", "initialize", "additive", "rank", "interaction",
           "evaluation", "certification")
 
 
+def file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for block in iter(lambda: stream.read(8 << 20), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def current_data_fingerprint(*, dry_run: bool) -> str | None:
+    path = ROOT / "basket_input" / "model_data_fingerprint.json"
+    require_files("data", (path,), dry_run=dry_run)
+    if dry_run:
+        return None
+    try:
+        payload = json.loads(path.read_text())
+        recorded = str(payload.pop("fingerprint_sha256"))
+        canonical = json.dumps(
+            payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True,
+            allow_nan=False).encode("utf-8")
+        if hashlib.sha256(canonical).hexdigest() != recorded:
+            raise ValueError("self digest does not match")
+        return recorded
+    except Exception as exc:
+        raise SystemExit(f"cannot read model-data fingerprint {path}: {exc}") from exc
+
+
 def stage_index(stage: str) -> int:
     return STAGES.index(stage)
+
+
+def resolve_raw_directory() -> Path:
+    configured = os.environ.get("NF_RAW_DIR")
+    if configured:
+        return Path(configured).expanduser().resolve()
+    for candidate in (RAW_DEFAULT, RAW_LOCAL):
+        if candidate.is_dir():
+            return candidate.resolve()
+    return RAW_DEFAULT.resolve()
 
 
 def runs_stage(start_at: str, stage: str) -> bool:
@@ -71,6 +110,10 @@ def validate_initialization(path: Path, *, dry_run: bool) -> dict | None:
         raise SystemExit(f"{path} is not a Version-4 initialization artifact")
     if not blob["metadata"].get("household_size_rank1", False):
         raise SystemExit(f"{path} does not reserve the household-size rank-one coordinate")
+    expected = current_data_fingerprint(dry_run=False)
+    if blob["metadata"].get("data_fingerprint_sha256") != expected:
+        raise SystemExit(
+            f"{path} does not match the current audited model dataset")
     return blob
 
 
@@ -84,8 +127,11 @@ def validate_additive(path: Path, initialization: Path, *, dry_run: bool) -> dic
         raise SystemExit(f"{path} is not an exact additive checkpoint")
     if blob.get("fresh_artifact_digest") != initial["model_state_sha256"]:
         raise SystemExit(
-            f"{path} was not trained from {initial}; restore the matching "
-            "artifacts/initialization.pt")
+            f"{path} was not trained from {initialization}; restore the matching "
+              "artifacts/initialization.pt")
+    if blob.get("data_fingerprint_sha256") != initial["metadata"].get(
+            "data_fingerprint_sha256"):
+        raise SystemExit(f"{path} and {initialization} use different model data")
     return blob
 
 
@@ -128,17 +174,28 @@ def validate_completed_additive(best: Path, latest: Path, initialization: Path,
 def validate_candidate(path: Path, initialization: Path, *, final: bool,
                        profile: str, dry_run: bool) -> dict | None:
     require_files("interaction", (initialization, path), dry_run=dry_run)
-    validate_initialization(initialization, dry_run=dry_run)
+    initial = validate_initialization(initialization, dry_run=dry_run)
     if dry_run:
         return None
     blob = load_checkpoint_blob(path, "final candidate" if final else "interaction candidate")
-    if blob.get("estimator") != "constrained_crn_monte_carlo_mle_version4_natural_block":
+    allowed_estimators = {
+        "constrained_crn_monte_carlo_mle_version4_natural_block",
+        "size_stratified_sparse_natural_mcle_version4",
+    }
+    if blob.get("estimator") not in allowed_estimators:
         raise SystemExit(f"{path} is not a constrained Version-4 interaction checkpoint")
     rank = int(blob.get("active_rank", 0))
     if rank < 1 or rank > 8:
         raise SystemExit(f"{path} has invalid active interaction rank {rank}")
     if final and "household_size_rank1" not in blob:
         raise SystemExit(f"{path} has not completed the household-size stage")
+    if blob.get("data_fingerprint_sha256") != current_data_fingerprint(dry_run=False):
+        raise SystemExit(f"{path} does not match the current audited model dataset")
+    if blob.get("fresh_artifact_digest") != initial["model_state_sha256"]:
+        raise SystemExit(f"{path} was not descended from {initialization}")
+    configured_artifact = blob.get("config", {}).get("artifact")
+    if configured_artifact is None or Path(configured_artifact).name != initialization.name:
+        raise SystemExit(f"{path} does not reference {initialization.name}")
     expected_batch = 128 if profile == "full" else 8
     if int(blob.get("config", {}).get("batch", -1)) != expected_batch:
         raise SystemExit(
@@ -149,7 +206,8 @@ def validate_candidate(path: Path, initialization: Path, *, final: bool,
 
 def selected_rank_from_report(basis: Path, *, maximum_rank: int,
                               dry_run: bool,
-                              parent_iteration: int | None = None) -> int:
+                              parent_iteration: int | None = None,
+                              parent: Path | None = None) -> int:
     require_files("rank", (basis, basis.with_suffix(".json")), dry_run=dry_run)
     if dry_run:
         return maximum_rank
@@ -163,6 +221,13 @@ def selected_rank_from_report(basis: Path, *, maximum_rank: int,
             f"{basis.with_suffix('.json')} was built from additive iteration "
             f"{report.get('parent_iteration')}, not the restored best iteration "
             f"{parent_iteration}")
+    if parent is not None and report.get("parent_sha256") != file_sha256(parent):
+        raise SystemExit(
+            f"{basis.with_suffix('.json')} was not built from {parent}")
+    if report.get("basis_sha256") != file_sha256(basis):
+        raise SystemExit(f"{basis} failed its rank-report content digest")
+    if report.get("data_fingerprint_sha256") != current_data_fingerprint(dry_run=False):
+        raise SystemExit(f"{basis.with_suffix('.json')} belongs to another dataset")
     profiles = report.get("rank_stability", {})
     for rank in range(maximum_rank, 3, -1):
         if profiles.get(str(rank), {}).get("accepted"):
@@ -179,16 +244,22 @@ def basis_from_candidate_report(candidate: Path, *, dry_run: bool,
     try:
         report = json.loads(report_path.read_text())
         reported = Path(report["spectral"])
+        expected_digest = report["spectral_sha256"]
     except Exception as exc:
         raise SystemExit(f"cannot recover spectral basis from {report_path}: {exc}") from exc
     if reported.is_file():
+        if file_sha256(reported) != expected_digest:
+            raise SystemExit(f"spectral basis {reported} failed candidate lineage digest")
         return reported
     portable = ART / reported.name
     require_files("evaluation", (portable, portable.with_suffix(".json")), dry_run=False)
+    if file_sha256(portable) != expected_digest:
+        raise SystemExit(f"relocated spectral basis {portable} failed candidate lineage digest")
     return portable
 
 
-def validate_evaluation_outputs(*, profile: str, dry_run: bool) -> None:
+def validate_evaluation_outputs(*, profile: str, candidate: Path,
+                                dry_run: bool) -> None:
     """Ensure certification cannot follow missing, truncated, or rejected evaluations."""
     json_paths = (
         REPORT / "likelihood_validation.json",
@@ -202,12 +273,20 @@ def validate_evaluation_outputs(*, profile: str, dry_run: bool) -> None:
     require_files("certification", (*json_paths, assignments), dry_run=dry_run)
     if dry_run:
         return
+    candidate_digest = file_sha256(candidate)
+    data_digest = current_data_fingerprint(dry_run=False)
     parsed = {}
     for path in json_paths:
         try:
             parsed[path.name] = json.loads(path.read_text())
         except Exception as exc:
             raise SystemExit(f"cannot resurrect evaluation; invalid {path}: {exc}") from exc
+        if parsed[path.name].get("checkpoint_sha256") != candidate_digest:
+            raise SystemExit(
+                f"cannot resurrect evaluation: {path.name} belongs to another checkpoint")
+        if parsed[path.name].get("data_fingerprint_sha256") != data_digest:
+            raise SystemExit(
+                f"cannot resurrect evaluation: {path.name} belongs to another dataset")
     if profile == "full":
         for name in ("likelihood_validation.json", "likelihood_test.json"):
             accepted = parsed[name].get("numerical_certification", {}).get("passed")
@@ -220,6 +299,9 @@ def validate_evaluation_outputs(*, profile: str, dry_run: bool) -> None:
         with np.load(assignments) as stored:
             if not stored.files:
                 raise ValueError("archive contains no arrays")
+        if parsed["customer_segments.json"].get(
+                "assignments_sha256") != file_sha256(assignments):
+            raise ValueError("archive content digest differs from segment report")
     except Exception as exc:
         raise SystemExit(
             f"cannot resurrect evaluation; invalid {assignments}: {exc}") from exc
@@ -236,7 +318,7 @@ def preflight(*, from_raw: bool, stop_after: str) -> None:
             "missing Python dependencies: " + ", ".join(missing_modules)
             + "; run python -m pip install -r requirements.txt")
 
-    raw = Path(os.environ.get("NF_RAW_DIR", RAW_DEFAULT)).expanduser()
+    raw = resolve_raw_directory()
     missing_raw = [raw / name for name in (
         "transaction_data.csv", "product.csv", "causal_data.csv")
         if not (raw / name).is_file()]
@@ -251,6 +333,7 @@ def preflight(*, from_raw: bool, stop_after: str) -> None:
             ROOT / "data" / "tx.parquet",
             ROOT / "data" / "price_week.parquet",
             ROOT / "data" / "price_store_week.parquet",
+            ROOT / "data" / "build_meta.json",
             ROOT / "basket_input" / "meta.json",
             ROOT / "basket_input" / "items.parquet",
             ROOT / "basket_input" / "baskets.parquet",
@@ -283,6 +366,7 @@ class Driver:
         self.environment["PYTHONPATH"] = os.pathsep.join(
             [str(native), str(V4)] + ([old] if old else []))
         self.environment["V3_AFFINITY"] = "1"
+        self.environment["NF_RAW_DIR"] = str(resolve_raw_directory())
 
     def run(self, command: list[str], *, allow_failure: bool = False) -> int:
         self.commands.append(command)
@@ -318,20 +402,40 @@ def rank_selection(driver: Driver, parent: Path, contexts: int,
         return 8, output
     maximum_rank = 4 if smoke else 8
     output = ART / f"interaction_basis_rank{maximum_rank}.npz"
-    driver.run(script("build_spectral_phi_initialization.py", "--parent", parent,
+    pending = ART / f".{output.stem}.pending-{os.getpid()}.npz"
+    pending_report = pending.with_suffix(".json")
+    for path in (pending, pending_report):
+        path.unlink(missing_ok=True)
+
+    def reject_pending(message: str) -> None:
+        pending.unlink(missing_ok=True)
+        pending_report.unlink(missing_ok=True)
+        raise SystemExit(message)
+
+    status = driver.run(script("build_spectral_phi_initialization.py", "--parent", parent,
                       "--trips", contexts, "--draws", 2, "--rank", maximum_rank,
                       "--threads", threads,
                       "--minimum-stability", -1.0 if smoke else 0.5,
-                      "--output", output), allow_failure=True)
-    report_path = output.with_suffix(".json")
-    if report_path.exists():
-        report = json.loads(report_path.read_text())
-        profiles = report.get("rank_stability", {})
-        for rank in range(maximum_rank, 3, -1):
-            if profiles.get(str(rank), {}).get("accepted"):
-                print(f"[pipeline] selected independently stable rank {rank}")
-                return rank, output
-    raise SystemExit("no rank in 4..8 passed the predeclared split-half gate")
+                      "--output", pending), allow_failure=True)
+    if status != 0 or not pending.is_file() or not pending_report.is_file():
+        reject_pending("spectral rank build failed; no prior basis was reused")
+    try:
+        report = json.loads(pending_report.read_text())
+    except Exception as exc:
+        reject_pending(f"new spectral rank report is invalid: {exc}")
+    if report.get("parent_sha256") != file_sha256(parent):
+        reject_pending("new spectral rank report does not match its additive parent")
+    if report.get("basis_sha256") != file_sha256(pending):
+        reject_pending("new spectral basis failed its report content digest")
+    if report.get("data_fingerprint_sha256") != current_data_fingerprint(dry_run=False):
+        reject_pending("new spectral rank report does not match the audited dataset")
+    rank = report.get("largest_stable_rank")
+    if rank is None or not 4 <= int(rank) <= maximum_rank:
+        reject_pending("no rank in 4..8 passed the predeclared split-half gate")
+    os.replace(pending, output)
+    os.replace(pending_report, output.with_suffix(".json"))
+    print(f"[pipeline] selected independently stable rank {rank}")
+    return int(rank), output
 
 
 def main() -> None:
@@ -356,6 +460,15 @@ def main() -> None:
         help=("resurrect a partially completed pipeline from this stage; all earlier "
               "artifacts are validated and reused"))
     parser.add_argument("--stop-after", choices=STAGES, default="certification")
+    parser.add_argument(
+        "--interaction-estimator", choices=("stratified", "legacy-ordinary"),
+        default="stratified",
+        help=("stratified is the certified default and jointly refines C and rho_0 "
+              "with explicit size-band coverage; legacy-ordinary preserves the former "
+              "unstratified estimator for result reproduction only"))
+    parser.add_argument(
+        "--rebuild-interaction-bank", action="store_true",
+        help="resample the stratified estimator's derived draw cache")
     args = parser.parse_args()
     start_at = args.start_at or ("additive" if args.resume_additive else "data")
     if args.from_raw and args.resume_additive is not None:
@@ -368,6 +481,9 @@ def main() -> None:
         parser.error("--stop-after must be the same as or later than --start-at")
     if args.threads < 0:
         parser.error("--threads cannot be negative")
+    if args.rebuild_interaction_bank and args.interaction_estimator != "stratified":
+        parser.error("--rebuild-interaction-bank requires --interaction-estimator "
+                     "stratified")
     preflight(from_raw=args.from_raw, stop_after=args.stop_after)
     from runtime_capabilities import (detect_runtime, resolve_backend,
                                       write_runtime_report)
@@ -416,6 +532,7 @@ def main() -> None:
     # Build the ragged index only after the training-only partition exists.  The
     # partition builder reads baskets directly and cannot consume a stale model cache.
     driver.run(script("data.py", "--force"))
+    driver.run(script("provenance.py"))
     if args.stop_after == "data":
         return
 
@@ -480,7 +597,8 @@ def main() -> None:
         rank = selected_rank_from_report(
             basis, maximum_rank=8 if full else 4, dry_run=driver.dry_run,
             parent_iteration=(int(additive_blob["iter"])
-                              if additive_blob is not None else None))
+                              if additive_blob is not None else None),
+            parent=additive if not driver.dry_run else None)
         print(f"[pipeline] resurrected rank selection: rank={rank}, basis={basis}",
               flush=True)
     else:
@@ -493,17 +611,35 @@ def main() -> None:
     interaction_candidate = ART / "candidate.pt"
     candidate = ART / "candidate_rank1.pt"
     if runs_stage(start_at, "interaction"):
-        driver.run(script(
-            "fit_convex_natural_interactions.py", "--parent", additive,
-            "--spectral", basis, "--contexts", 12000 if full else 64,
-            "--draws", 64 if full else 4, "--batch", 96 if full else 8,
-            "--rank", rank, "--score-mass", 1.0, "--spectral-max", 1.0,
-            "--threads", cpu_threads,
-            "--minimum-crossfit-gain", 0.005 if full else -1.0,
-            "--minimum-half-gain", 0.0 if full else -1e9,
-            "--minimum-ess-fraction", 0.20 if full else 0.0,
-            "--minimum-ess-p01", 2.0 if full else 0.0,
-            "--output", interaction_candidate))
+        if args.interaction_estimator == "stratified":
+            driver.run(script(
+                "fit_stratified_natural_interactions.py", "--parent", additive,
+                "--spectral", basis, "--contexts", 12000 if full else 64,
+                "--band-draws", *( [16, 16, 12, 8, 5, 4, 3] if full
+                                   else [1, 1, 1, 1, 1, 1, 1]),
+                "--batch", 96 if full else 8, "--rank", rank,
+                "--score-mass", 1.0, "--spectral-max", 1.0,
+                "--category-bound", 0.0,
+                "--size-ridge", 1e-3, "--size-smoothness", 1e-1,
+                *(("--rebuild-bank",) if args.rebuild_interaction_bank else ()),
+                "--threads", cpu_threads,
+                "--minimum-crossfit-gain", 0.005 if full else -1.0,
+                "--minimum-half-gain", 0.0 if full else -1e9,
+                "--minimum-within-band-ess-fraction", 0.20 if full else 0.0,
+                "--output", interaction_candidate))
+        else:
+            driver.run(script(
+                "fit_convex_natural_interactions.py", "--parent", additive,
+                "--spectral", basis, "--contexts", 12000 if full else 64,
+                "--draws", 64 if full else 4, "--batch", 96 if full else 8,
+                "--rank", rank, "--score-mass", 1.0, "--spectral-max", 1.0,
+                "--joint-additive-polish", "--additive-polish-ridge", 1e-3,
+                "--threads", cpu_threads,
+                "--minimum-crossfit-gain", 0.005 if full else -1.0,
+                "--minimum-half-gain", 0.0 if full else -1e9,
+                "--minimum-ess-fraction", 0.20 if full else 0.0,
+                "--minimum-ess-p01", 2.0 if full else 0.0,
+                "--output", interaction_candidate))
         if not driver.dry_run:
             interaction_report = json.loads(
                 interaction_candidate.with_suffix(".json").read_text())
@@ -517,6 +653,8 @@ def main() -> None:
                 print(f"[pipeline] convex solve reduced certified basis rank {rank} "
                       f"to active rank {fitted_rank}")
             rank = fitted_rank
+        print("[pipeline] post-interaction size block: retain the additive kappa_h and "
+              "test only a cross-fitted residual household increment", flush=True)
         driver.run(script(
             "fit_household_size_rank1.py",
             "--checkpoint", interaction_candidate,
@@ -565,7 +703,7 @@ def main() -> None:
             "--rank", rank, "--target-level", rank + 2,
             "--audit-trips", 128 if full else 4,
             "--threads", cpu_threads,
-            *(('--maximum-audit-error-bound', 0.01, '--require-certified-gain')
+            *(('--maximum-audit-error-bound', 0.01)
               if full else ()),
             "--output", REPORT / "likelihood_test.json"))
         driver.run(script(
@@ -594,10 +732,14 @@ def main() -> None:
             "--listed-pairs", 20 if full else 5,
             "--output", REPORT / "interaction_embedding_audit.json"))
     else:
-        validate_evaluation_outputs(profile=args.profile, dry_run=driver.dry_run)
+        validate_evaluation_outputs(profile=args.profile, candidate=candidate,
+                                    dry_run=driver.dry_run)
         print("[pipeline] resurrected completed evaluation artifacts", flush=True)
     if args.stop_after == "evaluation":
         return
+
+    validate_evaluation_outputs(profile=args.profile, candidate=candidate,
+                                dry_run=driver.dry_run)
 
     tail_status = driver.run(script(
         "audit_population_size.py", "--checkpoint", candidate,
@@ -609,6 +751,12 @@ def main() -> None:
         "--chunk", 48 if full else 8,
         "--threads", cpu_threads,
         "--output", REPORT / "population_size.json"), allow_failure=not full)
+    driver.run(script(
+        "diagnose_size_phase.py", "--parent", additive, "--child", candidate,
+        "--confirmed-panel", REPORT / "population_size_confirm_per_trip.npz",
+        "--contexts-per-panel", 64 if full else 2,
+        "--threads", cpu_threads,
+        "--output", REPORT / "size_phase_diagnostic.json"))
     driver.run(script(
         "run_segment_pricing_mdp.py", "--checkpoint", candidate,
         "--assignments", ART / "customer_segments.npz",

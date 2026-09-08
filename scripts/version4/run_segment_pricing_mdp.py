@@ -33,13 +33,14 @@ import numpy as np
 import pandas as pd
 import torch
 
-from audit_particle_counterfactual_generation import (
-    ROOT, copied_context, load_checkpoint, particle_delta)
+from checkpoint_io import ROOT, load_checkpoint
 from data import build
 from features import Features
 from fit import Batcher
 from interaction_particles import rao_blackwell_particle_statistics
+from pipeline_support import copied_context, particle_delta
 from tempered_ais import annealed_smc_logz
+from provenance import file_sha256, strict_json_dumps
 
 
 torch.set_default_dtype(torch.float64)
@@ -407,7 +408,9 @@ def main() -> None:
         else ROOT / args.segment_report
     output_path = args.output if args.output.is_absolute() else ROOT / args.output
     data = build()
-    model, _blob, meta = load_checkpoint(checkpoint, data)
+    model, blob, meta = load_checkpoint(
+        checkpoint, data,
+        required_capabilities=("conditional_nonempty_incidence", "gram_interactions"))
     labels = np.load(assignments)["segment"].astype(np.int64)
     if len(labels) != int(data["n_user"]):
         raise RuntimeError("segment assignment count does not match household count")
@@ -418,8 +421,9 @@ def main() -> None:
                      for row in segment_report["segments"]}
     metadata = pd.read_parquet(ROOT / "basket_input" / "items.parquet") \
         .sort_values("item_id")
-    features = Features(int(data["n_item"]), int(data["n_store"]), 712)
-    batcher = Batcher(data, features, int(meta["nmax"]))
+    features = Features(int(data["n_item"]), int(data["n_store"]), 712,
+                        include_recency=False)
+    batcher = Batcher(data, features, int(meta["nmax"]), include_recency=False)
 
     train = np.flatnonzero(
         (data["trip_split"] == 0) & (data["trip_nlines"] <= int(meta["nmax"])))
@@ -512,6 +516,9 @@ def main() -> None:
 
     output = {
         "checkpoint": str(checkpoint),
+        "checkpoint_sha256": file_sha256(checkpoint),
+        "data_fingerprint_sha256": blob["data_fingerprint_sha256"],
+        "trained_capabilities": blob["trained_capabilities"],
         "state": "(promotion days remaining, expected markdown budget remaining)",
         "actions": (
             "no promotion, or one segment-targeted five-product bundle discounted by "
@@ -541,8 +548,8 @@ def main() -> None:
             "option/visit model."),
     }
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    output_path.write_text(json.dumps(output, indent=2) + "\n")
-    print(json.dumps({
+    output_path.write_text(strict_json_dumps(output))
+    print(strict_json_dumps({
         "output": str(output_path),
         "horizon_days": args.horizon_days,
         "segments": [{
@@ -557,7 +564,7 @@ def main() -> None:
                 "total_incremental_list_value_mean",
                 "total_incremental_post_discount_sales", "action_day_counts")
         } for scenario in scenarios],
-    }, indent=2), flush=True)
+    }), end="", flush=True)
 
 
 if __name__ == "__main__":

@@ -9,7 +9,6 @@ protocol drift.  Marginal-incidence variants remain available explicitly for dia
 from __future__ import annotations
 
 import argparse
-import json
 import math
 import os
 from pathlib import Path
@@ -19,12 +18,13 @@ os.environ.setdefault("V3_AFFINITY", "1")
 import numpy as np
 import torch
 
-from audit_particle_counterfactual_generation import ROOT, load_checkpoint
+from checkpoint_io import ROOT, load_checkpoint
 from data import build
 from eval_mrr_cutoffs import popularity_ranks
 from features import Features
 from fit import Batcher, popularity_logits, rec_eval
 from ragged import smolyak_grid
+from provenance import file_sha256, strict_json_dumps
 
 
 torch.set_default_dtype(torch.float64)
@@ -153,15 +153,18 @@ def main():
     torch.set_num_threads(args.threads)
     data = build()
     ckpt = args.ckpt if args.ckpt.is_absolute() else ROOT / args.ckpt
-    model, blob, meta = load_checkpoint(ckpt, data)
+    model, blob, meta = load_checkpoint(
+        ckpt, data,
+        required_capabilities=("conditional_nonempty_incidence", "gram_interactions"))
     singular = torch.linalg.svdvals(model.phi)
     active_rank = int((singular > singular[0] * 1e-10).sum())
     if args.rank > 0 and active_rank != args.rank:
         raise RuntimeError(
             f"checkpoint active interaction rank is {active_rank}, not {args.rank}")
     model.eval()
-    batcher = Batcher(data, Features(int(data["n_item"]), int(data["n_store"]), 712),
-                      int(meta["nmax"]))
+    features = Features(int(data["n_item"]), int(data["n_store"]), 712,
+                        include_recency=False)
+    batcher = Batcher(data, features, int(meta["nmax"]), include_recency=False)
     split = {"validation": 1, "test": 2}[args.split]
     population = np.flatnonzero((data["trip_split"] == split) &
                                 (data["trip_nlines"] <= int(meta["nmax"])))
@@ -170,6 +173,9 @@ def main():
     protocol = "conditioned-incidence" if args.conditioned else args.protocol
     base = {
         "checkpoint": str(ckpt),
+        "checkpoint_sha256": file_sha256(ckpt),
+        "data_fingerprint_sha256": blob["data_fingerprint_sha256"],
+        "trained_capabilities": blob["trained_capabilities"],
         "checkpoint_iteration": int(blob["iter"]),
         "active_rank": active_rank,
         "requested_test_trips": int(len(trips)),
@@ -225,8 +231,8 @@ def main():
                 float(reciprocal_gain.mean() + 1.96 * gain_se)],
         }
     path = args.output if args.output.is_absolute() else ROOT / args.output
-    path.write_text(json.dumps(output, indent=2) + "\n")
-    print(json.dumps(output, indent=2))
+    path.write_text(strict_json_dumps(output))
+    print(strict_json_dumps(output), end="")
 
 
 if __name__ == "__main__":

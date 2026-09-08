@@ -25,6 +25,7 @@ from features import Features
 from fit import (Batcher, calibrate_size_ipf, initialize_size_potential,
                  initialize_taste_moments, popularity_logits)
 from ragged import RaggedModel
+from provenance import load_data_fingerprint, strict_json_dumps
 from sparse_artifact import (initialize_nested_trace_class_phi,
                              save_sparse_initialization_artifact)
 
@@ -59,6 +60,7 @@ def main() -> None:
     torch.set_num_threads(args.threads)
     torch.manual_seed(args.seed)
     data = build()
+    data_fingerprint = load_data_fingerprint(Path(__file__).resolve().parents[2])
     dimensions = tuple(int(data[key]) for key in
                        ("n_item", "n_user", "n_cat", "n_store"))
     products, households, categories, stores = dimensions
@@ -91,7 +93,8 @@ def main() -> None:
     # explicitly zeros Phi before its first objective evaluation.
     initialize_nested_trace_class_phi(model, active_rank=args.active_rank,
                                       row_rms=0.03, decay=0.84, seed=823)
-    batcher = Batcher(data, Features(products, stores, 712), args.nmax)
+    features = Features(products, stores, 712, include_recency=False)
+    batcher = Batcher(data, features, args.nmax, include_recency=False)
     initialize_size_potential(model, data, training, batcher, args.nmax)
     if args.ipf_steps:
         calibrate_size_ipf(model, data, training, batcher, args.nmax,
@@ -105,13 +108,22 @@ def main() -> None:
         "active_rank": args.active_rank, "affinity_partition": True,
         "initialization_only": True, "no_rec": True,
         "household_size_rank1": bool(args.household_size_rank1),
+        "data_fingerprint_sha256": data_fingerprint["fingerprint_sha256"],
+        "price_basis": data_fingerprint["price_basis"],
+        "trained_capabilities": {
+            "conditional_nonempty_incidence": False,
+            "gram_interactions": False,
+            "recency": False,
+            "quantities": False,
+            "arrival_or_null_basket": False,
+        },
     }
     args.output.parent.mkdir(parents=True, exist_ok=True)
     summary = save_sparse_initialization_artifact(
         args.output, model, metadata=metadata,
         sequence=[tuple([1] * args.Kz)], calibration_trips=[])
     args.manifest.parent.mkdir(parents=True, exist_ok=True)
-    args.manifest.write_text(json.dumps(summary, indent=2, default=str) + "\n")
+    args.manifest.write_text(strict_json_dumps(summary))
     print(f"[initialize] wrote fresh artifact {args.output}")
 
 

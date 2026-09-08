@@ -10,7 +10,6 @@ additional beta=1 invariant blocked update to the final SMC population.
 from __future__ import annotations
 
 import argparse
-import json
 import math
 import os
 import time
@@ -22,18 +21,18 @@ import numpy as np
 import pandas as pd
 import torch
 
+from checkpoint_io import ROOT, load_checkpoint
 from data import build
 from features import Features
 from fit import Batcher
 from interaction_particles import (blocked_rejuvenation,
                                    rao_blackwell_particle_statistics)
-from ragged import RaggedModel
-from sparse_artifact import load_sparse_initialization_artifact
+from pipeline_support import copied_context, named_basket, particle_delta
 from tempered_ais import annealed_smc_logz
+from provenance import file_sha256, strict_json_dumps
 
 
 torch.set_default_dtype(torch.float64)
-ROOT = Path(__file__).resolve().parents[2]
 
 
 def parse_args():
@@ -54,58 +53,6 @@ def parse_args():
     return parser.parse_args()
 
 
-def resolve_initialization_artifact(checkpoint: Path, configured: str | Path) -> Path:
-    """Relocate a checkpoint's initialization artifact after moving to another clone."""
-    configured = Path(configured)
-    if configured.is_file():
-        return configured
-    checkpoint_root = checkpoint.resolve().parents[1]
-    candidates = (
-        checkpoint_root / "artifacts" / configured.name,
-        checkpoint.resolve().parent / configured.name,
-        ROOT / "artifacts" / configured.name,
-    )
-    for candidate in candidates:
-        if candidate.is_file():
-            return candidate
-    raise FileNotFoundError(
-        f"checkpoint refers to missing initialization artifact {configured}; "
-        f"restore it as {checkpoint_root / 'artifacts' / configured.name}")
-
-
-def load_checkpoint(path: Path, data):
-    blob = torch.load(path, map_location="cpu", weights_only=False)
-    artifact = resolve_initialization_artifact(path, blob["config"]["artifact"])
-    raw = torch.load(artifact, map_location="cpu", weights_only=False)
-    meta = raw["metadata"]
-    model = RaggedModel(
-        int(data["n_item"]), int(data["n_user"]), int(data["n_cat"]),
-        K=int(meta["K"]), Kz=int(meta["Kz"]), nmax=int(meta["nmax"]),
-        R=int(meta["R"]), seed=int(meta["seed"]), S=int(data["n_store"]),
-        Kp=int(meta["Kp"]), phi_init=0.0,
-        household_size_rank1=bool(meta.get("household_size_rank1", False)))
-    load_sparse_initialization_artifact(artifact, model)
-    model.load_state_dict(blob["model"], strict=True)
-    model._poly_degree_native = True
-    model._esp_native = True
-    model._esp_log_blocked = True
-    model.double().eval()
-    return model, blob, meta
-
-
-def copied_context(ctx):
-    return {key: value.clone() if torch.is_tensor(value) else value
-            for key, value in ctx.items()}
-
-
-def particle_delta(states, delta_slot, batches):
-    answer = torch.zeros(len(states), batches, dtype=delta_slot.dtype)
-    for p, particle in enumerate(states):
-        for b, slots in enumerate(particle):
-            answer[p, b] = delta_slot[slots].sum()
-    return answer
-
-
 def selected_trip_panel(data, count, nmax, seed):
     candidates = np.flatnonzero(
         (data["trip_split"] == 1) & (data["trip_nlines"] <= nmax)
@@ -114,23 +61,18 @@ def selected_trip_panel(data, count, nmax, seed):
     return candidates[rng.permutation(len(candidates))[:count]]
 
 
-def named_basket(items, metadata, limit=8):
-    names = []
-    for item in items[:limit]:
-        text = str(metadata.SUB_COMMODITY_DESC.iloc[int(item)]).strip()
-        names.append({"item": int(item), "description": text})
-    return names
-
-
 @torch.no_grad()
 def main():
     args = parse_args()
     torch.set_num_threads(args.threads)
     ckpt = args.ckpt if args.ckpt.is_absolute() else ROOT / args.ckpt
     data = build()
-    model, blob, meta = load_checkpoint(ckpt, data)
-    batcher = Batcher(data, Features(int(data["n_item"]), int(data["n_store"]), 712),
-                      int(meta["nmax"]))
+    model, blob, meta = load_checkpoint(
+        ckpt, data,
+        required_capabilities=("conditional_nonempty_incidence", "gram_interactions"))
+    features = Features(int(data["n_item"]), int(data["n_store"]), 712,
+                        include_recency=False)
+    batcher = Batcher(data, features, int(meta["nmax"]), include_recency=False)
     trips = selected_trip_panel(data, args.trips, int(meta["nmax"]), args.seed)
     ix, ctx, _line_ctx, house, line_item, line_trip, _line_cat, _line_q = batcher.make(trips)
     model.house, model.ctx = house, ctx
@@ -240,6 +182,9 @@ def main():
     observed_sizes = data["trip_nlines"][trips].astype(np.float64)
     output = {
         "checkpoint": str(ckpt),
+        "checkpoint_sha256": file_sha256(ckpt),
+        "data_fingerprint_sha256": blob["data_fingerprint_sha256"],
+        "trained_capabilities": blob["trained_capabilities"],
         "checkpoint_iteration": int(blob["iter"]),
         "best_iteration": int(blob["best_iteration"]),
         "trips": trips.tolist(),
@@ -266,7 +211,7 @@ def main():
     }
     args.output = args.output if args.output.is_absolute() else ROOT / args.output
     args.output.parent.mkdir(parents=True, exist_ok=True)
-    args.output.write_text(json.dumps(output, indent=2) + "\n")
+    args.output.write_text(strict_json_dumps(output))
     summary = {
         key: output[key] for key in (
             "checkpoint", "particles_per_trip", "smc_levels", "smc_seconds",
@@ -279,7 +224,7 @@ def main():
         if key != "examples"
     }
     summary["full_report"] = str(args.output)
-    print(json.dumps(summary, indent=2))
+    print(strict_json_dumps(summary), end="")
 
 
 if __name__ == "__main__":

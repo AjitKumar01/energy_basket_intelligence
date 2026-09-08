@@ -5,7 +5,7 @@ import numpy as np
 import pytest
 import torch
 
-from checkpoint_io import require_capabilities
+from checkpoint_io import floating_state_dtype, require_capabilities
 from fit import Batcher
 from provenance import (build_data_fingerprint, file_sha256,
                         load_data_fingerprint, strict_json_dumps)
@@ -37,6 +37,29 @@ def test_checkpoint_capabilities_fail_closed():
         require_capabilities(blob, "gram_interactions")
     with pytest.raises(ValueError, match="predates"):
         require_capabilities({}, "conditional_nonempty_incidence")
+
+
+def test_checkpoint_dtype_is_taken_from_certified_state_not_process_default():
+    previous = torch.get_default_dtype()
+    try:
+        torch.set_default_dtype(torch.float32)
+        state = {
+            "weight": torch.ones(2, dtype=torch.float64),
+            "enabled": torch.tensor(True),
+            "index": torch.tensor([0, 1], dtype=torch.int64),
+        }
+        assert torch.get_default_dtype() == torch.float32
+        assert floating_state_dtype(state) == torch.float64
+    finally:
+        torch.set_default_dtype(previous)
+
+
+def test_checkpoint_dtype_rejects_mixed_floating_state():
+    with pytest.raises(ValueError, match="exactly one floating dtype"):
+        floating_state_dtype({
+            "left": torch.ones(1, dtype=torch.float32),
+            "right": torch.ones(1, dtype=torch.float64),
+        })
 
 
 def test_selected_batch_contract_does_not_compute_recency():

@@ -27,9 +27,9 @@ The selected pipeline is:
    program, with validation-driven learning-rate decay, a convergence gate, and a
    complete-support bound on the existing category coefficient;
 4. one split-half spectral pass that certifies the largest stable rank from 8 down to 4;
-5. one cross-fitted constrained Monte Carlo likelihood solve for the PSD interaction
-   kernel and the original total-size potential correction, using fixed exact draws from
-   the additive law;
+5. one cross-fitted size-stratified Monte Carlo likelihood solve for the PSD interaction
+   kernel and a smooth correction to the original total-size potential, using exact
+   additive-law band probabilities and fixed exact conditional draws;
 6. one strictly concave post-interaction household-size recalibration in the identified
    catalogue-common direction already learned by the exact parent, selected by
    within-household-day cross-fit and capped by the population tail screen;
@@ -39,11 +39,12 @@ The selected pipeline is:
 This is the corrected end-to-end pipeline. It never searches over \(\rho_0\)
 initializations and does not run stochastic Smolyak gradients. In the certified product
 basis it writes \(K=UCU^\top\), optimizes \(C\) directly under
-\(0\preceq C\preceq I\), and jointly solves a linear/quadratic correction inside the
-original \(\rho_0(n)\). Fixed common draws make the sampled likelihood deterministic and
-concave in these natural parameters. PSD/tail projection and Armijo backtracking make
-every accepted step monotone. Cross-fit gain and proposal effective sample size are
-checked before the independent Smolyak audit. Certification remains fail-closed: if the
+\(0\preceq C\preceq I\), and jointly solves a regularized 12-knot correction inside the
+original \(\rho_0(n)\). Seven exact-probability size bands explicitly represent the
+\(N\ge60\) safety region. Fixed common draws make the sampled likelihood deterministic
+and concave in these natural parameters. Projected Armijo steps are monotone. Cross-fit
+gain and within-band effective sample size are checked before the independent Smolyak
+audit. Certification remains fail-closed: if the
 optimizer does not converge, numerical fidelity fails, or the model
 puts excessive mass on anomalously large baskets, the last stage exits nonzero and keeps
 the candidate artifacts for diagnosis rather than calling them production-ready.
@@ -62,6 +63,9 @@ unobserved large-basket clique phase. Narrow two-item groups retain the original
 The evidence and decision rule are in [`paper/PIPELINE.md`](paper/PIPELINE.md). The full
 model derivation is in [`paper/THEORY.md`](paper/THEORY.md), and estimator details are in
 [`paper/ESTIMATOR.md`](paper/ESTIMATOR.md).
+The canonical size-stratified joint estimator, including its propositions, proofs,
+variance allocation, sparse complexity and pre-run gates, is in
+[`paper/SIZE_STRATIFIED_JOINT_ESTIMATOR.md`](paper/SIZE_STRATIFIED_JOINT_ESTIMATOR.md).
 For a single textbook-style narrative of the complete probability model, the role of the
 interaction-bridge \(\beta\) and its distinction from the price factor \(\beta_j\), the
 reason for staged interaction fitting, both appearances of the household-size coordinate,
@@ -73,6 +77,9 @@ map, and current implementation issue register are in
 The experimental restricted joint additive--interaction refinement, its fail-closed gate,
 synthetic efficacy result and scalability calculation are documented in
 [`paper/JOINT_INTERACTION_POLISH_AUDIT.md`](paper/JOINT_INTERACTION_POLISH_AUDIT.md).
+The accepted rank-5 interaction geometry, its relationship to product support and
+department volume, and a leakage-controlled held-out complement audit with five plots are
+in [`paper/LEARNED_INTERACTION_EMBEDDINGS.md`](paper/LEARNED_INTERACTION_EMBEDDINGS.md).
 Stage-wise interruption recovery, checkpoint prerequisites, cross-machine transfer and
 all `--start-at` commands are documented in
 [`paper/STAGEWISE_RESURRECTION.md`](paper/STAGEWISE_RESURRECTION.md).
@@ -116,24 +123,23 @@ costs and a 28-day promotion budget. Every one of the 60,459 supported baskets i
 have no numerical-integration error. Synthetic results validate recovery under declared
 truth; they do not replace real held-out evaluation or randomized commercial trials.
 
-## Historical empirical status and current certification state
+## Current empirical status
 
-The numerical results below were produced by commit `06b49ad`, before the artifact-
-lineage and simultaneous ridge-selection corrections on the
-`architecture-hardening-cleanup` branch. They remain evidence about the Version-4 model,
-but they are not a certification of the hardened executable pipeline. The model law and
-estimators were not changed by the cleanup. A new full-data execution is required before
-these numbers can be relabelled as current-pipeline results.
+The canonical size-stratified pipeline completed its full-data execution on 2026-09-08.
+It reused the converged fresh additive parent, selected rank 5, fitted the interaction
+matrix and existing size-potential correction on 12,000 training contexts, applied the
+cross-fitted household size correction, and completed every locked evaluation and
+population gate without manual intervention.
 
-The rank-one pipeline has completed from fresh initialization. It selected rank 5 and, on
-locked 4,096-trip panels, improves over its matched exact additive parent by
-\(0.02671\pm0.00211\) nats/basket on validation and \(0.03275\pm0.00239\) on test. The
-q8 numerical-error upper bounds are \(0.000318\) and \(0.000468\) nats respectively, so
-the positive likelihood gains are not quadrature artifacts. Locked test MRR is
-\(0.09525\pm0.00607\). The interaction-only MRR gain is positive but its 95% interval
-still crosses zero.
+On locked 4,096-trip panels, it improves over its matched exact additive parent by
+\(0.02675\pm0.00238\) nats/basket on validation and
+\(0.03101\pm0.00265\) on test. The lower 95% bounds after adjacent-rule numerical
+allowances are \(0.02174\) and \(0.02529\), so the positive likelihood gains are not
+quadrature artifacts. Locked test MRR is \(0.09525\pm0.00607\). The interaction-only MRR
+gain is \(0.001165\pm0.000627\), whose 95% interval still crosses zero.
 
-The three declared external baselines were then trained from fresh lineages to their
+In the preceding certified pipeline, the three declared external baselines were trained
+from fresh lineages to their
 validation convergence certificates and scored on the identical locked 4,096-trip test
 manifest. The model gains \(2.25204\pm0.09842\) nats over Bernoulli,
 \(2.26164\pm0.09767\) over DPP, and \(1.81225\pm0.09239\) over NDPP. These are paired
@@ -148,19 +154,19 @@ co-incidences versus 24,589.4 under a frequency-and-size configuration null (lif
 whereas matched controls have lift 0.998. This supports aggregate interaction information,
 not causal or uniformly reliable SKU-level complement claims.
 
-The former parent pipeline's localized extreme-basket failure is resolved: the complete
-160,007-context q6 screen and 2,048-context q7 confirmation find no context with majority
-probability on \(N\ge60\), and the calibrated population tail upper bound is
-\(0.002013\), below the allowed \(0.004250\). Every declared technical certification gate
-passes.
+The complete 160,007-context q6 screen and 2,048-context q7 confirmation find no context
+with majority probability on \(N\ge60\). The bias-corrected tail rate is \(0.003445\);
+its 95% upper bound is \(0.003570\), below the predeclared \(0.003700\) limit. Every
+declared technical certification gate passes, although this tail margin is narrow.
 
 That pass is not a claim that the model is already a commercial digital twin. On the
-64-context-per-segment generation panel, generated baskets remain too small and
-under-dispersed (mean \(7.34\), variance \(63.83\)) relative to the selected observed
+64-context generation panel, generated baskets remain too small and
+under-dispersed (mean \(7.26\), variance \(72.97\)) relative to the selected observed
 baskets (mean \(10.03\), variance \(136.28\)). The promotion MDP is therefore restricted
 to campaign shortlisting and A/B-test design until visit probability, quantities, costs,
-inventory and causal intervention evidence are added. Historical baseline numbers from
-the old preprocessing are not treated as corrected-data comparisons.
+inventory and causal intervention evidence are added. The earlier external-baseline
+margins have not yet been recomputed against this exact checkpoint and are therefore
+retained as historical evidence rather than current checkpoint comparisons.
 
 ## Requirements
 
@@ -296,6 +302,51 @@ If `data/` and `basket_input/` already exist:
 ```bash
 python scripts/run_pipeline.py 2>&1 | tee artifacts/pipeline.log
 ```
+
+The certified size-stratified estimator is the default. A smoke execution uses the same
+stage graph with deliberately small statistical panels:
+
+```bash
+python scripts/run_pipeline.py --profile smoke \
+  2>&1 | tee artifacts/stratified_smoke.log
+```
+
+A statistically gated full execution is:
+
+```bash
+python scripts/run_pipeline.py --profile full \
+  2>&1 | tee artifacts/stratified_full.log
+```
+
+The pipeline does not announce the candidate as certified unless cross-fit, within-band
+ESS, independent Smolyak likelihood, generation-mechanics, and complete-population gates
+pass. Generation moment calibration is reported separately and remains a caveat.
+Intermediate checkpoints remain clearly labeled as candidates.
+
+The expensive fixed draw bank is stored as `artifacts/candidate.bank.npz`. A compatible
+bank is reused automatically if the solver or a later stage is interrupted, so restarting
+at the interaction stage does not repeat sampling:
+
+```bash
+python scripts/run_pipeline.py --profile full --start-at interaction \
+  2>&1 | tee -a artifacts/stratified_full.log
+```
+
+The cache records the parent checkpoint digest, spectral-basis digest, context manifest,
+cross-fit split, bands, allocation, size knots, rank, and seed. A mismatch is reported and
+rebuilt rather than silently reused. To deliberately replace even a compatible derived
+bank, add `--rebuild-interaction-bank`.
+
+The former ordinary additive-parent draw estimator is retained only to reproduce earlier
+results:
+
+```bash
+python scripts/run_pipeline.py --profile full \
+  --interaction-estimator legacy-ordinary \
+  2>&1 | tee artifacts/legacy_ordinary_full.log
+```
+
+It is not selected automatically and should not be used for new model certification.
 
 ## Recovering a partial pipeline
 

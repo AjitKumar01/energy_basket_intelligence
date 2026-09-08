@@ -178,7 +178,11 @@ def validate_candidate(path: Path, initialization: Path, *, final: bool,
     if dry_run:
         return None
     blob = load_checkpoint_blob(path, "final candidate" if final else "interaction candidate")
-    if blob.get("estimator") != "constrained_crn_monte_carlo_mle_version4_natural_block":
+    allowed_estimators = {
+        "constrained_crn_monte_carlo_mle_version4_natural_block",
+        "size_stratified_sparse_natural_mcle_version4",
+    }
+    if blob.get("estimator") not in allowed_estimators:
         raise SystemExit(f"{path} is not a constrained Version-4 interaction checkpoint")
     rank = int(blob.get("active_rank", 0))
     if rank < 1 or rank > 8:
@@ -456,6 +460,15 @@ def main() -> None:
         help=("resurrect a partially completed pipeline from this stage; all earlier "
               "artifacts are validated and reused"))
     parser.add_argument("--stop-after", choices=STAGES, default="certification")
+    parser.add_argument(
+        "--interaction-estimator", choices=("stratified", "legacy-ordinary"),
+        default="stratified",
+        help=("stratified is the certified default and jointly refines C and rho_0 "
+              "with explicit size-band coverage; legacy-ordinary preserves the former "
+              "unstratified estimator for result reproduction only"))
+    parser.add_argument(
+        "--rebuild-interaction-bank", action="store_true",
+        help="resample the stratified estimator's derived draw cache")
     args = parser.parse_args()
     start_at = args.start_at or ("additive" if args.resume_additive else "data")
     if args.from_raw and args.resume_additive is not None:
@@ -468,6 +481,9 @@ def main() -> None:
         parser.error("--stop-after must be the same as or later than --start-at")
     if args.threads < 0:
         parser.error("--threads cannot be negative")
+    if args.rebuild_interaction_bank and args.interaction_estimator != "stratified":
+        parser.error("--rebuild-interaction-bank requires --interaction-estimator "
+                     "stratified")
     preflight(from_raw=args.from_raw, stop_after=args.stop_after)
     from runtime_capabilities import (detect_runtime, resolve_backend,
                                       write_runtime_report)
@@ -595,18 +611,35 @@ def main() -> None:
     interaction_candidate = ART / "candidate.pt"
     candidate = ART / "candidate_rank1.pt"
     if runs_stage(start_at, "interaction"):
-        driver.run(script(
-            "fit_convex_natural_interactions.py", "--parent", additive,
-            "--spectral", basis, "--contexts", 12000 if full else 64,
-            "--draws", 64 if full else 4, "--batch", 96 if full else 8,
-            "--rank", rank, "--score-mass", 1.0, "--spectral-max", 1.0,
-            "--joint-additive-polish", "--additive-polish-ridge", 1e-3,
-            "--threads", cpu_threads,
-            "--minimum-crossfit-gain", 0.005 if full else -1.0,
-            "--minimum-half-gain", 0.0 if full else -1e9,
-            "--minimum-ess-fraction", 0.20 if full else 0.0,
-            "--minimum-ess-p01", 2.0 if full else 0.0,
-            "--output", interaction_candidate))
+        if args.interaction_estimator == "stratified":
+            driver.run(script(
+                "fit_stratified_natural_interactions.py", "--parent", additive,
+                "--spectral", basis, "--contexts", 12000 if full else 64,
+                "--band-draws", *( [16, 16, 12, 8, 5, 4, 3] if full
+                                   else [1, 1, 1, 1, 1, 1, 1]),
+                "--batch", 96 if full else 8, "--rank", rank,
+                "--score-mass", 1.0, "--spectral-max", 1.0,
+                "--category-bound", 0.0,
+                "--size-ridge", 1e-3, "--size-smoothness", 1e-1,
+                *(("--rebuild-bank",) if args.rebuild_interaction_bank else ()),
+                "--threads", cpu_threads,
+                "--minimum-crossfit-gain", 0.005 if full else -1.0,
+                "--minimum-half-gain", 0.0 if full else -1e9,
+                "--minimum-within-band-ess-fraction", 0.20 if full else 0.0,
+                "--output", interaction_candidate))
+        else:
+            driver.run(script(
+                "fit_convex_natural_interactions.py", "--parent", additive,
+                "--spectral", basis, "--contexts", 12000 if full else 64,
+                "--draws", 64 if full else 4, "--batch", 96 if full else 8,
+                "--rank", rank, "--score-mass", 1.0, "--spectral-max", 1.0,
+                "--joint-additive-polish", "--additive-polish-ridge", 1e-3,
+                "--threads", cpu_threads,
+                "--minimum-crossfit-gain", 0.005 if full else -1.0,
+                "--minimum-half-gain", 0.0 if full else -1e9,
+                "--minimum-ess-fraction", 0.20 if full else 0.0,
+                "--minimum-ess-p01", 2.0 if full else 0.0,
+                "--output", interaction_candidate))
         if not driver.dry_run:
             interaction_report = json.loads(
                 interaction_candidate.with_suffix(".json").read_text())
@@ -718,6 +751,12 @@ def main() -> None:
         "--chunk", 48 if full else 8,
         "--threads", cpu_threads,
         "--output", REPORT / "population_size.json"), allow_failure=not full)
+    driver.run(script(
+        "diagnose_size_phase.py", "--parent", additive, "--child", candidate,
+        "--confirmed-panel", REPORT / "population_size_confirm_per_trip.npz",
+        "--contexts-per-panel", 64 if full else 2,
+        "--threads", cpu_threads,
+        "--output", REPORT / "size_phase_diagnostic.json"))
     driver.run(script(
         "run_segment_pricing_mdp.py", "--checkpoint", candidate,
         "--assignments", ART / "customer_segments.npz",

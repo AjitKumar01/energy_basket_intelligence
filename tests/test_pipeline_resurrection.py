@@ -236,9 +236,9 @@ def test_certification_rejects_failed_or_corrupt_evaluation_bundle(tmp_path, mon
 @pytest.mark.parametrize(
     ("start_at", "present", "absent"),
     [
-        ("interaction", "fit_convex_natural_interactions.py", "fit_exact_additive.py"),
+        ("interaction", "fit_stratified_natural_interactions.py", "fit_exact_additive.py"),
         ("evaluation", "compare_rank8_parent_likelihood.py",
-         "fit_convex_natural_interactions.py"),
+         "fit_stratified_natural_interactions.py"),
         ("certification", "audit_population_size.py",
          "compare_rank8_parent_likelihood.py"),
     ],
@@ -260,6 +260,44 @@ def test_dry_run_executes_only_requested_stage_suffix(
     assert f"execution window: {start_at} -> certification" in output
     assert present in output
     assert absent not in output
+
+
+def test_dry_run_uses_stratified_estimator_by_default(
+        tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(pipeline, "ROOT", tmp_path)
+    monkeypatch.setattr(pipeline, "ART", tmp_path / "artifacts")
+    monkeypatch.setattr(pipeline, "REPORT", tmp_path / "reports")
+    monkeypatch.setattr(pipeline, "V4", tmp_path / "scripts" / "version4")
+    monkeypatch.setattr(pipeline, "preflight", lambda **_kwargs: None)
+    monkeypatch.setattr(
+        sys, "argv", ["run_pipeline.py", "--dry-run", "--profile", "smoke",
+                      "--start-at", "interaction", "--stop-after", "interaction",
+                      "--rebuild-interaction-bank"])
+    pipeline.main()
+    output = capsys.readouterr().out
+    assert "fit_stratified_natural_interactions.py" in output
+    assert "--band-draws 1 1 1 1 1 1 1" in output
+    assert "--category-bound 0.0" in output
+    assert "--size-ridge 0.001 --size-smoothness 0.1" in output
+    assert "--rebuild-bank" in output
+    assert "fit_convex_natural_interactions.py" not in output
+
+
+def test_dry_run_retains_ordinary_estimator_only_as_explicit_legacy_option(
+        tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(pipeline, "ROOT", tmp_path)
+    monkeypatch.setattr(pipeline, "ART", tmp_path / "artifacts")
+    monkeypatch.setattr(pipeline, "REPORT", tmp_path / "reports")
+    monkeypatch.setattr(pipeline, "V4", tmp_path / "scripts" / "version4")
+    monkeypatch.setattr(pipeline, "preflight", lambda **_kwargs: None)
+    monkeypatch.setattr(
+        sys, "argv", ["run_pipeline.py", "--dry-run", "--profile", "smoke",
+                      "--start-at", "interaction", "--stop-after", "interaction",
+                      "--interaction-estimator", "legacy-ordinary"])
+    pipeline.main()
+    output = capsys.readouterr().out
+    assert "fit_convex_natural_interactions.py" in output
+    assert "fit_stratified_natural_interactions.py" not in output
 
 
 def test_full_test_score_is_reporting_only_not_a_gain_gate(

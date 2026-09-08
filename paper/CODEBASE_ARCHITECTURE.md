@@ -404,29 +404,33 @@ overlap to select the largest stable rank from 8 down to 4.
 The rank is model capacity. It is distinct from a Smolyak level, which controls numerical
 integration accuracy for a fixed fitted model.
 
-### 8.3 Constrained natural-parameter MCLE
+### 8.3 Canonical size-stratified natural-parameter MCLE
 
-`fit_convex_natural_interactions.py` works in the fixed spectral basis $U$:
+`fit_stratified_natural_interactions.py` works in the fixed spectral basis $U$:
 
 \[
 K=UCU^\top,
 \qquad 0\preceq C\preceq I,
 \]
 
-and jointly permits a linear/quadratic update inside the original size potential:
+and jointly fits a smooth 12-knot update inside the original size potential:
 
 \[
-\Delta\rho_0(n)=a(n/10)+c(n/10)^2.
+\Delta\rho_0(n)=\sum_{k=1}^{12}a_kB_k(n).
 \]
 
-For fixed exact draws from the additive parent, the log-likelihood-ratio objective is
-concave in (C,a,c). The implementation uses projected ascent with Armijo backtracking,
-cross-fits a ridge grid and requires both likelihood-gain and proposal-ESS gates. The
-accepted PSD matrix is factored back into active columns of `phi`.
+The additive size law is partitioned into seven exact-probability bands, including a
+dedicated \(N\ge60\) stratum. For fixed exact draws conditional on those bands, the
+log-likelihood-ratio objective is concave in \((C,a)\). The implementation alternates
+bounded L-BFGS for the size coefficients with projected Armijo ascent for \(C\), cross-fits
+a ridge grid, and requires both likelihood-gain and within-band ESS gates. The accepted
+PSD matrix is factored back into active columns of `phi`.
 
 This stage is Monte Carlo maximum likelihood, but it does not repeatedly estimate a noisy
 high-dimensional `log Z` during ordinary gradient training. Its common random draws make
-the finite-sample optimization target deterministic.
+the finite-sample optimization target deterministic. The draw bank is cached and reused
+after interruption. `fit_convex_natural_interactions.py` is retained only as the legacy
+ordinary-draw reproduction path.
 
 ### 8.4 Household-size post-calibration
 
@@ -628,7 +632,7 @@ The following classification is important because all files sit in one directory
 - `initialize_version4.py`
 - `fit_exact_additive.py`
 - `build_spectral_phi_initialization.py`
-- `fit_convex_natural_interactions.py`
+- `fit_stratified_natural_interactions.py`
 - `fit_household_size_rank1.py`
 - `compare_rank8_parent_likelihood.py`
 - `eval_smolyak_rank8_mrr.py`
@@ -642,6 +646,7 @@ The following classification is important because all files sit in one directory
 
 - `data.py`, `features.py`, `ragged.py`, `fit.py`
 - `interaction_particles.py`, `tempered_ais.py`, `tempered_block_gibbs.py`
+- `stratified_natural.py`
 - `category_safety.py`, `sparse_artifact.py`
 - `checkpoint_io.py`, `pipeline_support.py`, `provenance.py`
 - `poly_degree_native.py`, `poly_degree_native.cpp`, `setup_poly_degree_native.py`
@@ -656,12 +661,13 @@ The following classification is important because all files sit in one directory
 
 ### 13.4 Research or superseded entry points
 
-These are not called by `scripts/run_pipeline.py`:
+These are not called by the canonical `scripts/run_pipeline.py` invocation:
 
 - `adaptive_sparse.py`
 - `calibrate_projected_fisher_size.py`
 - `constrain_category_interactions.py`
 - `diagnose_bucket_coverage.py`
+- `fit_convex_natural_interactions.py` except through `--interaction-estimator legacy-ordinary`
 - `fit_interaction_particles.py` as a trainer
 - `fit_multifidelity_rank8.py` as a trainer
 - `fit_projected_fisher_interactions.py`
@@ -687,10 +693,10 @@ The test suite covers:
 - customer segmentation and promotion-budget DP logic; and
 - exact synthetic interaction and retailer recovery.
 
-Hardening-branch verification on 4 September 2026:
+Canonical-pipeline verification on 8 September 2026:
 
 ```text
-pytest -q: 66 passed, 2 warnings
+pytest -q: 90 passed, 2 warnings
 python -m compileall -q scripts tests: passed
 all three driver --help paths: passed
 ```

@@ -43,6 +43,22 @@ def require_capabilities(blob: dict, *required: str) -> dict[str, bool]:
     return {str(name): bool(value) for name, value in capabilities.items()}
 
 
+def floating_state_dtype(state: dict[str, torch.Tensor]) -> torch.dtype:
+    """Return the unique floating dtype recorded in a certified model state.
+
+    Model construction follows PyTorch's process-wide default dtype.  Evaluation
+    entry points must not therefore be able to change checkpoint restoration merely
+    by importing (or omitting) a module that calls ``set_default_dtype``.
+    """
+    dtypes = {value.dtype for value in state.values()
+              if isinstance(value, torch.Tensor) and value.is_floating_point()}
+    if len(dtypes) != 1:
+        raise ValueError(
+            "certified initialization must contain exactly one floating dtype; "
+            f"found {sorted(map(str, dtypes))}")
+    return next(iter(dtypes))
+
+
 def load_checkpoint(path: Path, data, *, required_capabilities=()):
     path = Path(path)
     blob = torch.load(path, map_location="cpu", weights_only=False)
@@ -62,6 +78,10 @@ def load_checkpoint(path: Path, data, *, required_capabilities=()):
         R=int(meta["R"]), seed=int(meta["seed"]), S=int(data["n_store"]),
         Kp=int(meta["Kp"]), phi_init=0.0,
         household_size_rank1=bool(meta.get("household_size_rank1", False)))
+    # Match the artifact before loading it.  Otherwise load_state_dict silently
+    # casts float64 tensors into a float32 model when an evaluator has not set the
+    # global default dtype, and the subsequent integrity digest correctly fails.
+    model.to(dtype=floating_state_dtype(raw["model_state"]))
     load_sparse_initialization_artifact(artifact, model)
     model.load_state_dict(blob["model"], strict=True)
     model._poly_degree_native = True

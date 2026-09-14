@@ -273,19 +273,22 @@ def draw_increment(vector: np.ndarray, bank: StratifiedNaturalBank) -> np.ndarra
 
 
 def evaluation_summary(vector: np.ndarray, bank: StratifiedNaturalBank,
-                       band_of_draw: np.ndarray) -> dict:
+                       band_of_draw: np.ndarray, household=None) -> dict:
     """Paired gain and within-stratum weight diagnostics.
 
     Overall importance ESS is not meaningful for deliberately unequal stratum weights.
     The relevant diagnostic is composition coverage *inside* each size stratum.
     """
     gain = likelihood_gain(vector, bank)
+    from uncertainty import paired_score_summary
+    uncertainty = paired_score_summary(gain, household)
     increment = draw_increment(vector, bank)
     band_of_draw = np.asarray(band_of_draw, dtype=np.int64)
     if band_of_draw.shape != (bank.draws,):
         raise ValueError("band_of_draw must have one entry per draw")
     rows = []
     all_fraction = []
+    all_ess = []
     for band in np.unique(band_of_draw):
         selected = band_of_draw == band
         logits = increment[:, selected]
@@ -298,9 +301,13 @@ def evaluation_summary(vector: np.ndarray, bank: StratifiedNaturalBank,
         value = fraction[active]
         if len(value):
             all_fraction.append(value)
+            all_ess.append(ess[active])
             rows.append({
                 "band": int(band), "draws": int(selected.sum()),
                 "active_contexts": int(active.sum()),
+                "ess_min": float(ess[active].min()),
+                "ess_p01": float(np.quantile(ess[active], 0.01)),
+                "maximum_normalized_weight": float(probability[active].max()),
                 "ess_fraction_min": float(value.min()),
                 "ess_fraction_p01": float(np.quantile(value, 0.01)),
                 "ess_fraction_median": float(np.median(value)),
@@ -308,13 +315,28 @@ def evaluation_summary(vector: np.ndarray, bank: StratifiedNaturalBank,
     pooled = np.concatenate(all_fraction) if all_fraction else np.asarray([0.0])
     return {
         "gain": float(gain.mean()),
-        "gain_standard_error": float(gain.std(ddof=1) / np.sqrt(len(gain))),
-        "gain_lower_95": float(gain.mean() - 1.96 * gain.std(ddof=1) / np.sqrt(len(gain))),
+        "gain_standard_error": uncertainty["standard_error"],
+        "gain_standard_error_method": uncertainty["standard_error_method"],
+        "gain_trip_naive_standard_error": uncertainty["trip_naive_standard_error"],
+        "gain_lower_95": uncertainty["95_interval"][0],
         "minimum_within_band_ess_fraction": float(pooled.min()),
+        "minimum_within_band_ess": float(np.concatenate(all_ess).min()) if all_ess else 0.0,
         "p01_within_band_ess_fraction": float(np.quantile(pooled, 0.01)),
         "median_within_band_ess_fraction": float(np.median(pooled)),
         "bands": rows,
     }
+
+
+def within_band_ess_passes(summary: dict, minimum_fraction: float,
+                           minimum_absolute: float) -> bool:
+    """Both gates are needed: ESS/D alone is vacuous when D <= 1/threshold."""
+    if (not np.isfinite([minimum_fraction, minimum_absolute]).all()
+            or not 0 <= minimum_fraction <= 1 or minimum_absolute < 0):
+        raise ValueError("invalid ESS thresholds")
+    fraction = summary.get("minimum_within_band_ess_fraction", float("nan"))
+    absolute = summary.get("minimum_within_band_ess", float("nan"))
+    return bool(np.isfinite([fraction, absolute]).all()
+                and fraction >= minimum_fraction and absolute >= minimum_absolute)
 
 
 def projected_solve(

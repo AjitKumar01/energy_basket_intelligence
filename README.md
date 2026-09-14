@@ -63,6 +63,10 @@ unobserved large-basket clique phase. Narrow two-item groups retain the original
 The evidence and decision rule are in [`paper/PIPELINE.md`](paper/PIPELINE.md). The full
 model derivation is in [`paper/THEORY.md`](paper/THEORY.md), and estimator details are in
 [`paper/ESTIMATOR.md`](paper/ESTIMATOR.md).
+For a line-by-line derivation of held-out basket likelihood, including the exact
+Hubbard--Stratonovich/ESP reduction, the signed Smolyak normalizer, the validation panel,
+and the current numerical audit, see
+[`paper/HELDOUT_LIKELIHOOD_NORMALIZER.md`](paper/HELDOUT_LIKELIHOOD_NORMALIZER.md).
 The canonical size-stratified joint estimator, including its propositions, proofs,
 variance allocation, sparse complexity and pre-run gates, is in
 [`paper/SIZE_STRATIFIED_JOINT_ESTIMATOR.md`](paper/SIZE_STRATIFIED_JOINT_ESTIMATOR.md).
@@ -85,6 +89,9 @@ all `--start-at` commands are documented in
 [`paper/STAGEWISE_RESURRECTION.md`](paper/STAGEWISE_RESURRECTION.md).
 The completed corrected-data fit and its fail-closed production decision are reported in
 [`paper/CORRECTED_PIPELINE_RESULTS.md`](paper/CORRECTED_PIPELINE_RESULTS.md).
+The evidence-gated HTTP interface for the successful basket-completion, cross-sell, and
+descriptive-segmentation applications is documented in
+[`paper/RETAIL_APPLICATION_API.md`](paper/RETAIL_APPLICATION_API.md).
 The completed rank-one successor, including its locked likelihood, recommendation,
 generation, external-baseline, interaction-embedding and population-certification results,
 is reported in
@@ -522,6 +529,39 @@ available product is ranked by its exact conditional add-one energy. `MRR` avera
 \(1/r\), where \(r\) is the hidden product's rank. `MRR@k` is \(1/r\) only when
 \(r\leq k\), otherwise zero. The normalizer cancels in this conditional ranking, so MRR
 does not use or tune the Smolyak level.
+
+## Cart-conditional retailer queries
+
+For a revealed non-empty cart `A`, `scripts/version4/conditional_basket.py` evaluates the
+completion law
+
+\[
+P(T\mid A\subseteq S,x)=
+\frac{\exp\{E(A\cup T;x)-E(A;x)\}}
+     {\sum_U\exp\{E(A\cup U;x)-E(A;x)\}}.
+\]
+
+The denominator includes `U = empty`, so the same computation returns both eventual-item
+incidences and the stopping probability. Revealed products are removed from the remaining
+assortment; their Gram cross-terms and category/size increments are retained exactly. This
+avoids rejecting unconditional particles until a rare cart happens to appear.
+
+Run the finite exact-enumeration certification and the held-out real-data application
+audit with:
+
+```bash
+python -u scripts/version4/audit_counterfactual_query_synthetic.py \
+  --output artifacts/retail_application_audit_20260915/synthetic_forced_cart_exact_audit.json
+
+python -u scripts/version4/evaluate_retail_applications.py \
+  --checkpoint artifacts/corrected_complete_rank5_20260913/artifacts/candidate_rank1.pt \
+  --output artifacts/retail_application_audit_20260915/real_application_evaluation.json
+```
+
+The fitted model is a set law: it predicts eventual completion, not chronological next
+scan. Price, promotion, stockout, and assortment changes remain model-conditional
+scenarios until their effects are validated using randomized assignment or a defensible
+causal design.
 
 ## Inspecting learned complements
 

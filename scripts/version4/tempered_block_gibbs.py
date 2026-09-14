@@ -335,10 +335,17 @@ def _numpy_backtrack_repeated(log_g: torch.Tensor, centred: torch.Tensor,
         log_pref = None
         for c in range(len(rows) - 1, -1, -1):
             active = np.flatnonzero(left > 0)
-            for draw in active:
-                hi = min(int(left[draw]), len(row_slots[c]), len(polys[c]) - 1)
+            if not len(active):
+                break
+            # Every draw with the same remaining degree has the same reverse
+            # conditional distribution.  Sampling the group in one RNG call is
+            # algebraically identical to one call per draw and avoids thousands of
+            # small Python/NumPy dispatches for production particle banks.
+            for remaining in np.unique(left[active]):
+                group = active[left[active] == remaining]
+                hi = min(int(remaining), len(row_slots[c]), len(polys[c]) - 1)
                 take_axis = np.arange(hi + 1)
-                keep = left[draw] - take_axis
+                keep = int(remaining) - take_axis
                 valid = keep < len(pref[c])
                 probability = np.zeros(hi + 1, dtype=np.float64)
                 probability[valid] = polys[c][take_axis[valid]] * pref[c][keep[valid]]
@@ -347,13 +354,13 @@ def _numpy_backtrack_repeated(log_g: torch.Tensor, centred: torch.Tensor,
                     if log_pref is None:
                         log_pref = _numpy_log_prefix(log_polys, max_n)
                     log_probability = _numpy_log_reverse_weights(
-                        log_polys[c], log_pref[c], int(left[draw]))
-                    take = probabilities_from_log(log_probability)
-                    take = int(rng.choice(len(take), p=take))
+                        log_polys[c], log_pref[c], int(remaining))
+                    probability = probabilities_from_log(log_probability)
                 else:
-                    take = int(rng.choice(hi + 1, p=probability / total))
-                allocation[draw, c] = take
-                left[draw] -= take
+                    probability /= total
+                take = rng.choice(len(probability), size=len(group), p=probability)
+                allocation[group, c] = take
+                left[group] -= take
         if np.any(left):
             raise RuntimeError("category reverse sampler left slots unfilled")
 
@@ -428,8 +435,23 @@ def conditional_log_tables_levels(model, ix, z: torch.Tensor,
     log_e = esp_log_bucketed(
         centred, ix.row_of, ix.n_rows, model.R, ix.row_size, ix.item_pos)
     r = torch.arange(model.R + 1, dtype=phi.dtype, device=phi.device)
-    log_g = (log_e - model.rho_c[ix.row_cat].unsqueeze(0).unsqueeze(-1)
-             * model.pair_feature(r))                                 # [L,row,R+1]
+    base_cat = getattr(model, "_condition_cat_count", None)
+    if base_cat is None:
+        category_feature = model.pair_feature(r).view(1, -1)
+        valid_category = None
+    else:
+        base_cat = base_cat.to(dtype=torch.long, device=phi.device)
+        if base_cat.shape != (ix.B, model.C):
+            raise ValueError("conditional category counts must have shape [B,C]")
+        base_row = base_cat[ix.row_trip, ix.row_cat]
+        category_feature = (
+            model.pair_feature(base_row.unsqueeze(-1) + r)
+            - model.pair_feature(base_row).unsqueeze(-1))
+        valid_category = r <= (model.R - base_row).unsqueeze(-1)
+    log_g = (log_e - model.rho_c[ix.row_cat].view(1, -1, 1)
+             * category_feature.unsqueeze(0))                         # [L,row,R+1]
+    if valid_category is not None:
+        log_g = log_g.masked_fill(~valid_category.unsqueeze(0), -float("inf"))
 
     gp = torch.full((L, ix.B * ix.Cpad, model.R + 1), -float("inf"),
                     dtype=phi.dtype, device=phi.device)
@@ -446,8 +468,25 @@ def conditional_log_tables_levels(model, ix, z: torch.Tensor,
         tilted.contiguous(), degree.contiguous(), model.nmax)
     log_a = log_a + slopes.unsqueeze(-1) * degree_axis
     n_axis = torch.arange(log_a.shape[-1], dtype=phi.dtype, device=phi.device)
-    log_size = (log_a + n_axis * scale.unsqueeze(-1)
-                - model.rho_0()[:log_a.shape[-1]])[..., 1:]
+    base_size = getattr(model, "_condition_size", None)
+    rho0 = model.rho_0()
+    if base_size is None:
+        size_potential = rho0[:log_a.shape[-1]].view(1, -1)
+        valid_size = None
+    else:
+        base_size = base_size.to(dtype=torch.long, device=phi.device)
+        if base_size.shape != (ix.B,):
+            raise ValueError("conditional base size must have shape [B]")
+        total_size = base_size.unsqueeze(-1) + n_axis.to(torch.long).unsqueeze(0)
+        valid_size = total_size < rho0.numel()
+        # Subtract the revealed-basket constant so an empty completion has score zero.
+        size_potential = (rho0[total_size.clamp(max=rho0.numel() - 1)]
+                          - rho0[base_size].unsqueeze(-1))
+    log_size_all = log_a + n_axis * scale.unsqueeze(-1) - size_potential.unsqueeze(0)
+    if valid_size is not None:
+        log_size_all = log_size_all.masked_fill(
+            ~valid_size.unsqueeze(0), -float("inf"))
+    log_size = log_size_all[..., 1:]
 
     return log_g, centred, log_size
 

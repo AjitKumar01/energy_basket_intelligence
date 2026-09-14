@@ -33,11 +33,45 @@ from stratified_natural import (
     evaluation_summary,
     linear_size_basis,
     split_parameters,
+    within_band_ess_passes,
 )
 from tempered_block_gibbs import conditional_slots_stratified, default_size_bands
 
 
 torch.set_default_dtype(torch.float64)
+
+
+def candidate_gate_failures(row: dict, *, minimum_gain: float,
+                            minimum_half_gain: float, minimum_ess_fraction: float,
+                            minimum_ess: float, include_full: bool = False) -> list[str]:
+    """Eligibility is joint likelihood, overlap and optimization, not gain alone."""
+    failures = []
+    gain = row.get("mean_crossfit_gain", float("nan"))
+    half_gain = row.get("minimum_crossfit_gain", float("nan"))
+    if not np.isfinite(gain) or gain < minimum_gain:
+        failures.append("mean cross-fit gain below minimum")
+    if not np.isfinite(half_gain) or half_gain <= minimum_half_gain:
+        failures.append("minimum half gain not above minimum")
+    for name in ("a_fit_b", "b_fit_a"):
+        if not within_band_ess_passes(row.get(name, {}), minimum_ess_fraction, minimum_ess):
+            failures.append(f"{name}: within-band ESS below minimum")
+    for name in ("solve_a", "solve_b"):
+        solve = row.get(name, {})
+        if not (solve.get("converged") and solve.get("accepted_steps_monotone")):
+            failures.append(f"{name}: optimization not converged and monotone")
+    if include_full:
+        if not within_band_ess_passes(row.get("full_fit", {}), minimum_ess_fraction, minimum_ess):
+            failures.append("full fit: within-band ESS below minimum")
+        solve = row.get("full_solve", {})
+        if not (solve.get("converged") and solve.get("accepted_steps_monotone")):
+            failures.append("full fit: optimization not converged and monotone")
+    return failures
+
+
+def select_eligible_ridge(rows: list[dict]) -> dict | None:
+    """Only fully screened candidates can win; None means fail closed."""
+    eligible = [row for row in rows if row.get("accepted_for_selection") is True]
+    return max(eligible, key=lambda row: row["mean_crossfit_gain"]) if eligible else None
 
 
 def category_entries(category: torch.Tensor, n_category: int
@@ -180,13 +214,14 @@ def main() -> None:
     parser.add_argument("--spectral", type=Path, required=True)
     parser.add_argument("--contexts", type=int, default=12000)
     parser.add_argument("--band-draws", type=int, nargs="+",
-                        default=[16, 16, 12, 8, 5, 4, 3])
+                        default=[16, 16, 12, 8, 8, 8, 8])
     parser.add_argument("--batch", type=int, default=96)
     parser.add_argument("--rank", type=int, required=True)
     parser.add_argument("--score-mass", type=float, default=1.0)
     parser.add_argument("--spectral-max", type=float, default=1.0)
     parser.add_argument("--ridges", type=float, nargs="+",
-                        default=[3e-4, 1e-3, 3e-3])
+                        default=[3e-4, 1e-3, 3e-3, 1e-2, 3e-2, 1e-1],
+                        help="training-only grid, screened jointly for gain, ESS and convergence")
     parser.add_argument("--category-ridge", type=float, default=1e-3)
     parser.add_argument("--size-ridge", type=float, default=1e-3)
     parser.add_argument("--size-smoothness", type=float, default=1e-1)
@@ -206,6 +241,7 @@ def main() -> None:
     parser.add_argument("--minimum-crossfit-gain", type=float, default=0.005)
     parser.add_argument("--minimum-half-gain", type=float, default=0.0)
     parser.add_argument("--minimum-within-band-ess-fraction", type=float, default=0.20)
+    parser.add_argument("--minimum-within-band-ess", type=float, default=2.0)
     parser.add_argument("--seed", type=int, default=40701)
     parser.add_argument("--threads", type=int, default=8)
     parser.add_argument("--output", type=Path,
@@ -221,6 +257,8 @@ def main() -> None:
     args = parser.parse_args()
     if args.contexts < 4:
         raise ValueError("at least four contexts are required")
+    if not np.isfinite(args.ridges).all() or any(ridge <= 0 for ridge in args.ridges):
+        raise ValueError("interaction ridges must be finite and positive")
     if args.category_bound < 0:
         raise ValueError("--category-bound must be nonnegative")
     if args.reuse_bank and args.rebuild_bank:
@@ -262,6 +300,7 @@ def main() -> None:
         "parent_sha256": file_sha256(parent),
         "spectral_sha256": file_sha256(spectral_path),
         "contexts": args.contexts, "rank": args.rank,
+        "score_mass": args.score_mass,
         "bands": bands, "draws_per_band": args.band_draws,
         "size_knots": args.size_knots, "seed": args.seed,
         "fit_categories": bool(args.category_bound > 0),
@@ -291,6 +330,21 @@ def main() -> None:
     bank_a = bank.subset(np.flatnonzero(half))
     bank_b = bank.subset(np.flatnonzero(~half))
     rows, candidates = [], {}
+    gates = dict(minimum_gain=args.minimum_crossfit_gain,
+                 minimum_half_gain=args.minimum_half_gain,
+                 minimum_ess_fraction=args.minimum_within_band_ess_fraction,
+                 minimum_ess=args.minimum_within_band_ess)
+
+    def full_solve(ridge):
+        return alternating_solve(
+            bank, args.rank, spectral_max=args.spectral_max,
+            category_bound=args.category_bound, size_bound=args.size_bound,
+            interaction_ridge=ridge, category_ridge=args.category_ridge,
+            size_ridge=args.size_ridge, size_smoothness=args.size_smoothness,
+            nuisance_iterations=args.max_iterations,
+            max_outer_iterations=args.max_outer_iterations,
+            pair_steps=args.pair_steps, tolerance=args.tolerance,
+            label=f"stratified-ridge-{ridge:g}-full")
     for ridge in args.ridges:
         fit_a, solve_a = alternating_solve(
             bank_a, args.rank, spectral_max=args.spectral_max,
@@ -310,8 +364,8 @@ def main() -> None:
             max_outer_iterations=args.max_outer_iterations,
             pair_steps=args.pair_steps, tolerance=args.tolerance,
             label=f"stratified-ridge-{ridge:g}-b")
-        a_on_b = evaluation_summary(fit_a, bank_b, band_of_draw)
-        b_on_a = evaluation_summary(fit_b, bank_a, band_of_draw)
+        a_on_b = evaluation_summary(fit_a, bank_b, band_of_draw, data["trip_user"][trips[~half]])
+        b_on_a = evaluation_summary(fit_b, bank_a, band_of_draw, data["trip_user"][trips[half]])
         row = {
             "ridge": float(ridge), "a_fit_b": a_on_b, "b_fit_a": b_on_a,
             "mean_crossfit_gain": 0.5 * (a_on_b["gain"] + b_on_a["gain"]),
@@ -319,29 +373,39 @@ def main() -> None:
             "minimum_within_band_ess_fraction": min(
                 a_on_b["minimum_within_band_ess_fraction"],
                 b_on_a["minimum_within_band_ess_fraction"]),
+            "minimum_within_band_ess": min(
+                a_on_b["minimum_within_band_ess"], b_on_a["minimum_within_band_ess"]),
             "solve_a": solve_a, "solve_b": solve_b,
         }
+        row["crossfit_gate_failures"] = candidate_gate_failures(row, **gates)
+        row["accepted_for_selection"] = False
+        if not row["crossfit_gate_failures"]:
+            full_vector, full_solver = full_solve(float(ridge))
+            row["full_solve"] = full_solver
+            row["full_fit"] = evaluation_summary(
+                full_vector, bank, band_of_draw, data["trip_user"][trips])
+            row["selection_gate_failures"] = candidate_gate_failures(row, include_full=True, **gates)
+            row["accepted_for_selection"] = not row["selection_gate_failures"]
+            candidates[float(ridge)] = full_vector
+        else:
+            row["selection_gate_failures"] = row["crossfit_gate_failures"]
+        print(f"[stratified-natural] ridge={ridge:g} gain={row['mean_crossfit_gain']:.6g} "
+              f"eligible={row['accepted_for_selection']} failures={row['selection_gate_failures']}",
+              flush=True)
         rows.append(row)
-        candidates[float(ridge)] = (fit_a, fit_b)
-    eligible = [row for row in rows if row["minimum_crossfit_gain"] >
-                args.minimum_half_gain]
-    selected = max(eligible or rows, key=lambda row: row["mean_crossfit_gain"])
-    vector, solve = alternating_solve(
-        bank, args.rank, spectral_max=args.spectral_max,
-        category_bound=args.category_bound, size_bound=args.size_bound,
-        interaction_ridge=selected["ridge"], category_ridge=args.category_ridge,
-        size_ridge=args.size_ridge, size_smoothness=args.size_smoothness,
-        nuisance_iterations=args.max_iterations,
-        max_outer_iterations=args.max_outer_iterations,
-        pair_steps=args.pair_steps, tolerance=args.tolerance,
-        label="stratified-full")
-    full = evaluation_summary(vector, bank, band_of_draw)
-    accepted = bool(
-        selected["minimum_crossfit_gain"] > args.minimum_half_gain
-        and selected["mean_crossfit_gain"] >= args.minimum_crossfit_gain
-        and selected["minimum_within_band_ess_fraction"] >=
-        args.minimum_within_band_ess_fraction
-        and solve["converged"] and solve["accepted_steps_monotone"])
+    selected = select_eligible_ridge(rows)
+    accepted = selected is not None
+    if selected is None:
+        # Preserve the strongest rejected result for diagnosis, never export it as accepted.
+        selected = max(rows, key=lambda row: row["mean_crossfit_gain"])
+    if selected["ridge"] not in candidates:
+        vector, solve = full_solve(selected["ridge"])
+        selected["full_solve"] = solve
+        selected["full_fit"] = evaluation_summary(vector, bank, band_of_draw, data["trip_user"][trips])
+        selected["selection_gate_failures"] = candidate_gate_failures(selected, include_full=True, **gates)
+    else:
+        vector = candidates[selected["ridge"]]
+    solve, full = selected["full_solve"], selected["full_fit"]
     pair, fitted_category_delta, size_coefficient = split_parameters(vector, bank)
     category_delta = (fitted_category_delta if bank.categories
                       else np.zeros(model.C, dtype=np.float64))
@@ -372,6 +436,8 @@ def main() -> None:
             "bank_cache": str(cache), "bank_cache_sha256": file_sha256(cache),
         },
         "ridge_audit": rows, "selected_ridge": selected["ridge"],
+        "ridge_selection_rule": "maximum cross-fit gain among candidates passing both halves and full-fit ESS/convergence gates",
+        "rejection_reasons": [] if accepted else selected["selection_gate_failures"],
         "selected_crossfit_gain": selected["mean_crossfit_gain"],
         "selected_minimum_half_gain": selected["minimum_crossfit_gain"],
         "selected_minimum_within_band_ess_fraction": selected[
@@ -393,12 +459,16 @@ def main() -> None:
             "complete-population localized and aggregate tail audit",
             "generation calibration audit",
         ],
+        "ess_gate": {"minimum_fraction": args.minimum_within_band_ess_fraction,
+                     "minimum_absolute": args.minimum_within_band_ess,
+                     "checks": "both cross-fit directions and final full-bank fit"},
     }
     output.parent.mkdir(parents=True, exist_ok=True)
     output.with_suffix(".json").write_text(strict_json_dumps(report))
     print(strict_json_dumps(report), end="")
     if not accepted:
-        raise RuntimeError("stratified natural candidate failed cross-fit or ESS gates")
+        raise RuntimeError("no ridge candidate passed all gates; best rejected candidate: "
+                           + "; ".join(selected["selection_gate_failures"]))
     with torch.no_grad():
         model.phi.zero_()
         model.phi[:, :phi.shape[1]].copy_(torch.as_tensor(phi, dtype=model.phi.dtype))

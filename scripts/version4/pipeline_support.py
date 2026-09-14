@@ -15,6 +15,10 @@ def supported_trips(data, split: int, nmax: int) -> np.ndarray:
 
 
 def smolyak_rule(model, rank: int, level: int):
+    if rank == 0:
+        # The latent integral is a constant when Phi=0, including a fitted size curve.
+        return (torch.zeros(1, model.Kz, dtype=model.phi.dtype, device=model.phi.device),
+                torch.ones(1, dtype=model.phi.dtype, device=model.phi.device))
     active, weights = smolyak_grid(rank, level)
     nodes = torch.zeros(len(weights), model.Kz, dtype=model.phi.dtype,
                         device=model.phi.device)

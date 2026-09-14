@@ -27,9 +27,10 @@ from features import Features
 from fit import Batcher
 from interaction_particles import (blocked_rejuvenation,
                                    rao_blackwell_particle_statistics)
-from pipeline_support import copied_context, named_basket, particle_delta
+from pipeline_support import named_basket, particle_delta
 from tempered_ais import annealed_smc_logz
 from provenance import file_sha256, strict_json_dumps
+from price_response import changed_price_context
 
 
 torch.set_default_dtype(torch.float64)
@@ -45,6 +46,13 @@ def parse_args():
     parser.add_argument("--rejuvenation", type=int, default=1)
     parser.add_argument("--threads", type=int, default=2)
     parser.add_argument("--seed", type=int, default=2561900)
+    parser.add_argument("--split", choices=("validation", "test"), default="validation")
+    parser.add_argument("--panel-input", type=Path,
+                        help="NPZ containing a frozen `trips` array")
+    parser.add_argument("--panel-output", type=Path,
+                        help="write the exact selected trip/household panel")
+    parser.add_argument("--per-context-output", type=Path,
+                        help="write factual, action, ESS and generated-size arrays")
     parser.add_argument("--actions", type=float, nargs="+",
                         default=[math.log(.8), math.log(.9), 0.0,
                                  math.log(1.1), math.log(1.2)])
@@ -53,9 +61,9 @@ def parse_args():
     return parser.parse_args()
 
 
-def selected_trip_panel(data, count, nmax, seed):
+def selected_trip_panel(data, count, nmax, seed, split=1):
     candidates = np.flatnonzero(
-        (data["trip_split"] == 1) & (data["trip_nlines"] <= nmax)
+        (data["trip_split"] == int(split)) & (data["trip_nlines"] <= nmax)
         & (data["trip_nlines"] >= 1))
     rng = np.random.default_rng(seed)
     return candidates[rng.permutation(len(candidates))[:count]]
@@ -73,7 +81,21 @@ def main():
     features = Features(int(data["n_item"]), int(data["n_store"]), 712,
                         include_recency=False)
     batcher = Batcher(data, features, int(meta["nmax"]), include_recency=False)
-    trips = selected_trip_panel(data, args.trips, int(meta["nmax"]), args.seed)
+    split_code = {"validation": 1, "test": 2}[args.split]
+    if args.panel_input:
+        with np.load(args.panel_input.resolve()) as panel:
+            trips = panel["trips"].astype(np.int64, copy=True)
+        if len(trips) != args.trips:
+            raise ValueError("frozen panel size differs from --trips")
+    else:
+        trips = selected_trip_panel(
+            data, args.trips, int(meta["nmax"]), args.seed, split_code)
+    if not np.all(data["trip_split"][trips] == split_code):
+        raise ValueError("generation panel contains a trip from the wrong split")
+    if args.panel_output:
+        panel_output = args.panel_output.resolve(); panel_output.parent.mkdir(parents=True, exist_ok=True)
+        np.savez_compressed(panel_output, trips=trips,
+                            household=data["trip_user"][trips], split=split_code)
     ix, ctx, _line_ctx, house, line_item, line_trip, _line_cat, _line_q = batcher.make(trips)
     model.house, model.ctx = house, ctx
 
@@ -106,15 +128,12 @@ def main():
         chosen_slots.append(int(slot[0]))
         chosen_items.append(chosen)
     chosen_slots = torch.as_tensor(chosen_slots, dtype=torch.long)
-    assortment_size = torch.bincount(ix.item_trip, minlength=ix.B).to(model.phi.dtype)
 
-    rows = []
+    rows, per_action = [], []
     factual_own = factual_stats.item_incidence[
         torch.arange(ix.B), torch.as_tensor(chosen_items)]
     for action in args.actions:
-        uniform = copied_context(ctx)
-        uniform["dlp"] += action
-        uniform["dlp_bar"] += action
+        uniform = changed_price_context(ctx, ix.item_trip, action)
         model.ctx = uniform
         uniform_b = model.b_flat(ix).clone()
         uniform_delta = particle_delta(smc.states, uniform_b - factual_b, ix.B)
@@ -125,9 +144,9 @@ def main():
             model, ix, smc.states, uniform_log_weight)
         uniform_size = (uniform_stats.size_probability * size_axis).sum(1)
 
-        own = copied_context(ctx)
-        own["dlp"][chosen_slots] += action
-        own["dlp_bar"] += action / assortment_size
+        own_change = torch.zeros_like(ctx["dlp"])
+        own_change[chosen_slots] = action
+        own = changed_price_context(ctx, ix.item_trip, own_change)
         model.ctx = own
         own_b = model.b_flat(ix).clone()
         own_delta = particle_delta(smc.states, own_b - factual_b, ix.B)
@@ -149,6 +168,10 @@ def main():
             "uniform_reweight_ess_min": float(uniform_ess.min()),
             "own_reweight_ess_min": float(own_ess.min()),
         })
+        per_action.append({"uniform_size": uniform_size.cpu().numpy(),
+                           "uniform_ess": uniform_ess.cpu().numpy(),
+                           "own_incidence": own_incidence.cpu().numpy(),
+                           "own_ess": own_ess.cpu().numpy()})
 
     model.ctx = ctx
     generated_states = blocked_rejuvenation(
@@ -180,6 +203,19 @@ def main():
     observed_categories /= max(observed_categories.sum(), 1.0)
     generated_sizes = np.asarray(generated_sizes, dtype=np.float64)
     observed_sizes = data["trip_nlines"][trips].astype(np.float64)
+    if args.per_context_output:
+        per_context = args.per_context_output.resolve()
+        per_context.parent.mkdir(parents=True, exist_ok=True)
+        np.savez_compressed(
+            per_context, trips=trips, household=data["trip_user"][trips],
+            observed_size=observed_sizes, factual_expected_size=factual_size.cpu().numpy(),
+            factual_own_incidence=factual_own.cpu().numpy(), chosen_items=np.asarray(chosen_items),
+            actions=np.asarray(args.actions),
+            uniform_expected_size=np.stack([x["uniform_size"] for x in per_action]),
+            uniform_ess_fraction=np.stack([x["uniform_ess"] for x in per_action]),
+            own_incidence=np.stack([x["own_incidence"] for x in per_action]),
+            own_ess_fraction=np.stack([x["own_ess"] for x in per_action]),
+            generated_size=generated_sizes.reshape(ix.B, len(generated_states)))
     output = {
         "checkpoint": str(ckpt),
         "checkpoint_sha256": file_sha256(ckpt),
@@ -188,6 +224,7 @@ def main():
         "checkpoint_iteration": int(blob["iter"]),
         "best_iteration": int(blob["best_iteration"]),
         "trips": trips.tolist(),
+        "split": args.split,
         "particles_per_trip": args.particles,
         "smc_levels": args.levels,
         "smc_seconds": smc_seconds,
@@ -209,6 +246,12 @@ def main():
             "examples": examples,
         },
     }
+    if args.panel_output:
+        output["panel_output"] = str(panel_output)
+        output["panel_sha256"] = file_sha256(panel_output)
+    if args.per_context_output:
+        output["per_context_output"] = str(per_context)
+        output["per_context_sha256"] = file_sha256(per_context)
     args.output = args.output if args.output.is_absolute() else ROOT / args.output
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(strict_json_dumps(output))

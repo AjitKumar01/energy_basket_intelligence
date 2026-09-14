@@ -25,12 +25,13 @@ from features import Features
 from fit import Batcher, popularity_logits, rec_eval
 from ragged import smolyak_grid
 from provenance import file_sha256, strict_json_dumps
+from uncertainty import household_cluster_se, paired_score_summary
 
 
 torch.set_default_dtype(torch.float64)
 
 
-def metrics(ranks):
+def metrics(ranks, household=None):
     ranks = np.asarray(ranks, dtype=float)
     reciprocal = 1.0 / ranks
     result = {
@@ -40,6 +41,9 @@ def metrics(ranks):
         "median_rank": float(np.median(ranks)),
         "mean_rank": float(np.mean(ranks)),
     }
+    if household is not None:
+        result["mrr_se"] = household_cluster_se(reciprocal, household)
+        result["standard_error_method"] = "household_cluster_robust"
     for cutoff in (5, 10, 20, 100):
         hit = ranks <= cutoff
         result[f"mrr_at_{cutoff}"] = float(np.where(hit, reciprocal, 0.0).mean())
@@ -55,7 +59,7 @@ def midrank(score, position):
 
 
 @torch.no_grad()
-def locked_add_one(model, batcher, data, trips, seed):
+def locked_add_one(model, batcher, data, trips, seed, parent=None):
     """Exact conditional add-one ranks on one common hidden-item manifest."""
     popularity = popularity_logits(
         data, np.flatnonzero(data["trip_split"] == 0)).numpy()
@@ -63,6 +67,9 @@ def locked_add_one(model, batcher, data, trips, seed):
     ranks = {name: [] for name in (
         "popularity", "additive_utility", "structured_no_gram",
         "full_interaction")}
+    if parent is not None:
+        ranks["additive_parent"] = []
+    retained_trips, households, hidden_items = [], [], []
     candidate_counts = []
     hidden_terms = []
     for start in range(0, len(trips), 24):
@@ -71,6 +78,9 @@ def locked_add_one(model, batcher, data, trips, seed):
             batcher.make(sub)
         model.house, model.ctx = house, ctx
         utility = model.b_flat(ix)
+        if parent is not None:
+            parent.house, parent.ctx = house, ctx
+            parent_utility = parent.b_flat(ix)
         slot_category = model.cat_of[ix.item]
         for basket_index in range(ix.B):
             observed = torch.unique(line_item[line_trip == basket_index])
@@ -102,18 +112,25 @@ def locked_add_one(model, batcher, data, trips, seed):
                 "structured_no_gram": structured.numpy(),
                 "full_interaction": (structured + gram).numpy(),
             }
+            if parent is not None:
+                scores["additive_parent"] = (parent_utility[slots]
+                    - parent.rho_c[candidate_category] * category_count[candidate_category]).numpy()
             for name, score in scores.items():
                 ranks[name].append(midrank(score, position))
             candidate_counts.append(available.numel())
+            retained_trips.append(int(sub[basket_index]))
+            households.append(int(data["trip_user"][sub[basket_index]]))
+            hidden_items.append(hidden)
             hidden_terms.append((float(additive[position]),
                                  float(category[position]),
                                  float(gram[position])))
-    summaries = {name: metrics(value) for name, value in ranks.items()}
+    summaries = {name: metrics(value, households) for name, value in ranks.items()}
     full = np.asarray(ranks["full_interaction"], dtype=np.float64)
     additive = np.asarray(ranks["additive_utility"], dtype=np.float64)
     gain = 1.0 / full - 1.0 / additive
-    gain_se = float(gain.std(ddof=1) / math.sqrt(len(gain)))
+    gain_se = household_cluster_se(gain, households)
     summaries["comparison"] = {
+        "standard_error_method": "household_cluster_robust",
         "full_beats_additive_fraction": float(np.mean(full < additive)),
         "full_ties_additive_fraction": float(np.mean(full == additive)),
         "mean_rank_change_full_minus_additive": float(np.mean(full - additive)),
@@ -126,12 +143,22 @@ def locked_add_one(model, batcher, data, trips, seed):
             ("additive", "category", "gram"),
             np.mean(hidden_terms, axis=0).tolist())),
     }
+    if parent is not None:
+        baseline = np.asarray(ranks["additive_parent"], dtype=float)
+        summaries["comparison"]["mrr_full_minus_fitted_parent"] = paired_score_summary(
+            1 / full - 1 / baseline, households)
+        summaries["comparison"]["recall_full_minus_fitted_parent"] = {
+            str(k): paired_score_summary((full <= k).astype(float) - (baseline <= k), households)
+            for k in (5, 10, 20, 100)}
+    summaries["per_case"] = {"trips": retained_trips, "households": households,
+                              "hidden_items": hidden_items, "ranks": ranks}
     return summaries
 
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--ckpt", type=Path, required=True)
+    parser.add_argument("--parent", type=Path, help="separately fitted additive checkpoint on the identical hidden-item manifest")
     parser.add_argument("--split", choices=("validation", "test"), default="test")
     parser.add_argument("--trips", type=int, default=2000)
     parser.add_argument("--chunk", type=int, default=24)
@@ -182,7 +209,14 @@ def main():
         "trip_manifest_seed": args.seed,
     }
     if protocol == "locked-add-one":
-        recommendation = locked_add_one(model, batcher, data, trips, args.seed)
+        parent = None
+        if args.parent is not None:
+            parent, parent_blob, parent_meta = load_checkpoint(args.parent.resolve(), data,
+                required_capabilities=("conditional_nonempty_incidence",))
+            if float(parent.phi.detach().abs().max()) != 0. or parent.nmax != model.nmax:
+                raise ValueError("recommendation parent must be additive on the identical support")
+            base["parent_sha256"] = file_sha256(args.parent.resolve())
+        recommendation = locked_add_one(model, batcher, data, trips, args.seed, parent=parent)
         output = {
             **base,
             "protocol": (

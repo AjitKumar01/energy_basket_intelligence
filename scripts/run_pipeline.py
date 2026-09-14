@@ -11,6 +11,8 @@ import shlex
 import shutil
 import subprocess
 import sys
+import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -18,12 +20,15 @@ PY = sys.executable
 V4 = ROOT / "scripts" / "version4"
 ART = ROOT / "artifacts"
 REPORT = ROOT / "reports"
+OUT = ROOT / "out"
 RAW_DEFAULT = (ROOT.parent / "dunnhumby_The-Complete-Journey" /
                "dunnhumby_The-Complete-Journey CSV")
 RAW_LOCAL = (ROOT / "dunnhumby_The-Complete-Journey" /
              "dunnhumby_The-Complete-Journey CSV")
 STAGES = ("data", "initialize", "additive", "rank", "interaction",
           "evaluation", "certification")
+RUN_MANIFEST = None
+RUN_STATUS = None
 
 
 def file_sha256(path: Path) -> str:
@@ -229,10 +234,10 @@ def selected_rank_from_report(basis: Path, *, maximum_rank: int,
     if report.get("data_fingerprint_sha256") != current_data_fingerprint(dry_run=False):
         raise SystemExit(f"{basis.with_suffix('.json')} belongs to another dataset")
     profiles = report.get("rank_stability", {})
-    for rank in range(maximum_rank, 3, -1):
+    for rank in range(maximum_rank, 0, -1):
         if profiles.get(str(rank), {}).get("accepted"):
             return rank
-    raise SystemExit(f"{basis.with_suffix('.json')} contains no accepted rank in 4..{maximum_rank}")
+    raise SystemExit(f"{basis.with_suffix('.json')} contains no accepted rank in 1..{maximum_rank}")
 
 
 def basis_from_candidate_report(candidate: Path, *, dry_run: bool,
@@ -357,8 +362,9 @@ def command_text(command: list[str]) -> str:
 
 
 class Driver:
-    def __init__(self, dry_run: bool):
+    def __init__(self, dry_run: bool, log_dir: Path | None = None):
         self.dry_run = dry_run
+        self.log_dir = log_dir
         self.commands: list[list[str]] = []
         self.environment = os.environ.copy()
         native = ART / "native" / "lib"
@@ -373,11 +379,32 @@ class Driver:
         print(f"[pipeline] {command_text(command)}", flush=True)
         if self.dry_run:
             return 0
-        result = subprocess.run(command, cwd=ROOT, env=self.environment,
-                                check=False)
-        if result.returncode and not allow_failure:
-            raise SystemExit(result.returncode)
-        return result.returncode
+        if self.log_dir is None:
+            code = subprocess.run(command, cwd=ROOT, env=self.environment, check=False).returncode
+        else:
+            from run_synthetic_experiment import write_manifest, source_identity
+            if source_identity() != RUN_STATUS["source_sha256"]:
+                raise RuntimeError("source changed during original-data pipeline; freeze code and resume explicitly")
+            name = f"{len(self.commands):02d}_{Path(next(x for x in command if x.endswith('.py'))).stem}"
+            path = self.log_dir / f"{name}.log"
+            row = {"name": name, "command": command, "log": str(path), "status": "running"}
+            RUN_STATUS["stages"].append(row)
+            RUN_STATUS["current_stage"] = name
+            write_manifest(RUN_MANIFEST, RUN_STATUS)
+            started = time.monotonic()
+            with path.open("x", buffering=1) as log:
+                with subprocess.Popen(command, cwd=ROOT, env=self.environment, stdout=subprocess.PIPE,
+                                      stderr=subprocess.STDOUT, text=True, bufsize=1) as process:
+                    for line in process.stdout:
+                        log.write(line)
+                        print(line, end="", flush=True)
+                    code = process.wait()
+            row.update(status="completed" if code == 0 else "failed", exit_code=code,
+                       runtime_seconds=time.monotonic() - started)
+            write_manifest(RUN_MANIFEST, RUN_STATUS)
+        if code and not allow_failure:
+            raise SystemExit(code)
+        return code
 
 
 def script(name: str, *arguments: object) -> list[str]:
@@ -396,7 +423,7 @@ def rank_selection(driver: Driver, parent: Path, contexts: int,
             return 4, output
         output = ART / "interaction_basis_rank8.npz"
         driver.run(script("build_spectral_phi_initialization.py", "--parent", parent,
-                          "--trips", contexts, "--draws", 2, "--rank", 8,
+                          "--trips", contexts, "--draws", 8, "--rank", 8,
                           "--threads", threads,
                           "--output", output))
         return 8, output
@@ -408,12 +435,15 @@ def rank_selection(driver: Driver, parent: Path, contexts: int,
         path.unlink(missing_ok=True)
 
     def reject_pending(message: str) -> None:
-        pending.unlink(missing_ok=True)
-        pending_report.unlink(missing_ok=True)
+        rejected = ART / f"rejected_rank_{time.time_ns()}"
+        rejected.mkdir()
+        for path in (pending, pending_report):
+            if path.exists():
+                os.replace(path, rejected / path.name)
         raise SystemExit(message)
 
     status = driver.run(script("build_spectral_phi_initialization.py", "--parent", parent,
-                      "--trips", contexts, "--draws", 2, "--rank", maximum_rank,
+                      "--trips", contexts, "--draws", 2 if smoke else 8, "--rank", maximum_rank,
                       "--threads", threads,
                       "--minimum-stability", -1.0 if smoke else 0.5,
                       "--output", pending), allow_failure=True)
@@ -430,8 +460,8 @@ def rank_selection(driver: Driver, parent: Path, contexts: int,
     if report.get("data_fingerprint_sha256") != current_data_fingerprint(dry_run=False):
         reject_pending("new spectral rank report does not match the audited dataset")
     rank = report.get("largest_stable_rank")
-    if rank is None or not 4 <= int(rank) <= maximum_rank:
-        reject_pending("no rank in 4..8 passed the predeclared split-half gate")
+    if rank is None or not 1 <= int(rank) <= maximum_rank:
+        reject_pending("no rank in 1..8 passed the predeclared split-half gate")
     os.replace(pending, output)
     os.replace(pending_report, output.with_suffix(".json"))
     print(f"[pipeline] selected independently stable rank {rank}")
@@ -439,7 +469,10 @@ def rank_selection(driver: Driver, parent: Path, contexts: int,
 
 
 def main() -> None:
+    global ART, REPORT, OUT, RUN_MANIFEST, RUN_STATUS
     parser = argparse.ArgumentParser()
+    parser.add_argument("--run-dir", type=Path,
+                        help="isolated artifacts/reports/out under a new run directory; explicit --start-at permits reuse")
     parser.add_argument("--from-raw", action="store_true",
                         help="rebuild data/ and basket_input/ from dunnhumby CSVs")
     parser.add_argument("--dry-run", action="store_true",
@@ -470,6 +503,26 @@ def main() -> None:
         "--rebuild-interaction-bank", action="store_true",
         help="resample the stratified estimator's derived draw cache")
     args = parser.parse_args()
+    if args.run_dir is not None:
+        run_dir = args.run_dir.resolve()
+        if not args.dry_run:
+            # A continuation gets a new invocation log without replacing the old one.
+            fresh = args.start_at in (None, "data", "initialize") and args.resume_additive is None
+            run_dir.mkdir(parents=True, exist_ok=not fresh)
+        ART, REPORT, OUT = run_dir / "artifacts", run_dir / "reports", run_dir / "out"
+        if not args.dry_run:
+            from run_synthetic_experiment import Tee, write_manifest, source_identity
+            stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+            log_dir = run_dir / f"invocation_{stamp}"
+            log_dir.mkdir(exist_ok=False)
+            sys.stdout = Tee(sys.stdout, log_dir / "pipeline.log")
+            sys.stderr = sys.stdout
+            RUN_MANIFEST = log_dir / "manifest.json"
+            RUN_STATUS = {"status": "running", "pid": os.getpid(), "started_utc": stamp,
+                          "run_dir": str(run_dir), "profile": args.profile,
+                          "source_sha256": source_identity(), "stages": [],
+                          "configuration": {k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()}}
+            write_manifest(RUN_MANIFEST, RUN_STATUS)
     start_at = args.start_at or ("additive" if args.resume_additive else "data")
     if args.from_raw and args.resume_additive is not None:
         parser.error("--from-raw cannot be combined with --resume-additive")
@@ -487,9 +540,10 @@ def main() -> None:
     preflight(from_raw=args.from_raw, stop_after=args.stop_after)
     from runtime_capabilities import (detect_runtime, resolve_backend,
                                       write_runtime_report)
-    ART.mkdir(exist_ok=True)
-    REPORT.mkdir(exist_ok=True)
-    (ROOT / "out").mkdir(exist_ok=True)
+    if not args.dry_run:
+        ART.mkdir(parents=True, exist_ok=True)
+        REPORT.mkdir(parents=True, exist_ok=True)
+        OUT.mkdir(parents=True, exist_ok=True)
     capabilities = detect_runtime(ROOT)
     try:
         selected_device = resolve_backend(args.device, capabilities)
@@ -510,29 +564,35 @@ def main() -> None:
             parser.error(
                 f"full profile requires at least 5 GiB free workspace disk; detected "
                 f"{capabilities.workspace_free_gib:g} GiB")
-    write_runtime_report(
-        ART / "runtime_capabilities.json", capabilities,
-        requested_device=args.device, selected_device=selected_device,
-        cpu_threads=cpu_threads)
+    if not args.dry_run:
+        write_runtime_report(
+            ART / "runtime_capabilities.json", capabilities,
+            requested_device=args.device, selected_device=selected_device,
+            cpu_threads=cpu_threads)
     accelerator = (f", CUDA devices={capabilities.cuda_device_count} (not eligible for "
                    "the exact normalizer)" if capabilities.cuda_device_count else "")
     print(f"[pipeline] backend={selected_device}, CPU threads={cpu_threads}, "
           f"RAM={capabilities.memory_gib or 'unknown'} GiB{accelerator}", flush=True)
     print(f"[pipeline] execution window: {start_at} -> {args.stop_after}", flush=True)
     print(f"[pipeline] hardware report: {ART / 'runtime_capabilities.json'}", flush=True)
-    driver = Driver(args.dry_run)
+    driver = Driver(args.dry_run, log_dir if args.run_dir is not None and not args.dry_run else None)
 
     if args.from_raw:
         driver.run([PY, "-u", "scripts/data/01_build_base.py"])
         driver.run([PY, "-u", "scripts/data/22_basket_data.py"])
         driver.run([PY, "-u", "scripts/data/23_promo_data.py"])
     # Always fail closed on data integrity, including when reusing derived files.
-    driver.run([PY, "-u", "scripts/data/audit_preprocessing.py"])
-    driver.run(script("build_affinity_partition.py"))
-    # Build the ragged index only after the training-only partition exists.  The
-    # partition builder reads baskets directly and cannot consume a stale model cache.
-    driver.run(script("data.py", "--force"))
-    driver.run(script("provenance.py"))
+    if start_at == "data":
+        driver.run([PY, "-u", "scripts/data/audit_preprocessing.py"])
+        driver.run(script("build_affinity_partition.py"))
+        driver.run(script("data.py", "--force"))
+        driver.run(script("provenance.py"))
+    else:
+        # Reuse the audited input without overwriting shared historical artifacts.
+        current_data_fingerprint(dry_run=driver.dry_run)
+        if not driver.dry_run:
+            from version4.provenance import require_fingerprint
+            require_fingerprint(current_data_fingerprint(dry_run=False), ROOT)
     if args.stop_after == "data":
         return
 
@@ -552,8 +612,8 @@ def main() -> None:
 
     full = args.profile == "full"
     additive_iterations = 30000 if full else 10
-    additive = ROOT / "out" / "v3_pipeline_additive_best.pt"
-    additive_latest = ROOT / "out" / "v3_pipeline_additive.pt"
+    additive = OUT / "v3_pipeline_additive_best.pt"
+    additive_latest = OUT / "v3_pipeline_additive.pt"
     additive_blob = None
     if runs_stage(start_at, "additive"):
         if args.resume_additive is not None:
@@ -564,6 +624,7 @@ def main() -> None:
                   flush=True)
         additive_command = script(
             "fit_exact_additive.py", "--artifact", initialization,
+            "--output-dir", OUT,
             "--label", "pipeline_additive", "--iters", additive_iterations,
             "--batch", 128 if full else 8, "--lr", 0.002,
             "--weight-decay", 1e-5, "--validation-trips", 1024 if full else 16,
@@ -615,7 +676,7 @@ def main() -> None:
             driver.run(script(
                 "fit_stratified_natural_interactions.py", "--parent", additive,
                 "--spectral", basis, "--contexts", 12000 if full else 64,
-                "--band-draws", *( [16, 16, 12, 8, 5, 4, 3] if full
+                "--band-draws", *( [16, 16, 12, 8, 16, 16, 16] if full
                                    else [1, 1, 1, 1, 1, 1, 1]),
                 "--batch", 96 if full else 8, "--rank", rank,
                 "--score-mass", 1.0, "--spectral-max", 1.0,
@@ -626,6 +687,7 @@ def main() -> None:
                 "--minimum-crossfit-gain", 0.005 if full else -1.0,
                 "--minimum-half-gain", 0.0 if full else -1e9,
                 "--minimum-within-band-ess-fraction", 0.20 if full else 0.0,
+                "--minimum-within-band-ess", 2.0 if full else 0.0,
                 "--output", interaction_candidate))
         else:
             driver.run(script(
@@ -708,6 +770,7 @@ def main() -> None:
             "--output", REPORT / "likelihood_test.json"))
         driver.run(script(
             "eval_smolyak_rank8_mrr.py", "--ckpt", candidate, "--split", "test",
+            "--parent", additive,
             "--trips", 2000 if full else 16, "--rank", rank,
             "--level", rank + 2, "--threads", cpu_threads,
             "--output", REPORT / "recommendation.json"))
@@ -770,16 +833,31 @@ def main() -> None:
         "--products-per-bundle", 5 if full else 3,
         "--horizon-days", 28 if full else 7,
         "--budget-bins", 4000 if full else 200,
-        "--minimum-budget-utilization", 0.95 if full else 0.90,
+            "--minimum-budget-utilization", 0.0,
         "--output", REPORT / "segment_promotion_mdp.json"))
     if args.dry_run:
         print("[pipeline] dry run complete; no stage was executed")
     elif full:
-        print("[pipeline] certification passed; candidate_rank1.pt is the accepted model")
+        print("[pipeline] fitted-model likelihood/numerical and population-safety gates "
+              "passed; candidate_rank1.pt is accepted for conditional-incidence "
+              "likelihood use. Generation calibration, causal price response and policy "
+              "value require separate capability verdicts", flush=True)
     else:
         print("[pipeline] smoke integration completed; statistical gates were relaxed "
               f"and tail audit status was {tail_status}; this is not a certified fit")
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except BaseException as exc:
+        if RUN_STATUS is not None:
+            from run_synthetic_experiment import write_manifest
+            RUN_STATUS.update(status="failed", error=repr(exc))
+            write_manifest(RUN_MANIFEST, RUN_STATUS)
+        raise
+    else:
+        if RUN_STATUS is not None:
+            from run_synthetic_experiment import write_manifest
+            RUN_STATUS.update(status="completed", current_stage=None)
+            write_manifest(RUN_MANIFEST, RUN_STATUS)

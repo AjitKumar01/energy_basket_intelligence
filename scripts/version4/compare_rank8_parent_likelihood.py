@@ -19,6 +19,7 @@ from fit import Batcher
 from interaction_particles import differentiable_logz_beta0
 from pipeline_support import smolyak_rule
 from provenance import file_sha256, strict_json_dumps
+from uncertainty import paired_score_summary
 
 
 torch.set_default_dtype(torch.float64)
@@ -50,12 +51,8 @@ def interaction_values(model, batcher, trips, quadrature, chunk):
     return torch.cat(result).numpy(), cancellation
 
 
-def summary(delta):
-    se = float(delta.std(ddof=1) / math.sqrt(len(delta)))
-    mean = float(delta.mean())
-    return {"trips": int(len(delta)), "mean": mean, "standard_error": se,
-            "95_interval": [mean - 1.96 * se, mean + 1.96 * se],
-            "median": float(np.median(delta))}
+def summary(delta, household=None):
+    return paired_score_summary(delta, household)
 
 
 def main():
@@ -125,10 +122,11 @@ def main():
         smolyak_rule(child, active_rank, audit_level), min(args.chunk, n_audit))
     lines = (data["line_ptr"][trips + 1] - data["line_ptr"][trips]).astype(
         np.int64, copy=False)
-    parent_summary = summary(parent_value)
-    child_summary = summary(target_value)
-    gain_summary = summary(target_value - parent_value)
-    audit_summary = summary(target_value[:n_audit] - audit_value)
+    household = data["trip_user"][trips]
+    parent_summary = summary(parent_value, household)
+    child_summary = summary(target_value, household)
+    gain_summary = summary(target_value - parent_value, household)
+    audit_summary = summary(target_value[:n_audit] - audit_value, household[:n_audit])
     audit_bound = (abs(audit_summary["mean"])
                    + 1.96 * audit_summary["standard_error"])
     certified_gain_lower = gain_summary["95_interval"][0] - audit_bound
@@ -150,9 +148,12 @@ def main():
         "exact_parent_log_likelihood": parent_summary,
         "target_child_log_likelihood": child_summary,
         "target_child_minus_exact_parent": gain_summary,
-        "low_minus_target": summary(low_value - target_value),
+        "low_minus_target": summary(low_value - target_value, household),
         "target_minus_audit": audit_summary,
         "numerical_certification": {
+            "interpretation": "empirical adjacent-rule allowance; not an exact-integral error bound or joint 95% coverage guarantee",
+            "empirical_adjacent_rule_allowance": audit_bound,
+            "legacy_error_bound_field_is_empirical_allowance": True,
             "audit_trips": n_audit,
             "absolute_audit_error_95_upper_bound": audit_bound,
             "maximum_allowed_audit_error_bound": args.maximum_audit_error_bound,
@@ -173,7 +174,7 @@ def main():
     elif not per_trip_output.is_absolute():
         per_trip_output = ROOT / per_trip_output
     np.savez_compressed(
-        per_trip_output, trips=trips, lines=lines,
+        per_trip_output, trips=trips, household=household, lines=lines,
         exact_parent=parent_value, target_child=target_value,
         low_child=low_value, audit_trips=trips[:n_audit],
         audit_child=audit_value)

@@ -1114,7 +1114,13 @@ def log_f_sparse(model, z, ix, C, drop_empty=False, return_terms=False,
     else:
         total_n = base_size.unsqueeze(-1) + n.to(torch.long).unsqueeze(0)
         valid_size = total_n < rho0_all.numel()
-        rho0 = rho0_all[total_n.clamp(max=rho0_all.numel() - 1)]
+        # Work relative to the revealed basket.  The empty remainder must have score
+        # exactly zero, so its contribution to the conditional completion partition is
+        # one.  Omitting this constant leaves marginal probabilities unchanged but makes
+        # the returned conditional log normalizer (and absolute completion log scores)
+        # wrong by -rho_0(|A|).
+        rho0 = (rho0_all[total_n.clamp(max=rho0_all.numel() - 1)]
+                - rho0_all[base_size].unsqueeze(-1))
     coefficient_log = logA if logA is not None else torch.log(A.clamp_min(1e-300))
     global_scale = node_M if degree_tilt is None else node_M + degree_tilt
     lg = coefficient_log - rho0 + n * global_scale.unsqueeze(-1)
@@ -1313,6 +1319,11 @@ class RaggedModel(torch.nn.Module):
         return torch.where(count_before < self.rho_pair_cap,
                            count_before, torch.zeros_like(count_before))
 
+    def price_coefficients(self, it, trip):
+        """Nonnegative product/household slopes shared by utility and price audits."""
+        return (softplus(self.gamma[self.house[trip]])
+                * softplus(self.beta[it])).sum(-1)
+
     def b_at(self, it, trip, c):
         """Eq. 7 at an arbitrary set of (product, trip) pairs.
 
@@ -1335,35 +1346,13 @@ class RaggedModel(torch.nn.Module):
             b = self.lam[it] + (theta[hh] * self.alpha[it]).sum(-1)
         if c is None:
             return b
-        # Price sensitivity is held non-negative.
-        #
-        # d b_j / d log p_j = -(gamma_h . beta_j), and nothing constrained that inner
-        # product's sign, so the model was free to learn that a product becomes MORE
-        # attractive when it gets dearer.  It did: on a fitted checkpoint a 10% cut on one
-        # product gave d b_j = -0.0164, i.e. cheaper made it less likely.  A model used to
-        # choose markdowns cannot have the own-price effect pointing the wrong way, whatever
-        # its likelihood.  Passing both factors through softplus makes gamma.beta >= 0
-        # elementwise, so the derivative is <= 0 by construction rather than by hope.
-        # PRICE, split into a common level and an idiosyncratic deviation.
-        #
-        #     dlp_j = m + e_j        m = the trip's mean over its assortment
-        #
-        # m shifts every b_j equally, so Proposition 1 applies and dE[n]/dm is amplified by
-        # Var(n) -- measured 10.5x, and CORRECT, since the data's own dispersion is 10.55.
-        # e_j shifts b_j differentially: it moves share between products and leaves the sum
-        # nearly untouched, so it is not amplified.
-        #
-        # One coefficient served both, so pinning the aggregate elasticity (-0.121) pinned
-        # the per-product response too: gamma.beta = 0.121/10.5 = 0.0115, against a data
-        # own-price response near -0.66.  The whole price effect then had to live in the
-        # units model, and a coupon could not change WHETHER a product was bought.
-        #
-        # kappa scales the idiosyncratic part alone.  The aggregate stays -(gamma.beta)*
-        # Var/E and remains pinned by --elast-w; the share response becomes
-        # -(gamma.beta)*kappa and is free.  The data supports the split: basket size against
-        # the common level gives -0.042, while share against relative price gives -0.078
-        # with t = -154.
-        _gb = (softplus(self.gamma[hh]) * softplus(self.beta[it])).sum(-1)
+        # g_hj >= 0. With m equal to the offered mean price deviation, the exact
+        # Jacobian is -g_hj [kappa*1(j=k) + (1-kappa)/J]. A common price move therefore
+        # shifts utilities by -g_hj, not by a single catalogue-average coefficient.
+        # Its size response is -Cov(N, sum_j g_hj Y_j). A one-price action also changes
+        # other utilities through m, so coefficient positivity alone does not guarantee
+        # marginal own-incidence monotonicity for kappa != 1.
+        _gb = self.price_coefficients(it, trip)
         if "dlp_bar" in c:
             _m = c["dlp_bar"][trip]
             b = b - _gb * (_m + softplus(self.price_kappa) * (c["dlp"] - _m))
@@ -2077,7 +2066,7 @@ class RaggedModel(torch.nn.Module):
         return out[0] if len(out) == 1 else tuple(out)
 
     def _log_Z_quad(self, ix, drop_empty, return_ess, return_size, return_mode):
-        """log Z by DETERMINISTIC Smolyak quadrature -- no proposal, no draws, no bias.
+        """log Z by deterministic Smolyak quadrature, with finite-rule integration error.
 
         f(z) is already exact (the ESP/poly-tree recursion is a closed form), so the only
         approximation in the whole pipeline was the outer E_z over a Kz-dimensional

@@ -31,6 +31,8 @@ import torch
 from scipy import sparse
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import brier_score_loss, log_loss, roc_auc_score
+from scipy.optimize import minimize
+from uncertainty import household_cluster_se
 
 
 torch.set_default_dtype(torch.float64)
@@ -38,7 +40,7 @@ torch.set_default_dtype(torch.float64)
 
 @dataclass(frozen=True)
 class Config:
-    customers: int = 240
+    customers: int = 1200
     products: int = 20
     categories: int = 5
     segments: int = 3
@@ -324,6 +326,7 @@ def simulate_retailer(config: Config, support: dict, truth: dict) -> dict:
         "line_quantity": np.asarray(line_quantity, dtype=np.int64),
         "customer_segment": customer_segment,
         "action_by_household_day": action_by_household_day,
+        "action_probability": action_probability,
     }
 
 
@@ -350,14 +353,14 @@ def arrival_features(opportunity: dict, config: Config,
         shape=(rows, config.segments))
     chosen = (opportunity["action"] if action_override is None else
               np.full(rows, action_override, dtype=np.int64))
-    # The synthetic truth deliberately makes promotion response segment-specific.
-    # A global action dummy is therefore misspecified even though its aggregate Brier
-    # score can look acceptable.  Encode the identified segment-action cell explicitly;
-    # actions are randomized within every segment in the data-generating design.
-    segment_action = opportunity["segment"] * (1 + 2 * config.rank) + chosen
-    action = sparse.csr_matrix((
-        np.ones(rows), (np.arange(rows), segment_action)),
-        shape=(rows, config.segments * (1 + 2 * config.rank)))
+    # Pool response by logged offer depth and alignment with the observed segment's
+    # mission, rather than fitting 18 noisy segment/action effects and optimizing them.
+    # These are declared covariates, not oracle response coefficients.
+    offered = (chosen > 0).astype(float)
+    discount = np.where(chosen > 0, .1 + .1 * ((chosen - 1) % 2), 0.)
+    aligned = offered * (((chosen - 1) // 2) == (opportunity["segment"] % config.rank))
+    action = sparse.csr_matrix(np.column_stack([
+        offered, discount / .1, aligned, aligned * discount / .1]))
     continuous = sparse.csr_matrix(np.column_stack([
         opportunity["recency"] / 30.0,
         opportunity["sin_day"], opportunity["cos_day"],
@@ -386,7 +389,7 @@ def fit_arrival(config: Config, simulated: dict) -> tuple[LogisticRegression, di
     validation_scores = []
     for regularization in candidates:
         candidate = LogisticRegression(
-            C=regularization, solver="lbfgs", max_iter=500, tol=1e-9,
+            C=regularization, solver="lbfgs", max_iter=3000, tol=1e-8,
             random_state=config.seed, n_jobs=1)
         candidate.fit(x[train], opportunity["purchase"][train])
         probability = candidate.predict_proba(x[validation])[:, 1]
@@ -394,10 +397,12 @@ def fit_arrival(config: Config, simulated: dict) -> tuple[LogisticRegression, di
             opportunity["purchase"][validation], probability)))
     selected_c = candidates[int(np.argmin(validation_scores))]
     model = LogisticRegression(
-        C=selected_c, solver="lbfgs", max_iter=500, tol=1e-9,
+        C=selected_c, solver="lbfgs", max_iter=3000, tol=1e-8,
         random_state=config.seed, n_jobs=1)
     development = train | validation
     model.fit(x[development], opportunity["purchase"][development])
+    if int(model.n_iter_.max()) >= model.max_iter:
+        raise RuntimeError("selected arrival fit did not meet its optimizer stopping rule")
     probability = model.predict_proba(x[test])[:, 1]
     oracle = opportunity["oracle_purchase_probability"][test]
     y = opportunity["purchase"][test]
@@ -411,6 +416,7 @@ def fit_arrival(config: Config, simulated: dict) -> tuple[LogisticRegression, di
         "probability_mae_to_oracle": float(np.mean(np.abs(probability - oracle))),
         "probability_correlation_to_oracle": float(np.corrcoef(probability, oracle)[0, 1]),
         "selected_regularization_C": selected_c,
+        "response_features": "offer, discount depth, segment/mission alignment and aligned depth; no oracle coefficients",
         "validation_log_loss_by_C": {
             str(value): score for value, score in zip(candidates, validation_scores)},
     }
@@ -556,12 +562,52 @@ def fit_basket_law(config: Config, truth: dict, support: dict,
     if best_state is None:
         raise RuntimeError("basket optimization did not produce a checkpoint")
     model.load_state_dict(best_state)
+    size_calibration = calibrate_size_marginal(model, support, train_count,
+                                              context_segment, context_action)
     return model.eval(), {
         "best_step": best_step,
         "terminal_step": step,
         "best_validation_log_likelihood": best,
         "history": history,
+        "size_calibration": size_calibration,
     }
+
+
+def calibrate_size_marginal(model, support, train_count, segment, action):
+    """Training-only convex profile of size potentials after selecting other parameters.
+
+    This preserves relative probabilities within each size, and fits the global size
+    marginal without modifying observed or generated baskets. No test moments are used.
+    """
+    with torch.no_grad():
+        old = model.log_probability(support, segment, action).numpy()
+    size = support["sizes"].numpy() - 1
+    count = train_count.numpy()
+    context_weight = count.sum(1) / count.sum()
+    target = np.bincount(size, weights=count.sum(0), minlength=model.config.nmax) / count.sum()
+    probability = np.exp(old)
+    size_mass = np.column_stack([probability[:, size == n].sum(1)
+                                for n in range(model.config.nmax)])
+
+    def objective(tail):
+        tilt = np.r_[0., tail]
+        logits = np.log(size_mass) + tilt
+        maximum = logits.max(1)
+        raw = np.exp(logits - maximum[:, None])
+        normalizer = raw.sum(1)
+        marginal = context_weight @ (raw / normalizer[:, None])
+        loss = context_weight @ (maximum + np.log(normalizer)) - target @ tilt
+        return float(loss), (marginal - target)[1:]
+
+    fit = minimize(objective, np.zeros(model.config.nmax - 1), jac=True,
+                   method="L-BFGS-B", options={"gtol": 1e-10, "ftol": 1e-14, "maxiter": 300})
+    error = float(np.max(np.abs(objective(fit.x)[1])))
+    if not np.isfinite(fit.fun) or error > 1e-6:
+        raise RuntimeError(f"training size calibration failed: {fit.message}; residual={error}")
+    with torch.no_grad():
+        model.rho_size_tail.sub_(torch.as_tensor(fit.x))
+    return {"split": "train", "method": "convex size-potential profile",
+            "maximum_moment_residual": error, "training_loglik_gain": float(-fit.fun)}
 
 
 class QuantityLaw(torch.nn.Module):
@@ -745,11 +791,13 @@ def generation_audit(model: BasketLaw, simulated: dict, truth: dict, support: di
     contexts = simulated["trip_context"][selected]
     observed_subset = simulated["trip_subset"][selected]
     rng = np.random.default_rng(seed)
-    generated_subset = np.empty(len(selected), dtype=np.int64)
+    replicates = 32
+    generated_subset = np.empty((replicates, len(selected)), dtype=np.int64)
     for context in np.unique(contexts):
         rows = np.flatnonzero(contexts == context)
-        generated_subset[rows] = rng.choice(
-            len(support["baskets"]), size=len(rows), p=np.exp(logp[context]))
+        generated_subset[:, rows] = rng.choice(
+            len(support["baskets"]), size=(replicates, len(rows)), p=np.exp(logp[context]))
+    generated_subset = generated_subset.reshape(-1)
     sizes = support["sizes"].numpy()
     observed_size = sizes[observed_subset]; generated_size = sizes[generated_subset]
     observed_hist = np.bincount(observed_size, minlength=config.nmax + 1)[1:]
@@ -757,8 +805,21 @@ def generation_audit(model: BasketLaw, simulated: dict, truth: dict, support: di
     membership = support["membership"].numpy()
     observed_incidence = membership[observed_subset].mean(0)
     generated_incidence = membership[generated_subset].mean(0)
+    # Exact model moments separate model miscalibration from one finite synthetic draw.
+    pn = np.column_stack([np.exp(logp)[:, sizes == n].sum(1)
+                          for n in range(1, config.nmax + 1)])
+    predicted_mean = pn @ np.arange(1, config.nmax + 1)
+    oracle_mean = np.exp(truth["logp"]) @ sizes
+    residual = observed_size - predicted_mean[contexts]
+    household = opportunity["household"][simulated["trip_opportunity"][selected]]
+    residual_se = household_cluster_se(residual, household)
+    exact_hist = pn[contexts].mean(0)
+    model_variance = pn @ np.arange(1, config.nmax + 1) ** 2 - predicted_mean ** 2
+    sampler_se = float(np.sqrt(model_variance[contexts].sum() / replicates) / len(contexts))
     return {
         "test_baskets": len(selected),
+        "independent_generation_replicates": replicates,
+        "generated_baskets": len(generated_subset),
         "observed_mean_size": float(observed_size.mean()),
         "generated_mean_size": float(generated_size.mean()),
         "observed_size_variance": float(observed_size.var(ddof=1)),
@@ -768,6 +829,15 @@ def generation_audit(model: BasketLaw, simulated: dict, truth: dict, support: di
         "size_jensen_shannon": discrete_js(observed_hist, generated_hist),
         "item_incidence_rmse": float(np.sqrt(np.mean(
             (observed_incidence - generated_incidence) ** 2))),
+        "exact_model_mean_size": float(predicted_mean[contexts].mean()),
+        "oracle_mean_size": float(oracle_mean[contexts].mean()),
+        "observed_minus_model_mean": float(residual.mean()),
+        "household_cluster_residual_se": residual_se,
+        "model_vs_observed_size_tv": float(.5 * abs(exact_hist - observed_hist / observed_hist.sum()).sum()),
+        "sampler_mean_se": sampler_se,
+        "sampler_fidelity_passed": bool(abs(generated_size.mean() - predicted_mean[contexts].mean()) <= 5 * sampler_se),
+        "model_calibration_passed": bool(abs(residual.mean()) <= 4 * residual_se + .02),
+        "oracle_size_bias_passed": bool(abs(predicted_mean[contexts].mean() - oracle_mean[contexts].mean()) <= .10),
     }
 
 
@@ -906,11 +976,15 @@ def policy_audit(config: Config, simulated: dict, truth: dict, support: dict,
     opportunity = simulated["opportunity"]
     test = split_mask(opportunity["day"], config, "test")
     test_opportunity = {name: value[test] for name, value in opportunity.items()}
+    validation = split_mask(opportunity["day"], config, "validation")
+    selection_opportunity = {name: value[validation] for name, value in opportunity.items()}
 
-    true_metrics = {}; fitted_metrics = {}
+    true_metrics = {}; fitted_metrics = {}; selection_metrics = {}
     for segment in range(config.segments):
         segment_rows = test_opportunity["segment"] == segment
         local = {name: value[segment_rows] for name, value in test_opportunity.items()}
+        selection_rows = selection_opportunity["segment"] == segment
+        selection_local = {name: value[selection_rows] for name, value in selection_opportunity.items()}
         households_per_day = int(np.sum(simulated["customer_segment"] == segment))
         for action in range(len(truth["actions"])):
             logit = (truth["arrival_segment"][segment]
@@ -923,6 +997,8 @@ def policy_audit(config: Config, simulated: dict, truth: dict, support: dict,
             true_arrival = float((1.0 / (1.0 + np.exp(-logit))).mean())
             fitted_arrival = float(arrival.predict_proba(
                 arrival_features(local, config, action_override=action))[:, 1].mean())
+            selection_arrival = float(arrival.predict_proba(
+                arrival_features(selection_local, config, action_override=action))[:, 1].mean())
             context = segment * len(truth["actions"]) + action
             price = base_price * (1.0 - truth["action_discount"][action])
             markdown = base_price - price
@@ -940,6 +1016,9 @@ def policy_audit(config: Config, simulated: dict, truth: dict, support: dict,
                                                households_per_day * true_spend)
             fitted_metrics[(segment, action)] = (households_per_day * fitted_profit,
                                                  households_per_day * fitted_spend)
+            selection_metrics[(segment, action)] = (
+                households_per_day * selection_arrival * np.sum(fitted_incidence[context] * fitted_q * (price - cost)),
+                households_per_day * selection_arrival * np.sum(fitted_incidence[context] * fitted_q * markdown))
 
     predicted_actions = [{"name": "none", "segment": None, "action": 0,
                           "reward": 0.0, "cost": 0.0}]
@@ -950,9 +1029,10 @@ def policy_audit(config: Config, simulated: dict, truth: dict, support: dict,
             predicted_actions.append({
                 "name": f"segment_{segment}:{truth['actions'][action]['name']}",
                 "segment": segment, "action": action,
-                "reward": fitted_metrics[(segment, action)][0]
-                          - fitted_metrics[(segment, 0)][0],
-                "cost": fitted_metrics[(segment, action)][1],
+                "reward": selection_metrics[(segment, action)][0]
+                          - selection_metrics[(segment, 0)][0],
+                # A declared planning reserve, not a probabilistic upper bound.
+                "cost": 1.10 * selection_metrics[(segment, action)][1],
             })
             oracle_actions.append({
                 "name": f"segment_{segment}:{truth['actions'][action]['name']}",
@@ -969,10 +1049,11 @@ def policy_audit(config: Config, simulated: dict, truth: dict, support: dict,
                 "oracle_markdown_spend": oracle_actions[-1]["cost"],
             })
     horizon = 28
-    positive_cost = [row["cost"] for row in oracle_actions if row["cost"] > 0]
+    # Budget and selection may not read oracle costs or test rewards.
+    positive_cost = [value[1] for key, value in selection_metrics.items() if key[1] != 0]
     budget = horizon * float(np.median(positive_cost)) * 0.55
-    predicted = solve_budget_policy(predicted_actions, horizon, budget)
-    oracle = solve_budget_policy(oracle_actions, horizon, budget)
+    predicted = solve_budget_policy(predicted_actions, horizon, budget, minimum_utilization=0.)
+    oracle = solve_budget_policy(oracle_actions, horizon, budget, minimum_utilization=0.)
     if not predicted["feasible"] or not oracle["feasible"]:
         raise RuntimeError("synthetic policy problem is unexpectedly infeasible")
     realized_reward = float(sum(oracle_actions[i]["reward"] for i in predicted["chosen"]))
@@ -986,11 +1067,24 @@ def policy_audit(config: Config, simulated: dict, truth: dict, support: dict,
         [row["predicted_incremental_profit"] for row in action_comparison])
     oracle_reward_vector = np.asarray(
         [row["oracle_incremental_profit"] for row in action_comparison])
+    plugin_test = float(sum(
+        fitted_metrics[(predicted_actions[i]["segment"], predicted_actions[i]["action"])][0]
+        - fitted_metrics[(predicted_actions[i]["segment"], 0)][0]
+        for i in predicted["chosen"] if i != 0))
+    independent = independent_policy_value(config, simulated, truth, arrival, fitted_incidence,
+                                            quantity, predicted_actions, predicted["chosen"])
+    independent["oracle_in_95_interval"] = bool(independent["95_interval"][0] <= realized_reward
+                                               <= independent["95_interval"][1])
     return {
         "horizon_days": horizon, "budget": budget,
         "predicted_policy_actions": counts,
         "oracle_policy_actions": oracle_counts,
-        "predicted_incremental_profit": predicted["predicted_reward"],
+        "predicted_incremental_profit": plugin_test,
+        "selection_incremental_profit": predicted["predicted_reward"],
+        "selection_split": "validation covariates; test outcomes never select policy",
+        "cost_reserve_fraction": .10,
+        "independent_policy_evaluation": independent,
+        "value_interpretation": "fixed-context repeated-allocation policy, not a recency-transition dynamic oracle",
         "oracle_realized_profit_of_predicted_policy": realized_reward,
         "oracle_realized_spend_of_predicted_policy": realized_cost,
         "oracle_optimal_incremental_profit": oracle_reward,
@@ -1001,7 +1095,62 @@ def policy_audit(config: Config, simulated: dict, truth: dict, support: dict,
         "action_value_correlation": float(np.corrcoef(
             predicted_reward_vector, oracle_reward_vector)[0, 1]),
         "action_comparison": action_comparison,
+        "relative_plugin_value_error": abs(plugin_test - realized_reward) / max(abs(realized_reward), 1.),
+        "relative_plugin_overprediction": max(0., plugin_test - realized_reward) / max(abs(realized_reward), 1.),
     }
+
+
+def dr_contrast(outcome, logged_action, probability, mean_action, mean_control, action):
+    """Randomized augmented IPW contrast; predictions must not fit evaluation outcomes."""
+    if action == 0 or probability[action] <= 0 or probability[0] <= 0:
+        raise ValueError("a non-control action and positive logged propensities are required")
+    return (mean_action - mean_control
+            + (logged_action == action) / probability[action] * (outcome - mean_action)
+            - (logged_action == 0) / probability[0] * (outcome - mean_control))
+
+
+def independent_policy_value(config, simulated, truth, arrival, incidence, quantity, actions, chosen):
+    """Evaluate a frozen policy using held-out logged rewards, including no purchases.
+
+    Only prices, costs, assignment probabilities and fitted predictions enter this
+    estimator. Oracle probabilities, frailties and effects are deliberately unused.
+    """
+    opportunity = simulated["opportunity"]
+    test = split_mask(opportunity["day"], config, "test")
+    local = {name: value[test] for name, value in opportunity.items()}
+    line_opportunity = simulated["trip_opportunity"][simulated["line_trip"]]
+    line_action = opportunity["action"][line_opportunity]
+    item = simulated["line_item"]
+    price = truth["base_price"][item] * (1 - truth["action_discount"][line_action, item])
+    line_profit = simulated["line_quantity"] * (price - truth["unit_cost"][item])
+    reward = np.bincount(line_opportunity, weights=line_profit, minlength=len(test))[test]
+    scores = np.zeros(len(reward))
+    for segment in range(config.segments):
+        rows = local["segment"] == segment
+        group = {name: value[rows] for name, value in local.items()}
+        means = {}
+        for action in range(len(truth["actions"])):
+            context = segment * len(truth["actions"]) + action
+            action_price = truth["base_price"] * (1 - truth["action_discount"][action])
+            conditional_profit = np.sum(incidence[context] * expected_quantity(quantity, truth, segment, action)
+                                         * (action_price - truth["unit_cost"]))
+            means[action] = conditional_profit * arrival.predict_proba(
+                arrival_features(group, config, action_override=action))[:, 1]
+        for index in set(chosen):
+            row = actions[index]
+            if row["segment"] != segment:
+                continue
+            action = row["action"]
+            scores[rows] += chosen.count(index) * dr_contrast(
+                reward[rows], group["action"], simulated["action_probability"], means[action], means[0], action)
+    estimate = float(config.customers * scores.mean())
+    se = config.customers * household_cluster_se(scores, local["household"])
+    return {"estimator": "held-out randomized augmented IPW", "split": "test",
+            "opportunities": len(reward), "households": len(np.unique(local["household"])),
+            "incremental_profit": estimate, "household_cluster_se": se,
+            "95_interval": [estimate - 1.96 * se, estimate + 1.96 * se],
+            "positive_value_supported": bool(estimate - 1.96 * se > 0),
+            "interpretation": "may be imprecise; point prediction alone is not certified policy profit"}
 
 
 def markdown_report(result: dict) -> str:
@@ -1075,6 +1224,15 @@ def run(config: Config) -> dict:
         interaction, arrival_model, config, simulated, truth, support)
     policy = policy_audit(config, simulated, truth, support, arrival_model,
                           interaction, quantity_model)
+    generation = basket_result["generation"]
+    gates = {
+        "generator_matches_fitted_law": generation["sampler_fidelity_passed"],
+        "heldout_size_calibration": generation["model_calibration_passed"],
+        "oracle_size_bias_below_point_one": generation["oracle_size_bias_passed"],
+        "policy_overprediction_below_25_percent": policy["relative_plugin_overprediction"] <= .25,
+        "policy_oracle_expected_spend_within_budget": policy["budget_violation"] <= 1e-8,
+        "selected_policy_has_positive_oracle_value": policy["oracle_realized_profit_of_predicted_policy"] > 0,
+    }
     return {
         "schema": 1,
         "experiment": f"exact-support complete synthetic retailer: {config.world}",
@@ -1090,6 +1248,8 @@ def run(config: Config) -> dict:
         "quantity": quantity_result,
         "counterfactual": counterfactual,
         "policy": policy,
+        "acceptance": {"gates": gates, "passed": bool(all(gates.values())),
+                       "interpretation": "declared finite-world engineering tolerances; not a statistical guarantee of policy value"},
         "training": {"additive": additive_training,
                      "interaction": interaction_training},
         "runtime_seconds": time.perf_counter() - tick,

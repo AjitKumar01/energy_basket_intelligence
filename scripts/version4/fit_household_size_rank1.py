@@ -137,17 +137,9 @@ def residual_diagnostics(log_probability: np.ndarray, observed: np.ndarray,
 
 
 def household_cluster_se(values: np.ndarray, household: np.ndarray) -> float:
-    """Standard error of the trip-weighted mean with household-level dependence."""
-    values = np.asarray(values, dtype=np.float64)
-    household = np.asarray(household, dtype=np.int64)
-    unique, inverse = np.unique(household, return_inverse=True)
-    if len(values) < 2 or len(unique) < 2:
-        return float("inf")
-    centred_sum = np.bincount(
-        inverse, weights=values - values.mean(), minlength=len(unique))
-    variance = (len(unique) / (len(unique) - 1.0)
-                * float(np.square(centred_sum).sum()) / len(values) ** 2)
-    return float(np.sqrt(max(variance, 0.0)))
+    """Compatibility export of the shared household-robust estimator."""
+    from uncertainty import household_cluster_se as clustered
+    return clustered(values, household)
 
 
 def cap_households(log_probability: np.ndarray, household: np.ndarray,
@@ -184,14 +176,16 @@ def cap_households(log_probability: np.ndarray, household: np.ndarray,
 
 def seed_population_cache(checkpoint: Path, population_output: Path,
                           population: np.ndarray, rank: int, levels: list[int],
-                          log_probability: np.ndarray, observed: np.ndarray) -> str:
+                          log_probability: np.ndarray, observed: np.ndarray,
+                          data_fingerprint: str) -> str:
     """Write the exactly tilted low-rule law for the final checkpoint.
 
     The common household shift changes the cached size law analytically, so rerunning the
     full-catalogue DP would be redundant. The ordinary population audit verifies the
     signature before accepting this cache and still performs its q(confirm) panels.
     """
-    signature = screen_signature(checkpoint, population, rank, levels)
+    signature = screen_signature(
+        checkpoint, population, rank, levels, data_fingerprint)
     prefix = population_output.with_name(
         f"{population_output.stem}.screen-{signature[:12]}")
     np.save(str(prefix) + ".log_probability.npy",
@@ -262,7 +256,8 @@ def main() -> None:
     levels = [args.screen_level, args.screen_level + 1, args.screen_level + 2]
     observed, base_log_probability, used_level, provenance = resumable_screen(
         model, batcher, population, checkpoint, args.rank, levels, args.chunk,
-        report_path, f"rank1-base-q{args.screen_level}")
+        report_path, f"rank1-base-q{args.screen_level}",
+        blob["data_fingerprint_sha256"])
     household = data["trip_user"][population].astype(np.int64, copy=False)
     day = data["trip_day"][population].astype(np.int64, copy=False)
     n_household = int(data["n_user"])
@@ -425,7 +420,7 @@ def main() -> None:
         else ROOT / args.population_output)
     cache_prefix = seed_population_cache(
         output, population_output, population, args.rank, levels,
-        tilted, observed)
+        tilted, observed, blob["data_fingerprint_sha256"])
     result["output"] = str(output)
     result["final_population_cache_prefix"] = cache_prefix
     report_path.write_text(strict_json_dumps(result))

@@ -39,6 +39,25 @@ def test_stage_suffix_contract():
     assert not pipeline.runs_stage("certification", "evaluation")
 
 
+def test_isolated_dry_run_preserves_shared_outputs_and_uses_fitted_parent(tmp_path, monkeypatch, capsys):
+    monkeypatch.syspath_prepend(str(ROOT / "scripts"))
+    for key in ("ART", "REPORT", "OUT"):
+        monkeypatch.setattr(pipeline, key, getattr(pipeline, key))
+    monkeypatch.setattr(pipeline, "preflight", lambda **_kwargs: None)
+    destination = tmp_path / "new_run"
+    monkeypatch.setattr(sys, "argv", ["run_pipeline.py", "--dry-run", "--profile", "smoke",
+                        "--start-at", "initialize", "--stop-after", "evaluation",
+                        "--run-dir", str(destination)])
+    pipeline.main()
+    output = capsys.readouterr().out
+    assert f"--output-dir {destination / 'out'}" in output
+    assert f"--parent {destination / 'out/v3_pipeline_additive_best.pt'}" in output
+    assert not destination.exists()
+    # Top-level CLI imports from scripts/, without requiring a custom PYTHONPATH.
+    from version4.provenance import require_fingerprint
+    assert callable(require_fingerprint)
+
+
 def test_raw_directory_auto_detects_repository_local_bundle(tmp_path, monkeypatch):
     sibling = tmp_path / "missing-sibling"
     local = tmp_path / "repository-local"

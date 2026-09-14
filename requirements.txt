@@ -12,3 +12,7 @@ matplotlib==3.10.7     # every figure in figures/
 torch==2.9.1           # both model stages; CPU execution is supported
 setuptools==80.9.0     # builds the local PyTorch C++ extension
 pytest==9.0.1          # executable numerical and pipeline-contract checks
+fastapi==0.123.4       # typed evidence-gated retail inference API
+uvicorn==0.38.0        # local/production ASGI server for the API
+pydantic==2.12.5       # strict request and response contracts
+httpx==0.28.1          # in-process HTTP contract tests

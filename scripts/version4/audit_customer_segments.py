@@ -32,6 +32,7 @@ from interaction_particles import (blocked_rejuvenation,
 from pipeline_support import copied_context, named_basket, particle_delta
 from tempered_ais import annealed_smc_logz
 from provenance import file_sha256, strict_json_dumps
+from uncertainty import paired_score_summary
 
 
 torch.set_default_dtype(torch.float64)
@@ -217,6 +218,7 @@ def simulate_segment(model, batcher, data, trips, item_category, metadata, args,
     schedule_axis = torch.linspace(0.0, 1.0, args.levels)
     schedule = 1.0 - (1.0 - schedule_axis).pow(args.power)
     observed_baskets, generated_baskets, examples = [], [], []
+    generated_context_size = []
     factual_sizes, invalid, duplicates = [], 0, 0
     counterfactual = {action: {"uniform_size_change": [], "own_retained": [],
                                "own_ess": [], "uniform_ess": []}
@@ -291,11 +293,14 @@ def simulate_segment(model, batcher, data, trips, item_category, metadata, args,
                 args.seed + 900001 * segment + start))
         for b in range(ix.B):
             allowed = set(ix.item[ix.item_trip == b].numpy().tolist())
+            context_sizes = []
             for particle in states:
                 basket = ix.item[particle[b]].numpy().tolist()
                 generated_baskets.append(basket)
+                context_sizes.append(len(basket))
                 invalid += int(any(item not in allowed for item in basket))
                 duplicates += int(len(basket) != len(set(basket)))
+            generated_context_size.append(float(np.mean(context_sizes)))
             if len(examples) < 3:
                 examples.append({
                     "trip": int(sub[b]),
@@ -321,6 +326,10 @@ def simulate_segment(model, batcher, data, trips, item_category, metadata, args,
             "uniform_reweight_ess_min": float(np.min(row["uniform_ess"])),
         })
     reference_baskets = [trip_basket(data, int(trip)) for trip in reference_trips]
+    observed_context_size = np.asarray([len(x) for x in observed_baskets], dtype=float)
+    factual_sizes_array = np.asarray(factual_sizes, dtype=float)
+    generated_context_size = np.asarray(generated_context_size, dtype=float)
+    household = data["trip_user"][trips]
     return {
         "contexts": int(len(trips)), "particles_per_context": args.particles,
         "smc_seconds": smc_seconds,
@@ -328,6 +337,14 @@ def simulate_segment(model, batcher, data, trips, item_category, metadata, args,
         "invalid_assortment_baskets": invalid,
         "duplicate_item_baskets": duplicates,
         "counterfactuals": action_rows,
+        "same_context_uncertainty": {
+            "fitted_expected_minus_observed": paired_score_summary(
+                factual_sizes_array - observed_context_size, household),
+            "generated_context_mean_minus_fitted_expected": paired_score_summary(
+                generated_context_size - factual_sizes_array, household),
+            "interpretation": ("household-cluster context uncertainty; generated-particle "
+                               "dependence is not an independent-replicate MC interval"),
+        },
         "distribution": distribution_audit(
             reference_baskets, generated_baskets, item_category, model.nmax,
             model.J, model.C),

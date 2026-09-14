@@ -57,6 +57,85 @@ class WeightedParticleStatistics:
     phi_score: torch.Tensor             # [J,Kz], sum over trip expectations
 
 
+@torch.no_grad()
+def weighted_particle_expected_size(states: BasketParticles,
+                                    log_weights: torch.Tensor) -> torch.Tensor:
+    """Expected basket size of a weighted particle bank without all-item statistics."""
+    particles = len(states)
+    if particles < 1 or log_weights.ndim != 2:
+        raise ValueError("states and log_weights must describe a nonempty particle bank")
+    if log_weights.shape[0] != particles:
+        raise ValueError("log_weights first dimension must equal the particle count")
+    contexts = log_weights.shape[1]
+    if any(len(particle) != contexts for particle in states):
+        raise ValueError("states must have shape [particles][trips]")
+    size = torch.as_tensor(
+        [[len(slots) for slots in particle] for particle in states],
+        dtype=log_weights.dtype, device=log_weights.device)
+    return (torch.softmax(log_weights, dim=0) * size).sum(0)
+
+
+@torch.no_grad()
+def rao_blackwell_expected_size(model, ix, states: BasketParticles,
+                                log_weights: Optional[torch.Tensor] = None
+                                ) -> torch.Tensor:
+    """Size-only form of the exact one-site Rao--Blackwell statistic.
+
+    This is algebraically the mean of ``size_probability`` returned by
+    :func:`rao_blackwell_particle_statistics`, without allocating or accumulating
+    all-product incidence, category, interaction and embedding statistics.
+    """
+    particles = len(states)
+    if particles < 1 or any(len(particle) != ix.B for particle in states):
+        raise ValueError("states must have shape [particles][trips]")
+    dt, dev = model.phi.dtype, model.phi.device
+    if log_weights is None:
+        weight = torch.full((particles, ix.B), 1.0/particles, dtype=dt, device=dev)
+    else:
+        if log_weights.shape != (particles, ix.B):
+            raise ValueError("log_weights must have shape [particles,B]")
+        weight = torch.softmax(log_weights.to(dtype=dt, device=dev), dim=0)
+    slot_b = model.b_flat(ix).detach()
+    slot_trip = ix.item_trip
+    slot_cat = ix.row_cat[ix.row_of]
+    slot_phi = model.phi[ix.item]
+    slot_phi_norm = slot_phi.square().sum(1)
+    flat_category_index = slot_trip * model.C + slot_cat
+    assortment_size = torch.bincount(slot_trip, minlength=ix.B).to(dt)
+    rho0 = model.rho_0().detach()
+    answer = torch.zeros(ix.B, dtype=dt, device=dev)
+    for p, particle in enumerate(states):
+        selected = torch.zeros_like(slot_trip, dtype=torch.bool)
+        for b, slots in enumerate(particle):
+            slots = slots.to(device=dev, dtype=torch.long)
+            if slots.numel() and not bool((slot_trip[slots] == b).all()):
+                raise ValueError("particle contains a slot outside its trip assortment")
+            selected[slots] = True
+        old = selected.to(dt)
+        basket_size = torch.zeros(ix.B, dtype=dt, device=dev)
+        basket_size.index_add_(0, slot_trip, old)
+        mu = torch.zeros(ix.B, model.Kz, dtype=dt, device=dev)
+        mu.index_add_(0, slot_trip, slot_phi * old.unsqueeze(1))
+        counts_flat = torch.zeros(ix.B * model.C, dtype=dt, device=dev)
+        counts_flat.index_add_(0, flat_category_index, old)
+        counts = counts_flat.view(ix.B, model.C)
+        rest_n = basket_size[slot_trip] - old
+        rest_cat = counts[slot_trip, slot_cat] - old
+        projection = (slot_phi * mu[slot_trip]).sum(1) - old * slot_phi_norm
+        rest_index = rest_n.to(torch.long)
+        add_index = (rest_index + 1).clamp(max=model.nmax)
+        logit = (slot_b + projection - model.rho_c[slot_cat] * rest_cat
+                 - (rho0[add_index] - rho0[rest_index]))
+        conditional = torch.sigmoid(logit)
+        conditional = torch.where(rest_n == 0, torch.ones_like(conditional), conditional)
+        conditional = torch.where(rest_n >= model.nmax,
+                                  torch.zeros_like(conditional), conditional)
+        per_trip = torch.zeros(ix.B, dtype=dt, device=dev)
+        per_trip.index_add_(0, slot_trip, rest_n + conditional)
+        answer += weight[p] * per_trip / assortment_size
+    return answer
+
+
 def differentiable_log_size_beta0(model, ix, slot_b: Optional[torch.Tensor] = None
                                   ) -> torch.Tensor:
     """Exact differentiable no-Gram log mass for sizes 1 through ``nmax``.
@@ -360,6 +439,65 @@ def rao_blackwell_particle_statistics(model, ix, states: BasketParticles,
         category_pairs=category_pairs,
         interaction=expected_interaction,
         phi_score=phi_score)
+
+
+@torch.no_grad()
+def rao_blackwell_selected_incidence(model, ix, states: BasketParticles,
+                                     selected_slots: torch.Tensor,
+                                     log_weights: Optional[torch.Tensor] = None
+                                     ) -> torch.Tensor:
+    """Rao--Blackwell incidence for one declared assortment slot per trip.
+
+    This is the corresponding coordinate of :func:`rao_blackwell_particle_statistics`
+    without evaluating every offered product.  It is used by price-event audits where
+    only the event SKU is required.
+    """
+    particles = len(states)
+    if particles < 1 or any(len(particle) != ix.B for particle in states):
+        raise ValueError("states must have shape [particles][trips]")
+    dt, dev = model.phi.dtype, model.phi.device
+    selected_slots = torch.as_tensor(selected_slots, dtype=torch.long, device=dev)
+    if selected_slots.shape != (ix.B,) or not bool(
+            (ix.item_trip[selected_slots] == torch.arange(ix.B, device=dev)).all()):
+        raise ValueError("selected_slots must contain one slot from each trip")
+    if log_weights is None:
+        weight = torch.full((particles, ix.B), 1.0/particles, dtype=dt, device=dev)
+    else:
+        if log_weights.shape != (particles, ix.B):
+            raise ValueError("log_weights must have shape [particles,B]")
+        weight = torch.softmax(log_weights.to(dtype=dt, device=dev), dim=0)
+    slot_b = model.b_flat(ix).detach()[selected_slots]
+    target_item = ix.item[selected_slots]
+    target_cat = ix.row_cat[ix.row_of[selected_slots]]
+    target_phi = model.phi[target_item]
+    rho0 = model.rho_0().detach()
+    answer = torch.zeros(ix.B, dtype=dt, device=dev)
+    for p, particle in enumerate(states):
+        conditional = torch.empty(ix.B, dtype=dt, device=dev)
+        for b, basket_slots in enumerate(particle):
+            basket_slots = basket_slots.to(device=dev, dtype=torch.long)
+            if basket_slots.numel() < 1 or basket_slots.numel() > model.nmax or not bool(
+                    (ix.item_trip[basket_slots] == b).all()):
+                raise ValueError("particle contains an invalid trip basket")
+            target = selected_slots[b]
+            rest = basket_slots[basket_slots != target]
+            rest_n = int(rest.numel())
+            if rest_n == 0:
+                conditional[b] = 1.0
+                continue
+            if rest_n >= model.nmax:
+                conditional[b] = 0.0
+                continue
+            rest_items = ix.item[rest]
+            projection = (model.phi[rest_items].sum(0)*target_phi[b]).sum()
+            rest_cats = ix.row_cat[ix.row_of[rest]]
+            rest_cat = (rest_cats == target_cat[b]).to(dt).sum()
+            size_increment = rho0[rest_n+1]-rho0[rest_n]
+            logit = (slot_b[b]+projection-model.rho_c[target_cat[b]]*rest_cat
+                     -size_increment)
+            conditional[b] = torch.sigmoid(logit)
+        answer += weight[p]*conditional
+    return answer
 
 
 def controlled_particle_statistics(model, ix, states: BasketParticles,

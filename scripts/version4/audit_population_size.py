@@ -6,10 +6,13 @@ import argparse
 import hashlib
 import json
 import math
+import os
 from pathlib import Path
 
 import numpy as np
 import torch
+
+os.environ.setdefault("V3_AFFINITY", "1")
 
 from checkpoint_io import ROOT, load_checkpoint
 from data import build
@@ -18,6 +21,7 @@ from fit import Batcher
 from pipeline_support import (collect_size_law, install_quadrature, smolyak_rule,
                               supported_trips)
 from provenance import file_sha256, strict_json_dumps
+from uncertainty import household_cluster_se
 
 
 torch.set_default_dtype(torch.float64)
@@ -85,20 +89,33 @@ def resilient_size_panel(model, batcher, trips, rules, levels):
             f"{last_error}") from last_error
 
 
-def screen_signature(checkpoint, population, rank, levels):
+def implementation_signature():
+    """Bind resumable numerical caches to the complete Version-4 implementation."""
+    digest = hashlib.sha256()
+    source_root = Path(__file__).resolve().parent
+    for path in sorted(source_root.glob("*.py")) + sorted(source_root.glob("*.cpp")):
+        digest.update(path.name.encode())
+        digest.update(path.read_bytes())
+    return digest.hexdigest()
+
+
+def screen_signature(checkpoint, population, rank, levels, data_fingerprint):
     digest = hashlib.sha256()
     with checkpoint.open("rb") as stream:
         for block in iter(lambda: stream.read(1024 * 1024), b""):
             digest.update(block)
     digest.update(np.ascontiguousarray(population, dtype=np.int64).tobytes())
     digest.update(f"rank={rank};levels={levels}".encode())
+    digest.update(str(data_fingerprint).encode())
+    digest.update(implementation_signature().encode())
     return digest.hexdigest()
 
 
 def resumable_screen(model, batcher, population, checkpoint, rank, levels,
-                     chunk, output, label):
+                     chunk, output, label, data_fingerprint):
     """Checkpoint the population panel and resume after interruption or cancellation."""
-    signature = screen_signature(checkpoint, population, rank, levels)
+    signature = screen_signature(
+        checkpoint, population, rank, levels, data_fingerprint)
     prefix = output.with_name(f"{output.stem}.screen-{signature[:12]}")
     probability_path = Path(str(prefix) + ".log_probability.npy")
     observed_path = Path(str(prefix) + ".observed.npy")
@@ -117,7 +134,9 @@ def resumable_screen(model, batcher, population, checkpoint, rank, levels,
         if (cache_exists
                 and all(progress.get(key) == value
                         for key, value in expected.items())):
-            start = int(progress.get("completed_contexts", 0))
+            candidate = int(progress.get("completed_contexts", 0))
+            if 0 <= candidate <= len(population):
+                start = candidate
     mode = "r+" if start > 0 else "w+"
     probability = np.lib.format.open_memmap(
         probability_path, mode=mode, dtype=np.float64, shape=shape)
@@ -166,6 +185,8 @@ def main() -> None:
     parser.add_argument("--rank", type=int, required=True)
     parser.add_argument("--screen-level", type=int, default=8)
     parser.add_argument("--confirm-level", type=int, default=9)
+    parser.add_argument("--followup-level", type=int,
+                        help="higher rule for contexts failing screen/confirm mean fidelity")
     parser.add_argument("--confirm-contexts", type=int, default=96)
     parser.add_argument("--calibration-contexts", type=int, default=2048,
                         help="random contexts used to estimate q(screen)->q(confirm) tail bias")
@@ -176,6 +197,8 @@ def main() -> None:
     parser.add_argument("--maximum-low-observed-tail", type=float, default=0.5)
     parser.add_argument("--maximum-tail-rate-ratio", type=float, default=2.0)
     parser.add_argument("--tail-rate-slack", type=float, default=5e-4)
+    parser.add_argument("--calibration-margin", type=float, default=5e-4,
+                        help="separate absolute observed/model tail-calibration margin")
     parser.add_argument("--maximum-screen-confirm-mean-gap",
                         "--maximum-q9-q8-mean-gap",
                         dest="maximum_screen_confirm_mean_gap",
@@ -211,7 +234,8 @@ def main() -> None:
                      args.confirm_level + 1]
     observed, q8, used_level, screen_provenance = resumable_screen(
         model, batcher, population, checkpoint, args.rank, screen_levels,
-        args.chunk, output, f"{args.split}-q{args.screen_level}")
+        args.chunk, output, f"{args.split}-q{args.screen_level}",
+        blob["data_fingerprint_sha256"])
     screen = metrics(q8, observed)
     probability = np.exp(q8)
     size = np.arange(1, probability.shape[1] + 1, dtype=np.float64)
@@ -235,6 +259,38 @@ def main() -> None:
         "mean_absolute_expected_size_gap": float(np.mean(np.abs(q9_mean - q8_mean))),
         "maximum_absolute_expected_size_gap": float(np.max(np.abs(q9_mean - q8_mean))),
     }
+    failed_fidelity = np.flatnonzero(
+        np.abs(q9_mean - q8_mean) > args.maximum_screen_confirm_mean_gap)
+    followup_level = args.followup_level or args.confirm_level + 1
+    followup = {
+        "level": followup_level, "contexts": int(len(failed_fidelity)),
+        "status": "not_needed" if not len(failed_fidelity) else "running",
+    }
+    if len(failed_fidelity):
+        followup_trips = confirm_trips[failed_fidelity]
+        followup_observed, followup_log_probability = collect_size_law(
+            model, batcher, followup_trips,
+            smolyak_rule(model, args.rank, followup_level), args.chunk,
+            f"fidelity-q{followup_level}")
+        followup_probability = np.exp(followup_log_probability)
+        followup_mean = followup_probability @ size
+        followup_gap = np.abs(followup_mean - q9_mean[failed_fidelity])
+        followup_output = output.with_name(
+            output.stem + "_fidelity_followup_per_trip.npz")
+        np.savez_compressed(
+            followup_output, trips=followup_trips, observed=followup_observed,
+            screen_log_probability=q8[chosen_index][failed_fidelity],
+            confirm_log_probability=q9[failed_fidelity],
+            followup_log_probability=followup_log_probability)
+        followup.update({
+            "status": ("passed" if float(followup_gap.max())
+                       <= args.maximum_screen_confirm_mean_gap else "failed"),
+            "mean_absolute_followup_confirm_gap": float(followup_gap.mean()),
+            "maximum_absolute_followup_confirm_gap": float(followup_gap.max()),
+            "per_trip_output": str(followup_output),
+        })
+    numerical_fidelity_passed = bool(
+        not len(failed_fidelity) or followup["status"] == "passed")
     q8_tail = np.exp(q8[:, 59:]).sum(1)
     q9_probability = np.exp(q9)
     q9_tail = q9_probability[:, 59:].sum(1)
@@ -278,7 +334,8 @@ def main() -> None:
     calibration_q8_tail = q8_tail[calibration_index]
     tail_difference = calibration_q9_tail - calibration_q8_tail
     tail_bias = float(tail_difference.mean())
-    tail_bias_se = float(tail_difference.std(ddof=1) / math.sqrt(calibration_count))
+    tail_bias_se = household_cluster_se(
+        tail_difference, data["trip_user"][calibration_trips])
     corrected_tail = float(screen["model_tail_rate_ge_60"] + tail_bias)
     corrected_tail_upper = float(corrected_tail + 1.96 * tail_bias_se)
     calibration_output = output.with_name(
@@ -298,6 +355,33 @@ def main() -> None:
         "full_screen_bias_corrected_tail_rate": corrected_tail,
         "full_screen_bias_corrected_tail_rate_95_upper": corrected_tail_upper,
         "per_trip_output": str(calibration_output),
+    }
+    calibration_error = corrected_tail - screen["observed_tail_rate_ge_60"]
+    screen_calibration_score = q8_tail - (observed >= 60).astype(np.float64)
+    screen_calibration_se = household_cluster_se(
+        screen_calibration_score, data["trip_user"][population])
+    # Do not assume independence between the full-panel screen error and the random
+    # quadrature-bias panel.  Adding their 95% radii is conservative under dependence.
+    calibration_radius = 1.96 * (screen_calibration_se + tail_bias_se)
+    calibration_interval = [calibration_error-calibration_radius,
+                            calibration_error+calibration_radius]
+    if abs(calibration_error) > args.calibration_margin:
+        calibration_status = "failed"
+    elif (calibration_interval[0] >= -args.calibration_margin
+          and calibration_interval[1] <= args.calibration_margin):
+        calibration_status = "passed"
+    else:
+        calibration_status = "inconclusive"
+    separate_calibration = {
+        "status": calibration_status,
+        "model_minus_observed_tail_rate": calibration_error,
+        "screen_household_cluster_standard_error": screen_calibration_se,
+        "quadrature_bias_household_cluster_standard_error": tail_bias_se,
+        "conservative_95_interval": calibration_interval,
+        "absolute_margin": args.calibration_margin,
+        "interpretation": ("descriptive split-population calibration with estimated "
+                           "household-cluster and quadrature-bias uncertainty; not "
+                           "future-population coverage"),
     }
     allowed_rate = (args.maximum_tail_rate_ratio
                     * screen["observed_tail_rate_ge_60"]
@@ -340,10 +424,15 @@ def main() -> None:
                                f"by q{args.confirm_level} confirmation and conservative "
                                "coverage envelopes"),
         },
+        "higher_rule_fidelity_followup": followup,
+        "numerical_fidelity_status": (
+            "passed" if numerical_fidelity_passed else "failed"),
+        "tail_calibration": separate_calibration,
         "adaptive_high_risk_confirmation": adaptive_confirmation,
         "random_confirm_tail_calibration": tail_calibration,
         "allowed_model_tail_rate": allowed_rate,
         "gates": gates, "passed": bool(all(gates.values())),
+        "safety_status": "passed" if all(gates.values()) else "failed",
         "interpretation": (
             "The low rule screens the requested population panel. A context whose "
             "signed size masses are invalid is evaluated by the next positive rule "

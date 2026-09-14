@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Exact joint-MLE stage for the version-4 model with the Gram residual held at zero.
+"""Regularized likelihood stage with an exact additive Version-4 normalizer.
 
 The category/cardinality dynamic program normalizes all 5,455 offered products and every
 size 1..nmax exactly.  This stage learns propensity, household/context, price, promotion,
@@ -19,7 +19,6 @@ os.environ.setdefault("V3_AFFINITY", "1")
 
 import numpy as np
 import torch
-from torch.nn.functional import softplus
 
 from data import build
 from category_safety import category_capacities, project_category_reward_
@@ -30,6 +29,7 @@ from interaction_particles import (differentiable_log_size_beta0,
                                    differentiable_logz_beta0)
 from provenance import require_fingerprint, strict_json_dumps
 from ragged import RaggedModel
+from price_response import additive_uniform_price_response
 from sparse_artifact import load_sparse_initialization_artifact
 
 
@@ -57,6 +57,7 @@ def parse_args():
     parser.add_argument("--artifact", type=Path,
                         default=Path("out/v3_version4_sparse_init.pt"))
     parser.add_argument("--label", default="run259_exact_additive")
+    parser.add_argument("--output-dir", type=Path, default=ROOT / "out")
     parser.add_argument("--resume", type=Path,
                         help="resume an exact Phi=0 checkpoint; --iters is the final update")
     parser.add_argument("--iters", type=int, default=200)
@@ -88,6 +89,8 @@ def parse_args():
     parser.add_argument("--rkl-eps", type=float, default=1e-4)
     parser.add_argument("--elast-w", type=float, default=0.0)
     parser.add_argument("--elast-target", type=float, default=-0.121)
+    parser.add_argument("--elast-step", type=float, default=1e-3,
+                        help="maximum log-price step for audited fourth-order DP response")
     parser.add_argument("--pool-prod", type=float, default=0.0)
     parser.add_argument("--lam-centre", type=int, default=0)
     parser.add_argument("--lam-sd-max", type=float, default=0.0)
@@ -186,7 +189,7 @@ def main():
     torch.set_num_threads(args.threads)
     torch.manual_seed(args.seed)
     artifact = args.artifact if args.artifact.is_absolute() else ROOT / args.artifact
-    output = ROOT / "out"
+    output = args.output_dir.resolve()
     output.mkdir(parents=True, exist_ok=True)
     log_path = output / f"v3_{args.label}.log"
     checkpoint_path = output / f"v3_{args.label}.pt"
@@ -229,6 +232,10 @@ def main():
         if resumed.get("data_fingerprint_sha256") != meta["data_fingerprint_sha256"]:
             raise RuntimeError("resume checkpoint belongs to a different audited dataset")
         prior = resumed["config"]
+        if args.elast_w > 0 and resumed.get("price_response_estimator") != "exact_dp_fourth_order":
+            raise RuntimeError("cannot resume proxy-elasticity optimizer under the corrected objective")
+        if args.elast_w > 0 and float(prior.get("elast_step", 1e-3)) != args.elast_step:
+            raise RuntimeError("--elast-step must remain unchanged when resuming")
         for key in ("batch", "seed"):
             if int(prior[key]) != int(getattr(args, key)):
                 raise RuntimeError(f"--{key} must remain {prior[key]} when resuming")
@@ -307,13 +314,15 @@ def main():
         return {
             "format": 2,
             "estimator": "exact_version4_no_gram_dynamic_program",
+            "price_response_estimator": "exact_dp_fourth_order",
+            "optimization_contract": "regularized fit with validation early stopping; not a stationarity certificate",
             "fresh_artifact_digest": restored["model_state_sha256"],
             "data_fingerprint_sha256": meta["data_fingerprint_sha256"],
             "iter": iteration,
             "model": model.state_dict(),
             "optimizer": optimizer.state_dict(),
             "config": vars(args),
-            "objective": "exact normalized joint likelihood with Phi=0",
+            "objective": "exact normalized Phi=0 likelihood plus configured minibatch size calibration, audited price response, pooling and AdamW decay",
             "trained_capabilities": {
                 "conditional_nonempty_incidence": True,
                 "gram_interactions": False,
@@ -353,6 +362,7 @@ def main():
         size_penalty = torch.zeros((), dtype=score.dtype)
         elasticity_penalty = torch.zeros((), dtype=score.dtype)
         elasticity = torch.full((), float("nan"), dtype=score.dtype)
+        price_response = None
         if args.size_kl > 0:
             pbar = size_probability.mean(0).clamp_min(1e-12)
             pbar = pbar / pbar.sum()
@@ -365,16 +375,9 @@ def main():
                     pbar * (pbar.log() - smooth.log())).sum()
             loss = loss + args.size_kl * size_penalty
         if args.elast_w > 0:
-            grid = torch.arange(1, size_probability.shape[1] + 1,
-                                dtype=score.dtype)
-            mean_size = (size_probability * grid).sum(1)
-            var_size = ((size_probability * grid.square()).sum(1)
-                        - mean_size.square())
-            price_coefficient = (
-                softplus(model.gamma[house][ix.item_trip])
-                * softplus(model.beta[ix.item])).sum(-1).mean()
-            elasticity = -(price_coefficient * var_size.mean()
-                           / mean_size.mean().clamp_min(1e-6))
+            price_response = additive_uniform_price_response(
+                model, ix, size_probability, step=args.elast_step)
+            elasticity = price_response.elasticity
             elasticity_penalty = args.elast_w * (
                 elasticity - args.elast_target).square()
             loss = loss + elasticity_penalty
@@ -421,6 +424,10 @@ def main():
             "size_penalty": float(size_penalty.detach()),
             "elasticity": float(elasticity.detach()),
             "elasticity_penalty": float(elasticity_penalty.detach()),
+            "elasticity_difference_step": price_response.step if price_response else None,
+            "elasticity_slope_discrepancy_max": (
+                float(price_response.second_fourth_discrepancy.detach().max())
+                if price_response else None),
             "lam_sd": float(model.lam.std().detach()),
             "house_size_sd": (
                 float(model.theta_c()[:, -1].std().detach())

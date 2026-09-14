@@ -2,10 +2,12 @@ import math
 
 import numpy as np
 import torch
+import pytest
 
 from audit_synthetic_retailer import (Config, QuantityLaw, enumerate_support,
                                       make_truth, simulate_retailer,
                                       solve_budget_policy)
+from audit_synthetic_retailer import (BasketLaw, calibrate_size_marginal, dr_contrast)
 
 
 def test_support_enumerates_all_nonempty_sets_through_nmax():
@@ -74,3 +76,34 @@ def test_budget_policy_respects_budget_and_prefers_reward():
     assert result["feasible"]
     assert result["predicted_cost"] <= 10.0
     assert result["predicted_reward"] == 18.0
+
+
+def test_randomized_dr_contrast_is_unbiased_even_with_wrong_outcome_model():
+    probability = np.array([.4, .3, .3])
+    action = np.arange(3)
+    outcomes = np.array([3., 5., 7.])
+    estimate = dr_contrast(outcomes, action, probability, np.full(3, -14.), np.full(3, 99.), 1)
+    assert np.isclose(probability @ estimate, 2.)
+    with pytest.raises(ValueError):
+        dr_contrast(outcomes, action, probability, outcomes, outcomes, 0)
+
+
+def test_size_profile_matches_training_moments_without_changing_within_size_odds():
+    config = Config(customers=12, products=7, categories=3, segments=3, rank=2, nmax=3)
+    support = enumerate_support(config.products, config.nmax, config.categories)
+    truth = make_truth(config, support)
+    model = BasketLaw(config, truth, interaction=False, seed=19)
+    segment = torch.as_tensor(truth["context_segment"])
+    action = torch.as_tensor(truth["context_action"])
+    count = torch.tensor(np.random.default_rng(31).poisson(4, size=truth["logp"].shape), dtype=torch.float64)
+    before = model.log_probability(support, segment, action).detach()
+    report = calibrate_size_marginal(model, support, count, segment, action)
+    after = model.log_probability(support, segment, action).detach()
+    for n in range(1, config.nmax + 1):
+        index = torch.nonzero(support["sizes"] == n).flatten()
+        change = after[:, index] - before[:, index]
+        torch.testing.assert_close(change, change[:, :1].expand_as(change), atol=1e-11, rtol=0)
+        observed = count[:, index].sum() / count.sum()
+        expected = (count.sum(1) / count.sum()) @ after.exp()[:, index].sum(1)
+        torch.testing.assert_close(expected, observed, atol=1e-6, rtol=0)
+    assert report["split"] == "train"

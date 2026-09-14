@@ -25,6 +25,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 import time
 from collections import Counter
 from pathlib import Path
@@ -32,53 +33,42 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import torch
+from scipy.stats import norm
+
+os.environ.setdefault("V3_AFFINITY", "1")
 
 from checkpoint_io import ROOT, load_checkpoint
 from data import build
 from features import Features
 from fit import Batcher
 from interaction_particles import rao_blackwell_particle_statistics
-from pipeline_support import copied_context, particle_delta
+from pipeline_support import particle_delta
+from price_response import changed_price_context
 from tempered_ais import annealed_smc_logz
 from provenance import file_sha256, strict_json_dumps
+from uncertainty import paired_score_summary
 
 
 torch.set_default_dtype(torch.float64)
 
 
-def balanced_context_panel(data, labels: np.ndarray, segment: int,
-                           count: int, seed: int, nmax: int) -> np.ndarray:
-    """Select held-out contexts round-robin across segment households."""
+def representative_context_panel(data, labels: np.ndarray, segment: int,
+                                 count: int, seed: int, nmax: int,
+                                 split: int) -> np.ndarray:
+    """Simple random trip panel for a trip-weighted segment response estimand."""
     eligible = np.flatnonzero(
-        (data["trip_split"] == 2)
+        (data["trip_split"] == int(split))
         & (data["trip_nlines"] >= 1)
         & (data["trip_nlines"] <= nmax)
         & (labels[data["trip_user"]] == segment))
-    grouped: dict[int, list[int]] = {}
-    for trip in eligible:
-        grouped.setdefault(int(data["trip_user"][trip]), []).append(int(trip))
-    rng = np.random.default_rng(seed + 1009 * segment)
-    households = np.asarray(sorted(grouped), dtype=np.int64)
-    households = households[rng.permutation(len(households))]
-    for household in households:
-        values = np.asarray(grouped[int(household)], dtype=np.int64)
-        grouped[int(household)] = values[rng.permutation(len(values))].tolist()
-    selected: list[int] = []
-    position = {int(household): 0 for household in households}
-    target = min(count, len(eligible))
-    while len(selected) < target:
-        changed = False
-        for household_value in households:
-            household = int(household_value)
-            if position[household] < len(grouped[household]):
-                selected.append(grouped[household][position[household]])
-                position[household] += 1
-                changed = True
-                if len(selected) == target:
-                    break
-        if not changed:
-            break
-    return np.asarray(selected, dtype=np.int64)
+    rng = np.random.default_rng(seed + 1009 * segment + 100003 * int(split))
+    return eligible[rng.permutation(len(eligible))[:min(count, len(eligible))]]
+
+
+def balanced_context_panel(data, labels: np.ndarray, segment: int,
+                           count: int, seed: int, nmax: int) -> np.ndarray:
+    """Backward-compatible name; now returns a representative test-trip panel."""
+    return representative_context_panel(data, labels, segment, count, seed, nmax, 2)
 
 
 def training_product_bundles(data, labels: np.ndarray, metadata: pd.DataFrame,
@@ -134,8 +124,36 @@ def training_product_bundles(data, labels: np.ndarray, metadata: pd.DataFrame,
 def solve_budget_mdp(actions: list[dict], horizon: int, budget: float,
                      bins: int, utilization_floor: float) -> dict:
     """Backward dynamic program with an expected-spend budget transition."""
-    if budget <= 0.0:
-        raise ValueError("budget must be positive")
+    if budget < 0.0:
+        raise ValueError("budget must be nonnegative")
+    if budget == 0.0:
+        if utilization_floor != 0.0:
+            raise ValueError("a zero budget cannot have positive required utilization")
+        free = [action for action in actions
+                if float(action["daily_expected_markdown_spend"]) == 0.0]
+        if not free:
+            return {"feasible":False,"horizon_days":horizon,"budget":0.0,
+                    "budget_bins":bins,"minimum_utilization":utilization_floor,
+                    "reason":"no zero-cost action is available"}
+        action=max(free,key=lambda row:float(row["daily_incremental_list_value_lcb95"]))
+        count={action["action_id"]:horizon}
+        return {"feasible":True,"horizon_days":horizon,"budget":0.0,
+                "budget_bins":bins,"budget_bin_width":0.0,
+                "minimum_utilization":0.0,"quantized_budget_utilization":0.0,
+                "expected_markdown_spend":0.0,"expected_spend_fraction_of_budget":0.0,
+                "total_robust_incremental_list_value_lcb95":horizon*float(action["daily_incremental_list_value_lcb95"]),
+                "total_incremental_list_value_mean":horizon*float(action["daily_incremental_list_value_mean"]),
+                "total_incremental_post_discount_sales":horizon*float(action["daily_incremental_post_discount_sales"]),
+                "total_incremental_distinct_products":horizon*float(action["daily_incremental_distinct_products"]),
+                "action_day_counts":count,
+                "daily_policy":[{"day":day+1,"remaining_budget_before":0.0,
+                    "action_id":action["action_id"],"segment":action.get("segment"),
+                    "bundle":action.get("bundle"),"discount":action.get("discount",0.0),
+                    "expected_markdown_spend":0.0,
+                    "incremental_list_value_mean":action["daily_incremental_list_value_mean"],
+                    "incremental_list_value_lcb95":action["daily_incremental_list_value_lcb95"],
+                    "incremental_post_discount_sales":action["daily_incremental_post_discount_sales"]}
+                    for day in range(horizon)]}
     width = budget / bins
     cost_bins = []
     for action in actions:
@@ -145,8 +163,8 @@ def solve_budget_mdp(actions: list[dict], horizon: int, budget: float,
     # budget.  Each of the horizon actions can overstate spend by less than one bin.  Tighten
     # the terminal quantized utilization by ``horizon`` bins; then realized spend is still
     # at least utilization_floor * budget despite the accumulated rounding error.
-    maximum_leftover = int(math.floor(
-        (1.0 - utilization_floor) * bins - horizon + 1e-12))
+    maximum_leftover = (bins if utilization_floor == 0.0 else int(math.floor(
+        (1.0 - utilization_floor) * bins - horizon + 1e-12)))
     if maximum_leftover < 0:
         raise ValueError(
             "budget grid is too coarse to certify the requested utilization; "
@@ -250,8 +268,6 @@ def evaluate_segment_actions(model, batcher, features, data, trips: np.ndarray,
         chain_log_price = absolute_log_price[ix.item, day[ix.item_trip]]
         chain_deviation = features.dev[ix.item, day[ix.item_trip]].double()
         slot_price = torch.exp(chain_log_price + ctx["dlp"] - chain_deviation)
-        assortment_count = torch.bincount(
-            ix.item_trip, minlength=ix.B).to(model.phi.dtype)
 
         generator = torch.Generator().manual_seed(
             args.seed + 100003 * segment + start)
@@ -275,13 +291,8 @@ def evaluate_segment_actions(model, batcher, features, data, trips: np.ndarray,
             products = torch.as_tensor(action["products"], dtype=torch.long)
             promoted = torch.isin(ix.item, products)
             log_change = math.log1p(-float(action["discount"]))
-            changed = copied_context(ctx)
-            changed["dlp"][promoted] += log_change
-            per_trip_change = torch.zeros(ix.B, dtype=model.phi.dtype).index_add_(
-                0, ix.item_trip[promoted],
-                torch.full((int(promoted.sum()),), log_change,
-                           dtype=model.phi.dtype))
-            changed["dlp_bar"] += per_trip_change / assortment_count.clamp_min(1.0)
+            changed = changed_price_context(
+                ctx, ix.item_trip, promoted.to(model.phi.dtype) * log_change)
             model.ctx = changed
             delta = particle_delta(smc.states, model.b_flat(ix) - factual_b, ix.B)
             log_weight = torch.log_softmax(delta, dim=0)
@@ -324,33 +335,39 @@ def evaluate_segment_actions(model, batcher, features, data, trips: np.ndarray,
         incremental_size = size - baseline_size
         incremental_list_value = list_value - baseline_value
         incremental_post_discount = actual_sales - baseline_value
+        size_summary = paired_score_summary(
+            incremental_size, data["trip_user"][trips])
+        value_summary = paired_score_summary(
+            incremental_list_value, data["trip_user"][trips])
+        sales_summary = paired_score_summary(
+            incremental_post_discount, data["trip_user"][trips])
         rows.append({
             "bundle": int(action["bundle"]),
             "discount": float(action["discount"]),
             "expected_size": float(size.mean()),
             "incremental_distinct_products": float(incremental_size.mean()),
-            "incremental_distinct_products_se": float(
-                incremental_size.std(ddof=1) / math.sqrt(len(incremental_size))),
+            "incremental_distinct_products_se": size_summary["standard_error"],
             "list_value": float(list_value.mean()),
             "incremental_list_value": float(incremental_list_value.mean()),
-            "incremental_list_value_se": float(
-                incremental_list_value.std(ddof=1)
-                / math.sqrt(len(incremental_list_value))),
+            "incremental_list_value_se": value_summary["standard_error"],
             "incremental_list_value_lcb95": float(
                 incremental_list_value.mean()
-                - 1.96 * incremental_list_value.std(ddof=1)
-                / math.sqrt(len(incremental_list_value))),
+                - args.simultaneous_critical * value_summary["standard_error"]),
             "post_discount_sales": float(actual_sales.mean()),
             "incremental_post_discount_sales": float(
                 incremental_post_discount.mean()),
-            "incremental_post_discount_sales_se": float(
-                incremental_post_discount.std(ddof=1)
-                / math.sqrt(len(incremental_post_discount))),
+            "incremental_post_discount_sales_se": sales_summary["standard_error"],
             "markdown_spend": float(markdown.mean()),
             "promoted_bundle_incidence": float(
                 np.mean(values["bundle_incidence"])),
             "tail_probability_ge_60_max": float(np.max(values["tail"])),
             "reweight_ess_min": float(np.min(values["ess"])),
+            "_per_context": {
+                "incremental_size": incremental_size,
+                "incremental_list_value": incremental_list_value,
+                "incremental_post_discount": incremental_post_discount,
+                "markdown": markdown,
+            },
         })
     return {
         "contexts": int(len(trips)),
@@ -365,6 +382,63 @@ def evaluate_segment_actions(model, batcher, features, data, trips: np.ndarray,
     }
 
 
+def without_internal_arrays(segment):
+    answer = {key: value for key, value in segment.items() if key != "actions"}
+    if isinstance(answer.get("trips"), np.ndarray):
+        answer["trips"] = answer["trips"].tolist()
+    answer["actions"] = [
+        {key: value for key, value in row.items() if key != "_per_context"}
+        for row in segment["actions"]]
+    return answer
+
+
+def independent_policy_evaluation(scenarios, evaluation_segments, data):
+    """Evaluate frozen action counts on a disjoint panel with policy-level uncertainty."""
+    results = []
+    for scenario in scenarios:
+        if not scenario.get("feasible"):
+            results.append({"feasible": False, "reason": scenario.get("reason")})
+            continue
+        counts = scenario["action_day_counts"]
+        segment_summaries = []
+        for segment in evaluation_segments:
+            contexts = len(segment["trips"])
+            totals = {name: np.zeros(contexts) for name in (
+                "incremental_list_value", "incremental_post_discount", "markdown")}
+            for row in segment["actions"]:
+                action_id = (f"segment_{segment['segment']}_bundle_{int(row['bundle'])}_"
+                             f"discount_{int(round(100 * float(row['discount'])))}")
+                repetitions = int(counts.get(action_id, 0))
+                if not repetitions:
+                    continue
+                for name in totals:
+                    totals[name] += repetitions * row["_per_context"][name]
+            scale = float(segment["expected_trips_per_day"])
+            summaries = {
+                name: paired_score_summary(
+                    value * scale, data["trip_user"][segment["trips"]])
+                for name, value in totals.items()
+            }
+            segment_summaries.append({"segment": int(segment["segment"]), **summaries})
+        def combine(name):
+            mean = sum(row[name]["mean"] for row in segment_summaries)
+            # Segment memberships are disjoint; sum their independent cluster variances.
+            se = math.sqrt(sum(row[name]["standard_error"] ** 2
+                               for row in segment_summaries))
+            return {"mean": mean, "standard_error": se,
+                    "95_interval": [mean - 1.96 * se, mean + 1.96 * se],
+                    "method": "frozen-policy household-cluster inference; fixed fitted model"}
+        results.append({
+            "feasible": True, "budget": scenario["budget"],
+            "action_day_counts": counts,
+            "incremental_list_value": combine("incremental_list_value"),
+            "incremental_post_discount_sales": combine("incremental_post_discount"),
+            "markdown_spend": combine("markdown"),
+            "segment_summaries": segment_summaries,
+        })
+    return results
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--checkpoint", type=Path, required=True)
@@ -372,7 +446,8 @@ def main() -> None:
                         default=Path("artifacts/customer_segments.npz"))
     parser.add_argument("--segment-report", type=Path,
                         default=Path("reports/customer_segments.json"))
-    parser.add_argument("--contexts-per-segment", type=int, default=64)
+    parser.add_argument("--contexts-per-segment", type=int, default=64,
+                        help="selection and evaluation contexts per segment")
     parser.add_argument("--particles", type=int, default=32)
     parser.add_argument("--levels", type=int, default=17)
     parser.add_argument("--power", type=float, default=2.0)
@@ -386,18 +461,22 @@ def main() -> None:
     parser.add_argument("--budget-fractions-of-maximum", type=float, nargs="+",
                         default=[0.25, 0.50, 0.75])
     parser.add_argument("--budget-bins", type=int, default=4000)
-    parser.add_argument("--minimum-budget-utilization", type=float, default=0.95)
+    parser.add_argument("--minimum-budget-utilization", type=float, default=0.0)
     parser.add_argument("--maximum-tail-probability", type=float, default=0.5)
     parser.add_argument("--minimum-reweight-ess", type=float, default=0.2)
     parser.add_argument("--output", type=Path,
                         default=Path("reports/segment_promotion_mdp.json"))
+    parser.add_argument("--frozen-policy-output", type=Path)
+    parser.add_argument("--independent-evaluation-output", type=Path)
     args = parser.parse_args()
     if any(not 0.0 < value < 1.0 for value in args.discounts):
         raise ValueError("discounts must lie strictly between zero and one")
     if any(not 0.0 < value <= 1.0 for value in args.budget_fractions_of_maximum):
         raise ValueError("budget fractions must lie in (0,1]")
-    if not 0.0 < args.minimum_budget_utilization <= 1.0:
-        raise ValueError("minimum budget utilization must lie in (0,1]")
+    if not 0.0 <= args.minimum_budget_utilization <= 1.0:
+        raise ValueError("minimum budget utilization must lie in [0,1]")
+    action_family = 3 * args.bundles_per_segment * len(args.discounts)
+    args.simultaneous_critical = float(norm.ppf(1.0 - .05 / (2 * action_family)))
 
     torch.set_num_threads(args.threads)
     checkpoint = args.checkpoint if args.checkpoint.is_absolute() \
@@ -433,33 +512,47 @@ def main() -> None:
         labels[data["trip_user"][train]], minlength=3)
     traffic_share = train_segment_count / train_segment_count.sum()
 
-    segments = []
+    selection_segments, evaluation_segments = [], []
     for segment in range(3):
         bundles = training_product_bundles(
             data, labels, metadata, segment,
             args.bundles_per_segment, args.products_per_bundle)
-        trips = balanced_context_panel(
+        selection_trips = representative_context_panel(
             data, labels, segment, args.contexts_per_segment,
-            args.seed, int(meta["nmax"]))
-        print(f"[promotion-mdp] starting segment={segment} "
-              f"label={segment_names[segment]!r} contexts={len(trips)}",
+            args.seed, int(meta["nmax"]), 1)
+        evaluation_trips = representative_context_panel(
+            data, labels, segment, args.contexts_per_segment,
+            args.seed + 700001, int(meta["nmax"]), 2)
+        print(f"[promotion-mdp] selection segment={segment} "
+              f"label={segment_names[segment]!r} contexts={len(selection_trips)}",
               flush=True)
-        evaluation = evaluate_segment_actions(
-            model, batcher, features, data, trips, bundles,
+        selection = evaluate_segment_actions(
+            model, batcher, features, data, selection_trips, bundles,
             list(args.discounts), args, segment)
-        evaluation.update({
+        print(f"[promotion-mdp] independent evaluation segment={segment} "
+              f"contexts={len(evaluation_trips)}", flush=True)
+        evaluation = evaluate_segment_actions(
+            model, batcher, features, data, evaluation_trips, bundles,
+            list(args.discounts), args, segment)
+        common = {
             "segment": segment,
             "label": segment_names[segment],
             "training_trip_share": float(traffic_share[segment]),
             "expected_trips_per_day": float(total_trips_per_day * traffic_share[segment]),
             "bundles": bundles,
-            "trips": trips.tolist(),
-        })
-        segments.append(evaluation)
+        }
+        selection.update({**common, "split": "validation",
+                          "sampling": "simple random trip panel",
+                          "trips": selection_trips})
+        evaluation.update({**common, "split": "test",
+                           "sampling": "simple random trip panel",
+                           "trips": evaluation_trips})
+        selection_segments.append(selection)
+        evaluation_segments.append(evaluation)
 
     baseline_daily_value = sum(
         row["baseline_list_value"] * row["expected_trips_per_day"]
-        for row in segments)
+        for row in selection_segments)
     actions = [{
         "action_id": "no_promotion", "segment": None, "bundle": None,
         "discount": 0.0, "daily_expected_markdown_spend": 0.0,
@@ -468,7 +561,7 @@ def main() -> None:
         "daily_incremental_post_discount_sales": 0.0,
         "daily_incremental_distinct_products": 0.0,
     }]
-    for segment_row in segments:
+    for segment_row in selection_segments:
         scale = segment_row["expected_trips_per_day"]
         for row in segment_row["actions"]:
             if (row["tail_probability_ge_60_max"] >= args.maximum_tail_probability
@@ -514,6 +607,36 @@ def main() -> None:
         })
         scenarios.append(answer)
 
+    frozen_policy = {
+        "checkpoint_sha256": file_sha256(checkpoint),
+        "data_fingerprint_sha256": blob["data_fingerprint_sha256"],
+        "selection_split": "validation", "evaluation_split": "test",
+        "selection_context_sampling": "simple random trips within segment",
+        "action_family": action_family,
+        "simultaneous_critical_value": args.simultaneous_critical,
+        "selection_bound": "two-sided Bonferroni simultaneous normal lower bound",
+        "scenarios": scenarios,
+    }
+    independent = {
+        "checkpoint_sha256": file_sha256(checkpoint),
+        "data_fingerprint_sha256": blob["data_fingerprint_sha256"],
+        "selection_policy_sha256": None,
+        "model_conditional_status": "completed",
+        "policy_value_evaluated": "not_identifiable",
+        "reason": ("test-panel calculations evaluate a frozen fitted-model policy, but "
+                   "the observational data do not identify causal policy value or profit"),
+        "scenarios": independent_policy_evaluation(scenarios, evaluation_segments, data),
+    }
+    frozen_path = (args.frozen_policy_output.resolve() if args.frozen_policy_output
+                   else output_path.with_name("frozen_policy.json"))
+    frozen_path.parent.mkdir(parents=True, exist_ok=True)
+    frozen_path.write_text(strict_json_dumps(frozen_policy))
+    independent["selection_policy_sha256"] = file_sha256(frozen_path)
+    independent_path = (args.independent_evaluation_output.resolve()
+                        if args.independent_evaluation_output
+                        else output_path.with_name("independent_policy_evaluation.json"))
+    independent_path.write_text(strict_json_dumps(independent))
+
     output = {
         "checkpoint": str(checkpoint),
         "checkpoint_sha256": file_sha256(checkpoint),
@@ -532,13 +655,22 @@ def main() -> None:
         "budget_cost": (
             "discount times shelf price times model-implied promoted-product incidence"),
         "minimum_budget_utilization": args.minimum_budget_utilization,
+        "selection_split": "validation", "evaluation_split": "test",
+        "context_sampling": "simple random trips within segment; trip-weighted estimand",
+        "simultaneous_critical_value": args.simultaneous_critical,
         "training_only_action_design": True,
         "total_expected_trips_per_day": total_trips_per_day,
         "baseline_daily_list_value": baseline_daily_value,
-        "segments": segments,
+        "segments": [without_internal_arrays(row) for row in selection_segments],
+        "independent_evaluation_segments": [
+            without_internal_arrays(row) for row in evaluation_segments],
         "safe_daily_actions": actions,
         "maximum_campaign_spend_under_action_space": maximum_campaign_spend,
         "budget_scenarios": scenarios,
+        "frozen_policy": str(frozen_path),
+        "frozen_policy_sha256": file_sha256(frozen_path),
+        "independent_policy_evaluation": str(independent_path),
+        "independent_policy_evaluation_sha256": file_sha256(independent_path),
         "not_identified": [
             "wholesale cost and profit", "inventory", "probability of making a trip",
             "competitor/store switching", "quantity beyond product incidence"],
@@ -555,7 +687,7 @@ def main() -> None:
         "segments": [{
             "segment": row["segment"], "label": row["label"],
             "contexts": row["contexts"], "smc_ess_min": row["smc_ess_min"],
-        } for row in segments],
+        } for row in selection_segments],
         "budget_scenarios": [{
             key: scenario.get(key) for key in (
                 "budget_fraction_of_maximum_action_spend", "budget",

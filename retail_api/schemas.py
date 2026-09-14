@@ -22,12 +22,6 @@ class RetailContext(StrictModel):
     day: Annotated[int, Field(ge=0, le=711)]
     week: Annotated[int, Field(ge=9, le=101)]
 
-    @model_validator(mode="after")
-    def consistent_day_and_week(self):
-        if self.day // 7 + 1 != self.week:
-            raise ValueError("week must equal day // 7 + 1")
-        return self
-
 
 Context = Annotated[HistoricalContext | RetailContext, Field(discriminator="kind")]
 

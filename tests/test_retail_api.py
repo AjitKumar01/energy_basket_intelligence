@@ -115,7 +115,7 @@ def test_completion_contract_and_strict_validation(client):
     assert client.post("/v1/baskets/complete", json=body).status_code == 422
 
 
-def test_retail_context_rejects_inconsistent_day_and_week(client):
+def test_retail_context_accepts_independent_source_day_and_week(client):
     response = client.post("/v1/baskets/complete", json={
         "context": {
             "kind": "retail_context", "household_index": 1,
@@ -123,7 +123,16 @@ def test_retail_context_rejects_inconsistent_day_and_week(client):
         },
         "revealed_product_ids": [818980],
     })
-    assert response.status_code == 422
+    assert response.status_code == 200
+
+    invalid = client.post("/v1/baskets/complete", json={
+        "context": {
+            "kind": "retail_context", "household_index": 1,
+            "store_index": 2, "day": 650, "week": 102,
+        },
+        "revealed_product_ids": [818980],
+    })
+    assert invalid.status_code == 422
 
 
 def test_product_and_segment_endpoints(client):

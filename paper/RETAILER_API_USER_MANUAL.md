@@ -144,7 +144,7 @@ versus `0.218` for popularity, and hidden-product recall at 20 was `23.47%` vers
 
 Choose one non-essential recommendation surface, such as an optional mobile-app carousel.
 Do not place the service in the payment path. The exact basket request currently takes
-about 445 milliseconds at the 95th percentile on the development machine. A timeout or
+about 447 milliseconds at the 95th percentile on the development machine. A timeout or
 service failure must leave checkout unchanged and display no model recommendation.
 
 ### Step 2: construct the request from the current cart
@@ -194,7 +194,7 @@ latency and safety limits before looking at the result.
 ### Step 7: decide what happens next
 
 If the model does not improve margin, stop the customer-facing treatment and retain the
-offline service for analysis. If ranking improves margin but 445 milliseconds is too slow,
+offline service for analysis. If ranking improves margin but 447 milliseconds is too slow,
 build a cached or smaller serving model and run the exact service in the background as a
 quality reference. Compare the fast model with the exact service regularly so that speed
 does not silently change the recommendation logic.

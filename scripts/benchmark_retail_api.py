@@ -88,6 +88,10 @@ def main():
             client, "GET", "/v1/capabilities", repeats=args.cheap_repeats)
         result["measurements"]["openapi_schema"] = measure(
             client, "GET", "/openapi.json", repeats=args.cheap_repeats)
+        result["measurements"]["swagger_docs"] = measure(
+            client, "GET", "/docs", repeats=args.cheap_repeats)
+        result["measurements"]["redoc_docs"] = measure(
+            client, "GET", "/redoc", repeats=args.cheap_repeats)
         result["measurements"]["product_search"] = measure(
             client, "GET", "/v1/products/search", repeats=args.cheap_repeats,
             params={"q": str(revealed[0]), "limit": 20})

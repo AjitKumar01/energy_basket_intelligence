@@ -144,15 +144,17 @@ production load test.
 
 | Endpoint | First/cold | Warm p50 | Warm p95 | Median response |
 |---|---:|---:|---:|---:|
-| `GET /live` | — | 0.409 ms | 0.577 ms | 40 B |
-| `GET /ready` | 261.150 ms | 0.513 ms | 0.657 ms | 198 B |
-| `GET /v1/capabilities` | — | 0.531 ms | 0.552 ms | 1,073 B |
-| `GET /openapi.json` | — | 0.361 ms | 0.407 ms | 9,088 B |
-| `GET /v1/products/search` | — | 1.325 ms | 1.582 ms | 167 B |
-| `GET /v1/households/{id}/segment` | — | 0.579 ms | 0.611 ms | 381 B |
-| `POST /v1/baskets/complete`, masked pair | 512.136 ms | 442.771 ms | 445.220 ms | 12,115 B |
-| `POST /v1/baskets/complete`, literal cart | 442.813 ms | 444.578 ms | 445.922 ms | 12,065 B |
-| Rejected unsupported mask size | — | 0.528 ms | 0.668 ms | 137 B |
+| `GET /live` | — | 0.434 ms | 0.571 ms | 40 B |
+| `GET /ready` | 366.196 ms | 0.500 ms | 0.639 ms | 198 B |
+| `GET /v1/capabilities` | — | 0.512 ms | 0.581 ms | 1,073 B |
+| `GET /openapi.json` | — | 0.344 ms | 0.392 ms | 9,088 B |
+| `GET /docs` | — | 0.310 ms | 0.348 ms | 954 B |
+| `GET /redoc` | — | 0.302 ms | 0.317 ms | 911 B |
+| `GET /v1/products/search` | — | 1.325 ms | 1.418 ms | 167 B |
+| `GET /v1/households/{id}/segment` | — | 0.572 ms | 0.627 ms | 381 B |
+| `POST /v1/baskets/complete`, masked pair | 640.813 ms | 441.616 ms | 442.977 ms | 12,115 B |
+| `POST /v1/baskets/complete`, literal cart | 441.261 ms | 442.451 ms | 446.112 ms | 12,065 B |
+| Rejected unsupported mask size | — | 0.545 ms | 0.740 ms | 137 B |
 
 Exact basket inference is the bottleneck. One worker currently serializes it behind a
 model lock and sustains approximately 2.25 single-context requests per second. The API is
@@ -226,7 +228,7 @@ candidate is displayed, the retailer intersects the top results with current inv
 removes regulated or suppressed products, applies merchandising constraints and records
 the exact model score and checkpoint hash.
 
-At roughly 445 ms p95, the exact call can populate a non-blocking app carousel or a
+At roughly 447 ms p95, the exact call can populate a non-blocking app carousel or a
 low-volume pilot with a 600 ms service budget. It should not delay payment. The client
 must time out, show no model recommendation on failure, and continue checkout normally.
 

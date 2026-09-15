@@ -1,319 +1,217 @@
-# Why Real Price Counterfactuals Did Not Match the Synthetic Results
+# Real-price evidence and learnability: corrected audit
 
-## Executive conclusion
+## Final conclusion
 
-The original 32-event real-data comparison was too noisy and did not compare like with
-like. It should not have been used to conclude that the model had learned—or failed to
-learn—real price effects.
+The present real dataset does **not** identify a stable, correctly directed own-price
+response. The earlier apparent pooled signal was an artifact of selecting store-price
+cells that existed only when the product sold. It must not be cited as evidence that the
+basket model learned real price counterfactuals.
 
-A corrected same-product, same-store study changes the conclusion:
+The corrected analysis first builds a purchase-independent exposure panel, then fits on
+training weeks, selects shrinkage on validation weeks, and opens the test period once.
+The validation-selected model is worse than ignoring price on test. No price coefficient
+artifact is certified, and the full basket pipeline now stops before training rather than
+injecting unsupported price effects.
 
-1. The real data contain a small but repeatable **average** relationship between price and
-   product purchasing.
-2. Product-specific relationships are suggested for a small, well-observed part of the
-   catalogue, but they are not stable enough across all held-out periods to be established.
-3. The fitted model captures a little test-period price information, but its
-   product-by-product sensitivities do not reproduce consistently across periods.
-4. Therefore the weak result is partly a data problem and partly a fitting problem. It is
-   not logical to demand 5,455 reliable product effects from this panel. It is logical to
-   require the model to learn the supported shared average and to report that most
-   product-specific effects are unavailable.
-5. The synthetic experiment answered a much easier identification question: offers were
-   randomized, every opportunity was recorded, the catalogue had only 20 products, and
-   the true alternative outcomes were known.
+This finding does not contradict the synthetic experiment. Synthetic offers were
+randomized, all opportunities—including non-purchases—were recorded, and the alternative
+outcomes were known. Those conditions are absent from the real panel.
 
-The current price component should be refitted hierarchically against the same-store
-training evidence and judged against the untouched test period. Price scenarios should
-remain research-only until that refit beats a simple pooled-price baseline and is then
-validated in a randomized retailer trial.
+## 1. Root cause in the original evidence panel
 
-## 1. Why the earlier 32-event result was weak
+`data/price_store_week.parquet` is reconstructed from transaction lines. Every row is a
+product sale summarized to product/store/week. Direct inspection gives:
 
-The earlier evaluator detected a price change from the chain-wide weekly modal price. It
-then predicted a response while holding the original shoppers and circumstances fixed,
-but compared that prediction with purchases made by a different collection of shoppers
-in the next week. Those are different questions.
+- 2,349,168 price cells;
+- minimum `n_tx` = 1;
+- median `n_tx` = 1; and
+- zero cells with `n_tx = 0`.
 
-The audit now quantifies the problem:
+Therefore a store/product/week price is observed only after at least one sale. Requiring
+prices in adjacent weeks silently requires the product to sell in both weeks. The prior
+same-store comparison consequently removed almost all zero-purchase outcomes before it
+estimated demand response. That is selection on the dependent variable.
 
-- There were 3,176 nominally clean chain-level price events in the test period.
-- Only 1,087, or 34.2%, had even one store with a price observation in both weeks.
-- Of the 32 evaluated events, only 9 had any same-store price observation in both weeks.
-- The median product was purchased only 3 times before and 3 times after the change.
-- The median model effect was only 0.0014 of the ordinary sampling error of the observed
-  difference. Even the largest was only 0.034 of that error.
-- The median observed movement was 518 times the median predicted movement.
-- The interaction and parent predictions differed by at most 0.00000367 in this panel.
+The earlier panel had only 41 zero-total training events among 8,296 events. Its negative
+price association and the fitted sensitivity near 0.32 are invalid for price-response
+inference.
 
-The observed differences were therefore dominated by which shoppers happened to visit
-and buy in each week. A 56.25% sign-agreement score from these 32 events is not an
-informative test of the model.
+The historical implementation has been retired: calling `build_store_events()` in
+`scripts/version4/research_real_price_evidence.py` now fails with an explanation instead
+of regenerating the biased analysis.
 
-There is also a price-measurement problem. The available prices are reconstructed from
-transactions, not supplied as a complete posted-price history. A chain-wide modal price
-can change because the stores contributing purchases changed. A valid price feed would
-record the price offered even when nobody bought the product.
+## 2. Corrected exposure construction
 
-## 2. Corrected same-store research design
+The replacement uses the same price information available to the basket model without
+requiring a product sale at a particular store:
 
-The new audit constructs store-product price events and holds both store and product
-fixed. For each event it compares purchasing among baskets at that store in adjacent
-weeks. It retains only events satisfying all of the following:
+1. Start from the chain-level weekly modal loyalty price.
+2. Carry it through missing weeks exactly as preprocessing does.
+3. Expose it to every store in which the product belongs to the static assortment built
+   from training data.
+4. Count all baskets in that store/week, including explicit zero product purchases.
+5. Compare adjacent weeks for the same product and store.
+6. Keep only price movements of at least 5% and at most 0.70 log points.
+7. Require display and mailer status to be unchanged and recorded promotion depth to move
+   by less than one percentage point.
+8. Require at least 16 baskets per store/week and at least 500 training product lines.
+9. Only after those filters, learn each product's eligible training price-change range;
+   require held-out movements to lie within it.
 
-- the price moved by at least 5%, with absolute log change no greater than 0.70;
-- the recorded discount depth did not change by more than one percentage point;
-- display and mailer status remained unchanged;
-- the product had at least 500 training purchases;
-- each store-week contained at least 16 modeled shopping trips;
-- the test-period price movement lay inside that product's training-period range; and
-- product selection did not inspect validation or test purchases.
+Sparse store-price deviations are deliberately excluded from this evidence design: those
+cells are themselves revealed by sales. This leaves measurement error because the chain
+price is only a proxy for a posted store price, but it removes the direct outcome-selection
+bug.
 
-This still is not a causal experiment. Advertising, stock, competition, and other weekly
-changes remain unobserved. It is, however, a much better test of whether the same
-observational relationship repeats outside training.
+The complete construction initially contains 7,370,901 store/product price-change rows.
+After the prespecified filters and training-product support check:
 
-The complete same-store construction found 97,521 adjacent-week price events covering
-4,134 products and 113 stores. The median event still contained only one product purchase
-per side, demonstrating the catalogue's severe long tail.
+| Period | Store events | Informative strata | Zero-total strata | Informative products |
+|---|---:|---:|---:|---:|
+| Training | 134,028 | 34,416 | 99,612 | 193 |
+| Validation | 13,475 | 3,376 | 10,099 | 84 |
+| Test | 18,317 | 4,485 | 13,832 | 94 |
 
-After the stricter support filters, the evidence panel contained:
+An informative stratum has at least one purchase across the two adjacent weeks. A
+zero-total stratum contributes exactly zero to the conditional likelihood; retaining it
+proves that exposure construction no longer depends on a sale.
 
-| Period | Events | Products |
+## 3. Focused statistical model
+
+For a store/product price event, let `y0` and `y1` be product-purchase basket counts and
+`n0` and `n1` be all eligible basket counts before and after. The fitted conditional
+Poisson model is equivalent to
+
+```text
+y1 | (y0 + y1) ~ Binomial(y0 + y1,
+                          sigmoid(log(n1/n0) - sensitivity * log_price_change))
+```
+
+Conditioning on the total purchase count removes the event-specific baseline rate. A
+nonnegative sensitivity encodes the ordinary own-price direction. This is still an
+observational predictive model, not a causal estimator: inventory, competitor activity,
+demand-led price setting, and other time-varying conditions remain unobserved.
+
+Three nested models were trained only on weeks 10–82:
+
+- one global sensitivity;
+- category sensitivities shrunk to the global value; and
+- product sensitivities shrunk to their category values.
+
+The category and product penalty grid was selected only on weeks 83–90. Weeks 91–101 were
+then evaluated once. Analytic gradients were checked against finite differences, and a
+separate synthetic conditional-count test recovers its known sensitivity.
+
+## 4. Corrected results
+
+### 4.1 There is no positive pooled response
+
+The nonnegative global training optimum is exactly zero. Allowing the coefficient to have
+either sign gives:
+
+| Period | Unconstrained sensitivity | 95% interval clustered by product |
 |---|---:|---:|
-| Training | 8,296 | 177 |
-| Validation | 997 | 82 |
-| Test | 1,332 | 99 |
+| Training | -0.0070 | [-0.0638, 0.0498] |
+| Validation | -0.2150 | [-0.4369, 0.0068] |
+| Test | 0.0229 | [-0.1183, 0.1642] |
 
-## 3. Is there price evidence in the real data?
+With the model convention, a positive sensitivity is ordinary demand: a price increase
+reduces purchase incidence. The negative estimates instead associate higher measured
+prices with higher purchase rates. All three intervals contain zero, and the point estimate
+changes sign between validation and test. This is not evidence for ordinary price response
+and is not a stable drift from one positive elasticity to another.
 
-Yes, at an aggregate observational level. The estimated change in product incidence per
-unit change in log price was negative and similar in all three periods:
+### 4.2 Product flexibility overfits validation
 
-| Period | Estimated slope | Product-clustered 95% interval |
-|---|---:|---:|
-| Training | -0.02189 | [-0.03385, -0.00994] |
-| Validation | -0.03373 | [-0.06288, -0.00458] |
-| Test | -0.02444 | [-0.04287, -0.00601] |
+Validation selected the product hierarchy with category penalty 0.1 and product penalty
+0.001. It improved conditional log loss slightly on validation:
 
-In the test period, product incidence fell by 0.00836 on average after price rises and
-increased by 0.00693 after price cuts. These are associations, but their direction and
-magnitude reproduce across time.
+```text
+no-price validation loss     0.6855100819
+selected validation loss     0.6853813400
+```
 
-A single response coefficient fitted only on training weeks achieved the following on all
-1,332 eligible test events:
+On the untouched test period it reversed:
 
-- Pearson correlation: 0.175;
-- rank correlation: 0.171;
-- sign agreement: 57.8%;
-- mean-squared-error improvement over predicting no response: 3.0%; and
-- mean-absolute-error improvement: 0.5%.
+```text
+no-price test loss           0.6889408453
+selected test loss           0.6899150632
+selected minus no-price     +0.0009742179  (worse)
+```
 
-This is weak predictive information, not an absence of information. It establishes a
-reasonable shared price response but not precise event-level forecasts.
+Every cluster bootstrap interval includes zero and extends in the harmful direction. None
+supports a test improvement:
 
-## 4. Can product-specific responses be learned?
-
-The evidence becomes stronger with repetition, but not conclusive across every held-out
-comparison. Among products observed in every period:
-
-| Minimum usable events in each period | Products | Training-to-test correlation | Validation-to-test correlation |
-|---:|---:|---:|---:|
-| 1 | 69 | 0.043 | 0.126 |
-| 3 | 51 | 0.061 | 0.370 |
-| 5 | 32 | 0.329 | 0.515 |
-| 8 | 22 | 0.339 | 0.541 |
-| 10 | 16 | 0.286 | 0.690 |
-
-For the 32-product, five-event panel, product-bootstrap 95% intervals were:
-
-- training versus validation: [0.157, 0.741];
-- training versus test: [-0.010, 0.683]; and
-- validation versus test: [0.057, 0.746].
-
-The validation-to-test result suggests that some stable product differences may exist,
-but the training-to-test interval includes zero. This is not enough to certify even the
-32-product subset, much less separate elasticities for all 5,455 products. It provides
-still less support for a separate response for every household-product pair.
-
-## 5. Did the fitted model learn the available evidence?
-
-Not adequately.
-
-The frozen model was evaluated on 80 validation and 80 test events, with one event per
-product. Selection used price and training support only and did not inspect the held-out
-purchase response. All numerical calculations passed; minimum absolute ESS was 18.5 out
-of 64.
-
-On the 80-product test panel, the interaction model achieved:
-
-- Pearson correlation: 0.179;
-- rank correlation: 0.086;
-- sign agreement: 51.9%;
-- mean-squared-error improvement over predicting no response: 2.6%; and
-- mean-absolute-error improvement: 1.8%.
-
-That is a small amount of held-out predictive value. However, it did not reproduce on the
-80-product validation panel: Pearson correlation was -0.085, rank correlation was -0.165,
-and both absolute and squared errors became worse.
-
-The simple training-only pooled rule had a higher test rank correlation, 0.172, but only a
-1.0% squared-error improvement and worse absolute error. Neither method reproduced on the
-80-product validation sample. The fitted model has therefore not demonstrated consistent
-superiority over the simplest price baseline.
-
-Most importantly, for the 32 products with at least five usable events in every period,
-the fitted product price coefficient correlated with the independently measured response
-as follows:
-
-| Comparison | Correlation |
+| Resampling unit | 95% interval for selected minus no-price loss |
 |---|---:|
-| Fitted coefficient versus training evidence | -0.253 |
-| Fitted coefficient versus validation evidence | 0.057 |
-| Fitted coefficient versus test evidence | 0.284 |
+| Product | [-0.000178, 0.003008] |
+| Store | [-0.000253, 0.002228] |
+| Week | [-0.000300, 0.002867] |
 
-The direction changes across periods, so the product allocation is not reliably learned.
+The point estimate is worse overall, and no clustering view establishes a benefit. The
+product model assigned zero sensitivity to 74 of 193 training products and values as high
+as 4.06 to others. That heterogeneity did not generalize.
 
-## 6. Why the present training path misses it
+## 5. What is—and is not—learnable
 
-### 6.1 The overall price strength is imposed, not independently learned
+The corrected data support these statements:
 
-Training penalizes deviation from an aggregate elasticity target of -0.121. Repository
-documentation already records that this target is a calibration assumption rather than
-independent real-data evidence. The basket likelihood contains too little price movement
-to control the overall magnitude reliably on its own.
+- A model can reconstruct historical basket probabilities conditional on observed prices.
+- It cannot learn a stable price-to-demand response from the available transaction-derived
+  exposure alone.
+- It cannot support household-specific or catalogue-wide SKU-specific elasticities.
+- The previous aggregate target of -0.121 is an external calibration assumption, not a
+  result recovered from this evidence.
+- The relative-price multiplier cannot be identified by a uniform-price target.
+- Interaction fitting cannot repair the issue because it copies the additive-stage price
+  parameters unchanged.
 
-### 6.2 The target does not identify which product is sensitive
+The likely causes are price endogeneity, incomplete posted-price measurement, absent
+stock/availability histories, unmeasured promotions and competitor conditions, and the
+fact that only nonempty loyalty-card baskets are observed. Merely increasing model rank,
+particles, epochs, or catalogue-scale embeddings cannot manufacture this missing
+identification.
 
-A single average constraint can control the average response while allocating it to the
-wrong products. In the current checkpoint, the product price coefficient is extremely
-uneven: its median is 0.00642, its 90th percentile is 0.04495, and its maximum is 0.2114.
-The relative-price multiplier is 15.0456. Most evaluated product responses are consequently
-almost zero, with a small number carrying most of the total response.
+## 6. Implemented correction and fail-closed behavior
 
-### 6.3 The relative-price multiplier is not identified by the aggregate target
+`scripts/version4/fit_supported_price_response.py` now:
 
-When every price moves together, the common/relative construction causes the relative
-part to cancel. Therefore an aggregate all-price elasticity target cannot identify the
-relative-price multiplier. That multiplier must be calibrated using supported
-single-product or within-category price movements. It should not be allowed to drift based
-only on basket likelihood.
+- constructs the complete exposure panel;
+- verifies counts, support, and duplicate-free event keys;
+- fits global/category/product hierarchies with bound-aware convergence checks;
+- chooses hierarchy and shrinkage using validation only;
+- compares the frozen choice with no-price on locked test data;
+- bootstraps loss differences by product, store, and week; and
+- writes a non-certified marker instead of coefficients when gates fail.
 
-### 6.4 The interaction fit does not refit the price parameters
+The full pipeline runs this evidence stage before the expensive additive fit. The additive
+trainer can load, hash, freeze, and preserve a future certified price component with
+relative-price multiplier equal to one. On the present data the evidence stage exits
+nonzero, so expensive basket training does not start with unsupported coefficients.
 
-The parent and interaction checkpoints have bit-identical household price factors,
-product price factors, relative-price multiplier, display effects, mailer effects, and
-product intercepts. The interaction stage changes basket interactions and size terms, but
-it cannot repair the price coefficients learned by the additive stage. Synthetic
-interaction success therefore does not imply improved real price estimation.
+## 7. What a retailer must supply next
 
-### 6.5 There are too many requested effects for the available repetitions
+To estimate causal or operational price effects, collect a store/SKU/time panel containing
+the offered price even when no sale occurs, plus inventory/stockout state, all promotions,
+competitor prices where relevant, store traffic, units, costs, and margin. Then create
+exogenous variation through a randomized store-SKU-week or eligible-customer offer test
+inside safe business bounds.
 
-The current price block represents variation across 1,920 households and 5,455 products.
-The same-store audit found tentative product evidence for tens of products, not reliable
-evidence for thousands. Household-specific price response is even more weakly supported.
-Without aggressive pooling, the model can fit arbitrary patterns that barely affect
-likelihood.
-
-## 7. Why synthetic success does not transfer automatically
-
-| Synthetic experiment | Real retailer panel |
-|---|---|
-| 20 products | 5,455 products |
-| 1,200 customers | 1,920 modeled households |
-| 216,000 customer-day opportunities | 200,698 observed nonempty trips |
-| 7 offers randomly assigned at customer-day level | Historical prices were not randomly assigned |
-| Known assignment probability | No documented assignment mechanism |
-| 25,732 trips with repeated action support | Median store-product-week event has one purchase per side |
-| Visits, non-visits, quantities, cost, and profit recorded | Primarily purchase baskets; no complete opportunity, stock, or cost panel |
-| True alternative-price outcomes computable | Only one factual price is observed per shopping occasion |
-| Exact enumeration over a six-product maximum basket | Approximate inference over 5,455 products and baskets up to 120 products |
-| Mostly correct fitted structure plus a declared mild misspecification | Unknown confounding and unknown structural misspecification |
-
-The synthetic work verifies the mathematics and shows that the estimator works when given
-the information required to identify price response. It does not demonstrate that the
-real panel contains equally informative treatment variation.
-
-## 8. What should be changed
-
-### 8.1 Replace the price evidence panel
-
-Use store-SKU-week posted prices covering offered products whether or not they sold. Add
-stock availability, display, mailer, coupon, competitor price, and store traffic. Until
-that feed exists, use the corrected same-store panel and label it observational.
-
-### 8.2 Fit price response hierarchically
-
-Start with one shared response. Add category-level deviations where the training data
-support them. Add product deviations only after a minimum repetition and reliability gate.
-Unsupported products should shrink back to their category or global response. Do not fit
-household-specific price response unless repeated randomized exposure supports it.
-
-The loss should compare the model's predicted price response directly with training-period
-same-store response moments. Validation should choose the pooling strength. The test period
-must remain untouched until the final comparison.
-
-### 8.3 Identify common and relative price effects separately
-
-Retain the common/relative theory, but estimate its two parts with different evidence:
-
-- common price movement from broad price-level variation; and
-- relative product response from supported within-store, within-category movements.
-
-Keep the relative-scale-equals-one model as an explicit ablation. Do not select the larger
-relative multiplier unless it improves held-out price-response calibration, not merely
-basket likelihood.
-
-### 8.4 Use appropriate acceptance gates
-
-A corrected price model should be accepted only if it:
-
-1. beats the zero-response baseline;
-2. beats the training-only pooled-price baseline;
-3. reproduces direction and calibration in both validation and test periods;
-4. aligns product sensitivities for the prespecified supported-product subset;
-5. reports unsupported products as pooled estimates rather than confident individual
-   effects; and
-6. passes the existing numerical and ESS checks.
-
-### 8.5 Make the synthetic test resemble the real identification problem
-
-Add a 5,455-product long tail, transaction-derived missing prices, store-level price
-variation, promotion confounding, stockouts, and many products with no repeat price event.
-The estimator should learn shared/category effects, shrink unsupported products, and state
-that unsupported individual effects are unavailable.
-
-### 8.6 Obtain causal evidence before deployment
-
-For a production claim, randomize store-SKU-week or customer-offer prices inside safe
-bounds. Record every eligible opportunity, including no visit and no purchase, along with
-stock, units, cost, margin, display, and competitor conditions. Evaluate the locked model
-against the randomized average effect and report uncertainty by the unit that was
-randomized.
-
-## 9. Final verdict
-
-The real data do not justify saying “there is no price signal.” They support a modest
-shared response and only tentative product differences for a small high-support subset.
-They also do not justify saying “the current model learned product-level
-counterfactuals.” It did not.
-
-The scientifically defensible conclusion is:
-
-> Real price response is learnable at a pooled observational level. Product-specific
-> response is not established by the present panel, and the current
-> likelihood-plus-aggregate-calibration fit does not reproduce consistently. Refitting
-> with same-store response supervision and hierarchical shrinkage is warranted; causal
-> price deployment still requires randomized retailer data.
+Training must use only the randomized or otherwise identified exposure period. Validation
+selects pooling. A locked test must beat no-price and pooled baselines with uncertainty
+clustered at the randomization unit. Only after that should counterfactual price endpoints
+be enabled. Until then, the model's non-price basket-completion and generation functions
+can be evaluated independently, but price scenarios are simulations under an assumed
+coefficient—not evidence-backed forecasts.
 
 ## Reproducibility
 
-- Research implementation:
-  [`scripts/version4/research_real_price_evidence.py`](../scripts/version4/research_real_price_evidence.py)
-- Machine-readable result:
-  [`artifacts/real_price_evidence_research_20260915/report.json`](../artifacts/real_price_evidence_research_20260915/report.json)
-- Per-event frozen model comparison:
-  [`artifacts/real_price_evidence_research_20260915/per_event.parquet`](../artifacts/real_price_evidence_research_20260915/per_event.parquet)
-- Superseded 32-event evaluation:
-  [`artifacts/remaining_verification_audited_20260914/real_price_response_evaluation.json`](../artifacts/remaining_verification_audited_20260914/real_price_response_evaluation.json)
-- Synthetic comparison:
-  [`artifacts/remaining_verification_audited_20260914/synthetic_verification/synthetic_retailer_experiment.json`](../artifacts/remaining_verification_audited_20260914/synthetic_verification/synthetic_retailer_experiment.json)
+- Corrected implementation: `scripts/version4/fit_supported_price_response.py`
+- Focused tests: `tests/test_supported_price_response.py`
+- Run log: `artifacts/supported_price_response_20260915/run.log`
+- Machine report: `artifacts/supported_price_response_20260915/report.json`
+- Fail-closed coefficient marker:
+  `artifacts/supported_price_response_20260915/coefficients.json`
+
+The artifacts are local generated outputs and are intentionally not treated as source
+files. The JSON report records the implementation hash and every split/gate value.

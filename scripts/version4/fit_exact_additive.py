@@ -9,6 +9,7 @@ interactions are added as a separate residual stage only after this exact block 
 from __future__ import annotations
 
 import argparse
+import json
 import math
 import os
 import sys
@@ -27,7 +28,7 @@ from fit import Batcher
 from pipeline_support import supported_trips
 from interaction_particles import (differentiable_log_size_beta0,
                                    differentiable_logz_beta0)
-from provenance import require_fingerprint, strict_json_dumps
+from provenance import file_sha256, require_fingerprint, strict_json_dumps
 from ragged import RaggedModel
 from price_response import additive_uniform_price_response
 from sparse_artifact import load_sparse_initialization_artifact
@@ -91,6 +92,15 @@ def parse_args():
     parser.add_argument("--elast-target", type=float, default=-0.121)
     parser.add_argument("--elast-step", type=float, default=1e-3,
                         help="maximum log-price step for audited fourth-order DP response")
+    parser.add_argument(
+        "--global-price-sensitivity", type=float, default=0.0,
+        help=("positive matched-event own-price sensitivity; fixes every household-product "
+              "coefficient to this value and fixes relative-price kappa to one"))
+    parser.add_argument(
+        "--supported-price-coefficients", "--global-price-coefficients",
+        dest="supported_price_coefficients", type=Path,
+        help=("certified observational coefficient JSON from "
+              "fit_supported_price_response.py"))
     parser.add_argument("--pool-prod", type=float, default=0.0)
     parser.add_argument("--lam-centre", type=int, default=0)
     parser.add_argument("--lam-sd-max", type=float, default=0.0)
@@ -132,7 +142,80 @@ def fitted_parameters(model):
     # blocks are absent because this file fits incidence baskets, not line-unit counts.
     names = ("lam", "alpha", "theta", "rho_c", "rho_0_free", "price_kappa",
              "gamma", "beta", "w_dsp", "w_mlr", "mu", "delta", "zeta", "xi")
-    return [getattr(model, name) for name in names]
+    return [getattr(model, name) for name in names
+            if getattr(model, name).requires_grad]
+
+
+def configure_global_price(model, sensitivity):
+    sensitivity = float(sensitivity)
+    if sensitivity <= 0.0:
+        return None
+    return configure_supported_price(model, np.full(model.J, sensitivity), "global")
+
+
+def configure_supported_price(model, sensitivity, level):
+    sensitivity = np.asarray(sensitivity, dtype=np.float64)
+    if sensitivity.shape != (model.J,) or not np.isfinite(sensitivity).all() \
+            or not (sensitivity >= 0).all():
+        raise RuntimeError(
+            "supported price vector is not finite and nonnegative on catalogue")
+    model.set_product_price_sensitivity(sensitivity, relative_multiplier=1.0)
+    model.gamma.requires_grad_(False)
+    model.beta.requires_grad_(False)
+    model.price_kappa.requires_grad_(False)
+    with torch.no_grad():
+        product = (torch.nn.functional.softplus(model.gamma).mean(0)
+                   * torch.nn.functional.softplus(model.beta)).sum(-1)
+        kappa = torch.nn.functional.softplus(model.price_kappa)
+    target = torch.as_tensor(sensitivity, dtype=product.dtype, device=product.device)
+    maximum_error = float((product - target).abs().max())
+    if maximum_error > 1e-12 or abs(float(kappa) - 1.0) > 1e-12:
+        raise RuntimeError("supported price factorization did not reproduce its target")
+    return {
+        "level": str(level),
+        "sensitivity_minimum": float(sensitivity.min()),
+        "sensitivity_median": float(np.median(sensitivity)),
+        "sensitivity_maximum": float(sensitivity.max()),
+        "catalogue_products": int(model.J),
+        "relative_price_kappa": float(kappa),
+        "maximum_product_coefficient_error": maximum_error,
+        "household_parameters_frozen": not model.gamma.requires_grad,
+        "product_parameters_frozen": not model.beta.requires_grad,
+        "kappa_frozen": not model.price_kappa.requires_grad,
+    }
+
+
+def load_supported_price_sensitivity(path, catalogue_products):
+    path = path.resolve()
+    payload = json.loads(path.read_text())
+    if payload.get("status") != "certified_observational_predictor":
+        raise RuntimeError("price coefficient artifact is not certified")
+    level = payload.get("level")
+    global_sensitivity = float(payload["global_sensitivity"])
+    sensitivity = np.full(int(catalogue_products), global_sensitivity, dtype=np.float64)
+    estimated_products = 0
+    if level == "product":
+        rows = payload.get("product_sensitivity", [])
+        identifiers = np.asarray([row["item_id"] for row in rows], dtype=np.int64)
+        values = np.asarray([row["sensitivity"] for row in rows], dtype=np.float64)
+        if (len(identifiers) != len(np.unique(identifiers))
+                or (identifiers < 0).any() or (identifiers >= catalogue_products).any()):
+            raise RuntimeError("price coefficient artifact has invalid product identifiers")
+        sensitivity[identifiers] = values
+        estimated_products = int(len(identifiers))
+    elif level != "global":
+        raise RuntimeError(f"unsupported certified price hierarchy: {level}")
+    if not np.isfinite(sensitivity).all() or not (sensitivity >= 0).all():
+        raise RuntimeError("supported price sensitivities are invalid")
+    return sensitivity, level, {
+        "coefficient_path": str(path),
+        "coefficient_sha256": file_sha256(path),
+        "estimated_product_deviations": estimated_products,
+        "unestimated_products_using_global_sensitivity":
+            int(catalogue_products - estimated_products),
+        "individual_coefficient_interpretation_supported": bool(
+            payload.get("individual_coefficient_interpretation_supported", False)),
+    }
 
 
 def exact_loglik(model, ix, line_item, line_trip, line_cat, line_ctx):
@@ -186,6 +269,19 @@ def validate(model, batcher, trips, chunk):
 
 def main():
     args = parse_args()
+    price_provenance = None
+    if args.supported_price_coefficients is not None:
+        if args.global_price_sensitivity > 0:
+            raise SystemExit(
+                "use either --supported-price-coefficients or "
+                "--global-price-sensitivity, not both")
+    if args.global_price_sensitivity < 0:
+        raise SystemExit("--global-price-sensitivity must be nonnegative")
+    if ((args.global_price_sensitivity > 0
+         or args.supported_price_coefficients is not None) and args.elast_w > 0):
+        raise SystemExit(
+            "--global-price-sensitivity and --elast-w target different estimands; "
+            "use --elast-w 0 with the matched-event sensitivity")
     torch.set_num_threads(args.threads)
     torch.manual_seed(args.seed)
     artifact = args.artifact if args.artifact.is_absolute() else ROOT / args.artifact
@@ -199,6 +295,22 @@ def main():
 
     data = build()
     model, meta, restored = load_model(artifact, data)
+    supported_price_sensitivity = None
+    supported_price_level = None
+    if args.supported_price_coefficients is not None:
+        (supported_price_sensitivity, supported_price_level,
+         price_provenance) = load_supported_price_sensitivity(
+            args.supported_price_coefficients, model.J)
+    elif args.global_price_sensitivity > 0:
+        supported_price_sensitivity = np.full(
+            model.J, args.global_price_sensitivity, dtype=np.float64)
+        supported_price_level = "global"
+    supported_price_audit = (
+        configure_supported_price(
+            model, supported_price_sensitivity, supported_price_level)
+        if supported_price_sensitivity is not None else None)
+    if supported_price_audit is not None and price_provenance is not None:
+        supported_price_audit.update(price_provenance)
     if int(meta["active_rank"]) != 8:
         raise RuntimeError("expected the certified rank-8 parent artifact")
     features = Features(int(data["n_item"]), int(data["n_store"]), 712,
@@ -232,6 +344,15 @@ def main():
         if resumed.get("data_fingerprint_sha256") != meta["data_fingerprint_sha256"]:
             raise RuntimeError("resume checkpoint belongs to a different audited dataset")
         prior = resumed["config"]
+        prior_price = resumed.get("supported_price_component")
+        if (prior_price is None) != (supported_price_audit is None):
+            raise RuntimeError("supported price mode must remain unchanged when resuming")
+        if supported_price_audit is not None:
+            for key in ("level", "coefficient_sha256", "sensitivity_minimum",
+                        "sensitivity_median", "sensitivity_maximum"):
+                if prior_price.get(key) != supported_price_audit.get(key):
+                    raise RuntimeError(
+                        "supported price coefficients must remain unchanged when resuming")
         if args.elast_w > 0 and resumed.get("price_response_estimator") != "exact_dp_fourth_order":
             raise RuntimeError("cannot resume proxy-elasticity optimizer under the corrected objective")
         if args.elast_w > 0 and float(prior.get("elast_step", 1e-3)) != args.elast_step:
@@ -245,6 +366,11 @@ def main():
                 "--rho-c-max-category-reward must remain "
                 f"{prior_reward:g} when resuming")
         model.load_state_dict(resumed["model"])
+        if supported_price_sensitivity is not None:
+            supported_price_audit = configure_supported_price(
+                model, supported_price_sensitivity, supported_price_level)
+            if price_provenance is not None:
+                supported_price_audit.update(price_provenance)
         optimizer.load_state_dict(resumed["optimizer"])
         start_iteration = int(resumed["iter"])
         if args.iters <= start_iteration:
@@ -267,6 +393,12 @@ def main():
     if model.household_size_rank1:
         print("[exact-additive] taste rank split: K-1 catalogue-centred composition "
               "directions plus one household-common size direction", flush=True)
+    if supported_price_audit is not None:
+        print("[exact-additive] supported observational price component: "
+              f"level={supported_price_audit['level']}; sensitivity "
+              f"{supported_price_audit['sensitivity_minimum']:.6f}.."
+              f"{supported_price_audit['sensitivity_maximum']:.6f}; "
+              "relative-price kappa=1; price factors frozen", flush=True)
     if args.rho_c_max_category_reward > 0:
         initial_category_safety = project_category_reward_(
             model, rho_c_capacities, args.rho_c_max_category_reward,
@@ -314,7 +446,10 @@ def main():
         return {
             "format": 2,
             "estimator": "exact_version4_no_gram_dynamic_program",
-            "price_response_estimator": "exact_dp_fourth_order",
+            "price_response_estimator": (
+                "matched_store_conditional_binomial_hierarchy_v1"
+                if supported_price_audit is not None else "exact_dp_fourth_order"),
+            "supported_price_component": supported_price_audit,
             "optimization_contract": "regularized fit with validation early stopping; not a stationarity certificate",
             "fresh_artifact_digest": restored["model_state_sha256"],
             "data_fingerprint_sha256": meta["data_fingerprint_sha256"],
@@ -322,7 +457,12 @@ def main():
             "model": model.state_dict(),
             "optimizer": optimizer.state_dict(),
             "config": vars(args),
-            "objective": "exact normalized Phi=0 likelihood plus configured minibatch size calibration, audited price response, pooling and AdamW decay",
+            "objective": (
+                "exact normalized Phi=0 likelihood with a frozen independently fitted "
+                "observational price component, plus configured size calibration, pooling "
+                "and AdamW decay" if supported_price_audit is not None else
+                "exact normalized Phi=0 likelihood plus configured minibatch size "
+                "calibration, audited price response, pooling and AdamW decay"),
             "trained_capabilities": {
                 "conditional_nonempty_incidence": True,
                 "gram_interactions": False,
@@ -394,6 +534,18 @@ def main():
         loss.backward()
         grad_norm = float(torch.nn.utils.clip_grad_norm_(parameters, args.clip))
         optimizer.step()
+        if supported_price_audit is not None:
+            with torch.no_grad():
+                current_price = (
+                    torch.nn.functional.softplus(model.gamma).mean(0)
+                    * torch.nn.functional.softplus(model.beta)).sum(-1)
+                current_kappa = torch.nn.functional.softplus(model.price_kappa)
+            target_price = torch.as_tensor(
+                supported_price_sensitivity, dtype=current_price.dtype,
+                device=current_price.device)
+            if (float((current_price - target_price).abs().max())
+                    > 1e-12 or abs(float(current_kappa) - 1.0) > 1e-12):
+                raise RuntimeError("frozen supported price component changed during training")
         model.project_context_gauges()
         if args.lam_centre:
             # Exact gauge transformation: subtracting mu from every item utility and

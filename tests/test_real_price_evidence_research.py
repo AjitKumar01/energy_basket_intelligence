@@ -2,12 +2,19 @@ import math
 
 import numpy as np
 import pandas as pd
+import pytest
 
 from research_real_price_evidence import (
+    build_store_events,
     clustered_slope,
     eligible_store_events,
     pooled_slope,
 )
+
+
+def test_outcome_selected_store_price_audit_is_retired():
+    with pytest.raises(RuntimeError, match="conditions on the outcome"):
+        build_store_events()
 
 
 def test_price_evidence_slope_and_cluster_interval_recover_exact_relation():

@@ -640,6 +640,8 @@ def main() -> None:
         "model": model.state_dict(),
         "fresh_artifact_digest": parent_blob["fresh_artifact_digest"],
         "data_fingerprint_sha256": parent_blob["data_fingerprint_sha256"],
+        "price_response_estimator": parent_blob.get("price_response_estimator"),
+        "supported_price_component": parent_blob.get("supported_price_component"),
         "config": {**parent_blob["config"],
                    "artifact": parent_blob["config"]["artifact"]},
         "parent": str(parent_path),

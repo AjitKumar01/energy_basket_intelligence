@@ -51,7 +51,7 @@ def internal_store_map(baskets: pd.DataFrame) -> pd.DataFrame:
     return pairs
 
 
-def build_store_events() -> tuple[pd.DataFrame, dict]:
+def build_outcome_selected_store_events() -> tuple[pd.DataFrame, dict]:
     baskets = pd.read_parquet(
         ROOT / "basket_input/baskets.parquet",
         columns=["BASKET_ID", "WEEK_NO", "item_id", "store_id"])
@@ -145,6 +145,14 @@ def build_store_events() -> tuple[pd.DataFrame, dict]:
         },
     }
     return events, report
+
+
+def build_store_events() -> tuple[pd.DataFrame, dict]:
+    raise RuntimeError(
+        "retired invalid design: price_store_week.parquet contains a cell only after a "
+        "product sale, so consecutive price availability conditions on the outcome. Use "
+        "fit_supported_price_response.py, which constructs complete exposure events from "
+        "the carried chain-week price and training-defined assortment.")
 
 
 def eligible_store_events(events: pd.DataFrame) -> pd.Series:

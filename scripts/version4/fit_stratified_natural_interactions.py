@@ -480,6 +480,8 @@ def main() -> None:
         "iter": 0, "model": model.state_dict(),
         "fresh_artifact_digest": parent_blob["fresh_artifact_digest"],
         "data_fingerprint_sha256": parent_blob["data_fingerprint_sha256"],
+        "price_response_estimator": parent_blob.get("price_response_estimator"),
+        "supported_price_component": parent_blob.get("supported_price_component"),
         "config": parent_blob["config"], "parent": str(parent),
         "parent_iteration": int(parent_blob["iter"]),
         "parent_sha256": file_sha256(parent),

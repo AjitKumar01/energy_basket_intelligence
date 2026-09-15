@@ -1324,6 +1324,42 @@ class RaggedModel(torch.nn.Module):
         return (softplus(self.gamma[self.house[trip]])
                 * softplus(self.beta[it])).sum(-1)
 
+    @torch.no_grad()
+    def set_global_price_sensitivity(self, sensitivity, relative_multiplier=1.0):
+        """Set an exactly constant price slope without changing the energy formula.
+
+        ``gamma`` and ``beta`` are a nonnegative factorization of the household-product
+        coefficient.  Equal factor entries make every dot product exactly ``sensitivity``.
+        The caller decides whether to freeze these parameters during fitting.
+        """
+        sensitivity = float(sensitivity)
+        values = torch.full(
+            (self.J,), sensitivity, dtype=self.beta.dtype, device=self.beta.device)
+        self.set_product_price_sensitivity(values, relative_multiplier)
+
+    @torch.no_grad()
+    def set_product_price_sensitivity(self, sensitivity, relative_multiplier=1.0):
+        """Set household-invariant product slopes in the existing factorization."""
+        values = torch.as_tensor(
+            sensitivity, dtype=self.beta.dtype, device=self.beta.device)
+        relative_multiplier = float(relative_multiplier)
+        if values.shape != (self.J,) or not bool(torch.isfinite(values).all()) \
+                or not bool((values >= 0).all()):
+            raise ValueError(
+                "product price sensitivity must have one finite nonnegative value per product")
+        if not math.isfinite(relative_multiplier) or relative_multiplier <= 0.0:
+            raise ValueError("relative-price multiplier must be finite and positive")
+        rank = int(self.gamma.shape[1])
+        household_factor = 1.0 / math.sqrt(rank)
+        product_factor = (values / math.sqrt(rank)).clamp_min(
+            torch.finfo(values.dtype).tiny)
+        household_raw = math.log(math.expm1(household_factor))
+        product_raw = torch.log(torch.expm1(product_factor))
+        multiplier_raw = math.log(math.expm1(relative_multiplier))
+        self.gamma.fill_(household_raw)
+        self.beta.copy_(product_raw[:, None].expand_as(self.beta))
+        self.price_kappa.fill_(multiplier_raw)
+
     def b_at(self, it, trip, c):
         """Eq. 7 at an arbitrary set of (product, trip) pairs.
 

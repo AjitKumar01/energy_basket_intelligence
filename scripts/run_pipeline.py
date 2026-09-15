@@ -616,6 +616,14 @@ def main() -> None:
     additive_latest = OUT / "v3_pipeline_additive.pt"
     additive_blob = None
     if runs_stage(start_at, "additive"):
+        price_evidence_dir = ART / "supported_price_response"
+        price_evidence_report = price_evidence_dir / "report.json"
+        price_coefficients = price_evidence_dir / "coefficients.json"
+        driver.run(script(
+            "fit_supported_price_response.py",
+            "--output", price_evidence_report,
+            "--coefficients-output", price_coefficients,
+            "--seed", 68101))
         if args.resume_additive is not None:
             resume_path = (args.resume_additive if args.resume_additive.is_absolute()
                            else ROOT / args.resume_additive)
@@ -634,7 +642,8 @@ def main() -> None:
             "--convergence-patience", 8,
             "--convergence-min-updates", 4000 if full else 10,
             "--validation-min-delta", 0.001,
-            "--rkl-w", 10.0, "--elast-w", 20.0, "--elast-target", -0.121,
+            "--rkl-w", 10.0, "--elast-w", 0.0,
+            "--supported-price-coefficients", price_coefficients,
             "--pool-prod", 1.45, "--lam-centre", 1, "--seed", 29001,
             "--threads", cpu_threads,
             "--rho-c-max-category-reward", 1.5,

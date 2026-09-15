@@ -1,252 +1,233 @@
-# Retailer User Manual: Basket Suggestions and Customer Groups
+# A Simple Retailer’s Guide to the Basket Assistant
 
-## Who should use this manual
+## What this system does
 
-This manual is for retail managers, merchandisers, digital-commerce teams, store
-operations teams and IT staff. You do not need to understand probability theory or how
-the model was trained. The important points are what information to send, what the answer
-means, what action is safe, and what the system must not be used for.
+Think of this system as a shop assistant who has studied many past shopping baskets. When
+the assistant is told what is already in a basket, it suggests other products that often
+fit that shopping situation. It can also give a rough idea of whether the basket is likely
+to stay small or contain more products.
 
-The service can currently help with three jobs. It can suggest products that may belong
-with products already in a basket. It can estimate how many more products may appear in a
-completed basket under the tested offline procedure. It can also place a known customer
-in one of three descriptive groups for reporting and for balancing a business experiment.
-These are decision-support functions. They are not automatic proof that a recommendation
-caused a sale.
+The system does not speak to the shopper by itself. It gives a list to the retailer. The
+retailer decides which suggestions are suitable, checks that they are in stock, and then
+chooses whether to show them in an app, on a website, at a self-checkout, or nowhere at
+all.
 
-## What the retailer must not use it for
+The system can also place existing customers into broad shopping groups. These groups are
+useful for reports and for making sure a trial includes different kinds of shoppers. They
+must not be used to charge different prices or to decide that one group deserves a better
+offer.
 
-Do not use this service to set prices, promise profit, select discounts, remove products
-from stores, estimate lost demand during stockouts, forecast total store demand, or decide
-that a customer has finished shopping. The available transaction data did not contain the
-experiments, stock records, shopping order, costs or visit opportunities needed to verify
-those decisions. The service reports these applications as unavailable instead of
-guessing.
+## What it cannot tell the retailer
 
-## The two basket modes in ordinary language
+The system cannot currently tell the retailer that lowering a price will increase profit.
+It cannot prove that a recommendation caused an extra sale. It cannot tell whether a
+shopper has finished shopping. It cannot reliably say what a shopper will buy when an item
+is out of stock. It also does not forecast how many people will visit the store.
 
-The basket endpoint has two modes. Choosing the correct mode is essential.
+These are not small warnings. They define what the retailer may and may not do with the
+system. The retailer should use it to prepare product suggestions and conduct a fair
+business trial. The retailer should not allow it to set prices, discounts, store ranges,
+or purchasing budgets.
 
-The `uniform_random_subset` mode is the verified offline test mode. Start with a completed
-historical basket, hide all but two randomly selected products, and ask the service what
-else it expects. Use this mode to measure performance on past baskets. Exactly two
-products must be supplied. Do not use this mode for a live shopping cart because the first
-two products scanned by a shopper were not randomly selected from the final basket.
+## Who is responsible for what
 
-The `literal_cart` mode is the live-pilot candidate mode. It accepts the products that are
-actually known in a current cart and returns possible additions. Its product ranking may
-be used to prepare an experiment, but its remaining-count and checkout estimates are not
-certified for live shopping. A retailer must run a controlled online test before using
-this output as a normal customer-facing feature.
+The merchandising manager chooses the business goal. A sensible first goal is: “Can we
+make more useful product suggestions without slowing or annoying shoppers?” The manager
+also decides which products must never be suggested and which parts of the shop or app
+will be used for the trial.
 
-## Before the first use
+The technology team connects the basket assistant to the retailer’s till, website, app,
+product list, customer list, and stock information. Product and customer numbers often
+look different in different systems. The technology team translates them behind the
+scenes so that store employees do not have to work with computer codes.
 
-The retail IT team must connect the retailer's product catalogue to the model catalogue.
-The basket endpoint accepts the retailer's source `PRODUCT_ID`, not the model's internal
-product number. The product-search endpoint can be used to confirm the mapping. The
-current prepared files do not retain the retailer's original household-ID mapping, so IT
-must securely maintain a table that translates the retailer's customer key to the fitted
-`household_index`. The same applies to the fitted `store_index` where store systems use a
-different identifier.
+The trading or finance team supplies the real profit made on each product. Sales value is
+not enough. A recommendation that increases sales but reduces total profit is not a
+successful recommendation.
 
-IT must also provide both the transaction day and the source week number. These are two
-separate source fields and must not be calculated from one another. The current service
-accepts days 0 through 711 and weeks 9 through 101 because that is the period covered by
-the fitted data and promotions. A request outside that period is not evidence about a new
-calendar period; the model needs a controlled refresh and drift check before later weeks
-are served.
+The analyst sets up a fair comparison between shoppers who see the new suggestions and
+similar shoppers who do not. The analyst reports what actually happened, including cases
+where the service was slow, unavailable, or wrong.
 
-Start one copy of the service with:
+Store and customer-service teams watch for practical problems. They should report poor
+suggestions, unavailable products, repeated suggestions, complaints, and any delay to the
+shopping or payment journey.
 
-```bash
-python scripts/run_retail_api.py --host 127.0.0.1 --port 8000
-```
+## Before showing anything to a shopper
 
-The IT operator first opens `/live`. A successful answer means only that the web process
-is running. The operator then opens `/ready`. A successful answer means the model,
-catalogue, customer groups and audit records were loaded and belong together. Traffic
-must not be sent to a server that does not return `200` from `/ready`.
+Begin with one small, non-essential place, such as a recommendation panel in the mobile
+app. Do not begin at the payment button or anywhere a delay could stop a purchase. Agree
+in advance that if the basket assistant is slow or unavailable, the shopper will continue
+normally and no suggestion will be shown.
 
-## Step-by-step offline evaluation
+Choose the result that will decide success before the trial begins. The main result should
+be extra profit after product costs, compared with the retailer’s usual approach. Also
+watch whether shoppers leave, complain, remove products, or experience slower pages.
 
-### Step 1: select historical baskets fairly
+Prepare a list of products that must not be suggested. This may include age-restricted
+goods, medicines, products with legal restrictions, products the shopper has asked not to
+see, and products that are unsuitable for the channel. Make sure current stock information
+is available. The basket assistant does not know that a shelf is empty unless the retailer
+tells the surrounding retail system.
 
-Select completed baskets from a period that was not used to train the model. Do not select
-only large baskets, only loyal customers or only successful promotions. Such selection
-would make the result look better or worse than ordinary trade. Keep baskets containing
-at least two distinct products and within the model's supported basket size.
+Ask the technology team to demonstrate that the system is connected to the approved
+version of the basket assistant. The screen should show that the service is ready. If it
+does not show ready, the retailer must show no suggestion and continue normal shopping.
 
-### Step 2: hide products without looking at their identity
+## First try it on past baskets
 
-For each selected basket, randomly choose exactly two products to reveal. Hide every
-other product. The random choice must be made by software before anyone looks at which
-products were selected. This creates the same kind of test that passed the current audit.
+The safest first use does not involve customers at all. It uses completed purchases from
+a period that was not used to teach the system.
 
-### Step 3: send the test request
+First, let a computer select an ordinary mixture of past baskets. Do not choose only large
+baskets, loyal shoppers, successful stores, or examples where the answer looks obvious.
+Choosing favourable examples would give management a misleading result.
 
-Send the customer, store, day and source week together with the two visible source product
-IDs. Set `protocol` to `uniform_random_subset`. For example:
+Next, let the computer cover up all but two products in each basket. The two visible
+products must be chosen without looking at what they are. The basket assistant sees those
+two products and prepares a list of other products. It also estimates roughly how many
+products were covered up.
 
-```json
-{
-  "context": {
-    "kind": "retail_context",
-    "household_index": 1745,
-    "store_index": 40,
-    "day": 601,
-    "week": 87
-  },
-  "revealed_product_ids": [849843, 1045586],
-  "top_k": 10,
-  "protocol": "uniform_random_subset"
-}
-```
+Finally, uncover the real basket and compare it with the answer. Count how often the exact
+hidden products appeared near the top of the list. Keep a second count for related
+products. For example, suggesting large eggs when the hidden product was jumbo eggs is a
+useful related suggestion, but it is not an exact match. Management should see both
+figures rather than combining them.
 
-### Step 4: read the answer
+Compare the basket assistant with the simple list the retailer already uses, such as
+best-selling products. Use exactly the same past baskets for both. If the new system is not
+better than this simple list, it has not earned a customer-facing trial.
 
-`expected_additional_items` is the service's average estimate of how many hidden products
-remain. It is not a promise for an individual basket. An answer of `3.1` means that many
-similar cases average about three additional products; it does not mean that this shopper
-must purchase exactly three.
+## A real example explained simply
 
-`stop_probability` is the model's estimated chance that the two visible products are the
-whole completed basket under this offline testing procedure. A value of `0.27` means about
-27 cases out of 100 similar model cases would contain nothing else. It does not mean the
-live shopper has a 27% chance of going to checkout.
+In one past purchase, the two products shown to the basket assistant were wheat and
+multigrain bread, and fruit or breakfast bread. The parts of the basket hidden from the
+assistant were jumbo eggs, cream cheese, and butter.
 
-Each recommendation contains `probability_in_completion`. This is the model's estimate
-that the product belongs somewhere in the hidden remainder. Products can appear together,
-so these values do not need to add to 100%. Use the values to rank candidates, not as a
-claim of extra sales.
+The assistant estimated that about three more products were likely. The real answer was
+three. It placed extra-large eggs second on its suggestion list. Extra-large eggs were not
+the exact hidden product, because the shopper bought jumbo eggs, but the suggestion was
+clearly related to the same shopping need.
 
-The `numerical_certificate` is an automatic calculation-quality check. Business users do
-not need to interpret its individual fields. The important rule is simple: the service
-returns an error instead of a recommendation when the calculation is not precise enough.
+The assistant also showed considerable uncertainty. It said there was roughly a one in
+four chance that the two breads were the whole basket. This was wrong for this particular
+basket because three more products were bought. That does not automatically make the
+assistant useless. It means the retailer should treat the list as a set of possibilities,
+not as a promise about an individual shopper.
 
-### Step 5: score the offline result
+A merchandiser could reasonably say: “The assistant noticed a breakfast or pantry
+shopping pattern and brought an egg product near the top. It did not find every exact
+product, and it was unsure about how much shopping remained.” A merchandiser should not
+say: “Showing eggs will make this shopper buy eggs.” Only a live comparison can establish
+whether showing the suggestion changes sales.
 
-For each basket, check whether the exact hidden products occur in the top 5, 10 and 20
-recommendations. Also record whether a related category was recovered, but keep that
-separate from exact-product success. Compare the model with a simple popularity list on
-the same baskets. Report average remaining-count error, exact-product recall, ranking
-quality and calculation failures. Do not remove failed or difficult cases from the
-report.
+## How to run a small live trial
 
-The current 256-basket audit found average remaining count `6.519` versus `6.688`
-observed. Mean absolute error was `6.119` versus `6.867` for the training-only size
-baseline. On 200 baskets that truly had hidden products, model ranking MRR was `0.367`
-versus `0.218` for popularity, and hidden-product recall at 20 was `23.47%` versus
-`11.54%`. These are encouraging offline results, not measured incremental revenue.
+After the past-basket check is complete, choose a small number of stores or a small share
+of app users. Keep the trial away from payment. Agree on a maximum waiting time. On the
+machine tested here, a basket answer usually took just under half a second. If that is too
+slow for the chosen screen, ask the technology team to prepare suggestions earlier or use
+a faster copy of the system. Never make the shopper wait at checkout for an answer.
 
-## Step-by-step live pilot
+When a participating shopper places products in a basket, the retail system sends the
+known basket to the assistant. The assistant returns possible additions. Before anything
+is shown, the retailer’s normal rules remove unavailable, restricted, unsuitable, and
+already-selected products. A shopper should not see the same suggestion repeatedly.
 
-### Step 1: define one small customer-facing location
+The trial must contain three comparable groups. One group sees no additional suggestion.
+One sees the retailer’s normal best-seller suggestion. One sees the basket assistant’s
+suggestion. A computer lottery should place shoppers into these groups. The assignment
+should remain stable during the trial so that the same shopper is not repeatedly moved
+between experiences.
 
-Choose one non-essential recommendation surface, such as an optional mobile-app carousel.
-Do not place the service in the payment path. The exact basket request currently takes
-about 447 milliseconds at the 95th percentile on the development machine. A timeout or
-service failure must leave checkout unchanged and display no model recommendation.
+The customer groups produced by the basket assistant may be used to make sure the three
+trial groups contain a similar mixture of shopping styles. They should not be used to
+give one group a different price or a larger discount.
 
-### Step 2: construct the request from the current cart
+For every opportunity, record what was already in the basket, what was suggested, what
+was actually shown, whether it was in stock, whether the shopper added it, what the shopper
+finally bought, and the profit after product cost. Also record how long the answer took,
+whether it failed, whether the shopper abandoned the journey, and whether a complaint was
+made. Keep the same records for shoppers who saw no suggestion. Otherwise there is no fair
+comparison.
 
-When a known customer has one or more products in a cart, translate the customer, store
-and products to the fitted identifiers. Send the actual products with `protocol` set to
-`literal_cart`. Do not label its stopping or remaining-count fields as verified live
-predictions. The live pilot uses the returned product order only to form candidates.
+## How management should decide
 
-### Step 3: apply retail safety rules
+At the end of the trial, ask four direct questions. Did shoppers who saw the basket
+assistant buy the exact suggested products more often than shoppers who saw nothing? Did
+it beat the retailer’s normal best-seller suggestions? Did the retailer make more profit
+after costs? Did it avoid slower journeys, more abandonment, and more complaints?
 
-Before displaying anything, remove products that are out of stock, legally restricted,
-incompatible with the channel, suppressed by the customer, or already in the cart. Apply
-frequency limits so the same suggestion is not repeatedly shown. Retain the original
-model rank and probability in the event log even if a business rule removes an item.
+Do not expand the trial merely because total sales rose. Shoppers may have bought those
+products anyway, or the extra sales may have had poor margins. Do not expand merely
+because some examples look impressive. Use all eligible trial results, including failures.
 
-### Step 4: randomize the recommendation
+The rules for success must be written before the result is opened. At minimum, the
+retailer should require a clear profit improvement over both comparison groups, acceptable
+speed, no meaningful increase in abandonment or complaints, and no breach of stock or
+product-safety rules.
 
-Assign eligible household-weeks to one of three groups: no recommendation, a normal
-popularity recommendation, or the model recommendation. Keep the assignment fixed for the
-household-week so that a shopper does not jump between experiences. Balance the groups by
-store and by the descriptive customer segment. The segment is used to make the test fair,
-not to decide who deserves an offer.
+If the suggestions improve profit but the system is too slow, do not put the exact system
+directly into a busy checkout. Ask the technology team to build a quicker version and keep
+the current system running quietly in the background as a reference. Regular comparison
+will reveal whether the faster version begins to give different answers.
 
-### Step 5: record what happened
+If the trial does not improve profit, turn off the customer-facing use. The system can
+still help analysts and merchandisers study possible product connections, but an
+interesting suggestion is not the same as a successful business action.
 
-For every eligible opportunity, record the request time, checkpoint fingerprint, visible
-cart, full model candidate list, candidates removed by business rules, inventory, shelf
-price, products actually displayed, click or add event, final purchases, units, cost,
-margin, response latency, timeout and checkout abandonment. Also record eligible control
-opportunities where nothing was displayed. Without those control records, the retailer
-cannot know whether a product would have been bought anyway.
+## How to use the customer groups
 
-### Step 6: use business decision measures
+The customer groups are descriptions of broad past shopping patterns. They can help the
+retailer compare stores, prepare balanced trials, and see whether service quality is very
+different across types of shoppers.
 
-The main measures are the change in exact recommended-product attachment and the change
-in contribution margin relative to both controls. Report uncertainty around each change.
-Category attachment is useful as a secondary measure but cannot replace exact-product
-sales. Check that timeouts, page delay, abandonment, complaints and repeated exposure did
-not get worse.
+They do not reveal why a customer behaves in a certain way. They do not show that a
+customer will respond to an offer. A group described as more price-sensitive must not
+automatically receive a discount, and a group described as less price-sensitive must not
+be charged more. Those decisions require a separate, fair trial.
 
-A practical launch rule is: do not expand unless the lower confidence limit for
-incremental margin is above zero, the model beats the popularity arm, the latency target
-is met, and no customer-safety measure is worse. The retailer should set the exact margin,
-latency and safety limits before looking at the result.
+In the bread example, the customer belongs to a large group described by refrigerated,
+organic fruit and vegetable purchasing with medium price sensitivity. This description
+does not change the product list and does not authorize a price decision. It simply helps
+the retailer make sure similar customers are represented in all three trial groups.
 
-### Step 7: decide what happens next
+## What staff should do when something goes wrong
 
-If the model does not improve margin, stop the customer-facing treatment and retain the
-offline service for analysis. If ranking improves margin but 447 milliseconds is too slow,
-build a cached or smaller serving model and run the exact service in the background as a
-quality reference. Compare the fast model with the exact service regularly so that speed
-does not silently change the recommendation logic.
+If the screen says the service is not ready, show no suggestion and continue normal
+shopping. If the system does not recognize a product or customer, send the mapping problem
+to the technology team. If the answer arrives after the agreed waiting time, ignore it for
+that shopping visit. Do not keep retrying while the shopper waits.
 
-## Worked example in ordinary business language
+If staff see an inappropriate suggestion, record the basket, suggestion, store, time, and
+reason it was inappropriate. Remove the affected product or situation through the
+retailer’s safety rules while the issue is investigated. Do not change the underlying
+system quietly during a trial, because the trial would then mix results from different
+versions.
 
-In one real held-out case, the visible basket contained wheat/multigrain bread and
-fruit/breakfast bread. The hidden completed basket also contained jumbo eggs, cream cheese
-and butter. The offline test endpoint estimated `3.071` additional products; three were
-actually hidden. It gave a 27.3% chance of no additional products. Extra-large eggs were
-ranked second, which is relevant to the hidden jumbo eggs but is not an exact-SKU hit.
+## Daily checklist for the retail manager
 
-A merchandiser should read this as follows: the model recognized a plausible breakfast or
-pantry shopping pattern and produced an egg alternative near the top. It did not recover
-all exact hidden products, and the high stop probability shows uncertainty. This is a
-useful candidate-generation example, not proof that displaying eggs would cause an extra
-sale. Only the randomized live pilot can answer that business question.
+Before the trial opens each day, ask whether the service shows ready, whether stock
+information is current, whether the product translation is current, and whether the normal
+shopping journey works when the assistant is switched off.
 
-## How to use customer segments
+During the day, watch how often the assistant is slow or unavailable, whether suggestions
+are being removed because stock is missing, whether the same products are repeatedly
+shown, and whether staff or customers report poor suggestions.
 
-The segment endpoint returns a segment number and a plain label. Use the segment to create
-balanced experimental groups, summarize trading patterns and check whether the service
-behaves very differently across existing types of customers. Do not infer that a segment
-is more persuadable, should pay a different price, or should receive a bigger discount.
-Those are treatment decisions and need randomized evidence.
+After the day closes, confirm that every suggestion can be connected to what was finally
+bought and to the profit made after product cost. Confirm that the comparison groups also
+have complete records. Missing comparison records can make an unsuccessful system appear
+successful.
 
-For the worked example, household 1745 belongs to segment 0, labelled “REFRIGERATED /
-ORGANICS FRUIT & VEGETABLES; medium price sensitivity.” This describes the fitted
-household profile. It does not change the basket recommendation and does not authorize a
-price action.
+## The one-page rule
 
-## What to do when the service returns an error
+Use the basket assistant to suggest possibilities. Check those possibilities against
+stock, law, customer preferences, and merchandising rules. Test them against both no
+suggestion and the retailer’s normal suggestion. Judge success by extra profit and a safe,
+uninterrupted customer journey. Do not use the assistant to set prices, claim that it
+caused a purchase, or decide that a shopper has finished.
 
-An HTTP `400` response means the request is not supported, such as an unknown product or
-the wrong number of products for offline mask mode. Correct the input; do not retry the
-same request repeatedly. An HTTP `422` response means the request does not follow the
-published format or an index is outside its permitted range. An HTTP `503` response means
-the model, audit lineage or numerical calculation did not pass a safety check. Show no
-model recommendation and alert the service owner. A timeout has the same business
-fallback: continue the customer journey without the recommendation.
-
-## Daily operator checklist
-
-Before traffic begins, confirm `/live`, `/ready` and `/v1/capabilities` return successfully.
-Confirm that the checkpoint fingerprint equals the approved release. Check that inventory
-and product-ID mapping feeds are current. During operation, watch p50 and p95 latency,
-timeouts, HTTP 400/422/503 counts and request volume. After operation, reconcile exposures
-with purchases and margins, and confirm that every treatment opportunity has a valid
-randomized assignment or control record.
-
-Do not replace the checkpoint or audit files independently. A new checkpoint requires the
-full application audit, a new approved fingerprint, a shadow comparison with the current
-release and a fresh pilot decision. The `/ready` lineage checks prevent many accidental
-mismatches, but they cannot determine whether the retailer collected the right live
-business data.
+The separate technical guide, `RETAIL_APPLICATION_API.md`, contains the computer commands,
+field names, timing measurements, and connection details needed by the retailer’s IT
+team. Business users do not need that document to follow this operating guide.

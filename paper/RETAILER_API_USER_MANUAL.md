@@ -12,22 +12,60 @@ retailer decides which suggestions are suitable, checks that they are in stock, 
 chooses whether to show them in an app, on a website, at a self-checkout, or nowhere at
 all.
 
-The system can also place existing customers into broad shopping groups. These groups are
-useful for reports and for making sure a trial includes different kinds of shoppers. They
-must not be used to charge different prices or to decide that one group deserves a better
-offer.
+The system can also place existing customers into broad shopping groups. These groups can
+help the retailer see whether the same offer appears to work differently for different
+kinds of shoppers. That makes them useful for choosing which offers to test and for making
+sure each trial contains a fair mixture of shoppers. The group label alone is not enough
+evidence to give a customer a different price. If a properly run trial later shows that an
+offer genuinely works better for a particular group, the retailer can then make a pricing
+decision using that evidence, together with its normal legal and customer-fairness checks.
 
 ## What it cannot tell the retailer
 
-The system cannot currently tell the retailer that lowering a price will increase profit.
-It cannot prove that a recommendation caused an extra sale. It cannot tell whether a
-shopper has finished shopping. It cannot reliably say what a shopper will buy when an item
-is out of stock. It also does not forecast how many people will visit the store.
+The system can estimate how a basket may change when a price changes. It cannot yet promise
+that the change will occur in the real shop or that it will increase profit. It cannot
+prove that a recommendation caused an extra sale. It cannot tell whether a shopper has
+finished shopping. It cannot reliably say what a shopper will buy when an item is out of
+stock. It also does not forecast how many people will visit the store.
 
-These are not small warnings. They define what the retailer may and may not do with the
-system. The retailer should use it to prepare product suggestions and conduct a fair
-business trial. The retailer should not allow it to set prices, discounts, store ranges,
-or purchasing budgets.
+These warnings define the difference between a forecast and a proven business result. The
+retailer may use the system to compare possible prices, discard weak ideas, and choose the
+most promising ideas for a real trial. The retailer should not allow it to change prices
+automatically or treat its forecast as guaranteed profit.
+
+## Why price is part of the system
+
+Price has two important jobs in this system.
+
+First, it helps the system understand past purchases. Suppose butter sold more often in a
+month when it was heavily discounted. A system that ignores price may wrongly conclude
+that customers suddenly developed a stronger liking for butter. This system is shown the
+price so it can separate, as far as the available history allows, ordinary product appeal
+from purchasing that happened while the product was cheaper.
+
+Second, the retailer can ask practical “what if” questions. For example:
+
+> A basket contains milk, bread, and butter at today's prices. What does the system expect
+> baskets like this to look like if butter becomes ten per cent more expensive?
+
+The answer can show whether butter becomes less likely, whether milk and bread remain,
+whether another spread becomes more likely, and whether the basket tends to become
+smaller. The retailer can ask the same question for a discount, another product, a group
+of related products, or a different kind of shopper.
+
+This leads to concrete decisions. The retailer can decide which price ideas are not worth
+pursuing, which products and discounts should enter a small trial, which customer groups
+must be represented in that trial, and how much trial budget to reserve. After the trial,
+the retailer uses actual purchases, product costs, stock levels, and customer reactions to
+decide whether to keep, change, or reject the price.
+
+The fitted system has already passed an important basic check: when prices are raised in
+its test scenarios, it predicts fewer purchases of the affected products; when prices are
+lowered, it predicts more. In the real-data screening exercise it also produced a ranked
+list of possible product-group and discount combinations. These results show that the
+price part of the system is working as a scenario-screening tool. They do not yet prove
+that its predicted sales or profit will be achieved in a shop. That proof must come from a
+real trial in which comparable shoppers are offered different prices by a fair lottery.
 
 ## Who is responsible for what
 
@@ -141,8 +179,10 @@ should remain stable during the trial so that the same shopper is not repeatedly
 between experiences.
 
 The customer groups produced by the basket assistant may be used to make sure the three
-trial groups contain a similar mixture of shopping styles. They should not be used to
-give one group a different price or a larger discount.
+recommendation groups contain a similar mixture of shopping styles. Keep prices unchanged
+in this particular trial, because changing recommendations and prices at the same time
+would make it impossible to tell which change produced the result. Run a separate price
+trial when the business question concerns discounts.
 
 For every opportunity, record what was already in the basket, what was suggested, what
 was actually shown, whether it was in stock, whether the shopper added it, what the shopper
@@ -182,15 +222,18 @@ The customer groups are descriptions of broad past shopping patterns. They can h
 retailer compare stores, prepare balanced trials, and see whether service quality is very
 different across types of shoppers.
 
-They do not reveal why a customer behaves in a certain way. They do not show that a
-customer will respond to an offer. A group described as more price-sensitive must not
-automatically receive a discount, and a group described as less price-sensitive must not
-be charged more. Those decisions require a separate, fair trial.
+They do not reveal why a customer behaves in a certain way, and the group name alone does
+not prove that a customer will respond to an offer. A group described as more
+price-sensitive is a sensible candidate for a price trial. The retailer can offer a
+discount to some customers in that group and keep the usual price for comparable customers
+in the same group. If the result repeatedly shows worthwhile extra profit without harming
+customers, that evidence can support a targeted promotion. A customer must not be charged
+more merely because the system attached a label to them.
 
 In the bread example, the customer belongs to a large group described by refrigerated,
-organic fruit and vegetable purchasing with medium price sensitivity. This description
-does not change the product list and does not authorize a price decision. It simply helps
-the retailer make sure similar customers are represented in all three trial groups.
+organic fruit and vegetable purchasing with medium price sensitivity. This makes the
+group useful when comparing possible offers and planning a price trial. It is a starting
+clue, not the final pricing decision.
 
 ## What staff should do when something goes wrong
 
@@ -222,11 +265,13 @@ successful.
 
 ## The one-page rule
 
-Use the basket assistant to suggest possibilities. Check those possibilities against
-stock, law, customer preferences, and merchandising rules. Test them against both no
-suggestion and the retailer’s normal suggestion. Judge success by extra profit and a safe,
-uninterrupted customer journey. Do not use the assistant to set prices, claim that it
-caused a purchase, or decide that a shopper has finished.
+Use the basket assistant to suggest products and to compare possible price changes. Check
+those possibilities against stock, product cost, law, customer preferences, and
+merchandising rules. Test the strongest ideas against the retailer's usual approach.
+Judge success by extra profit and a safe, uninterrupted customer journey. Let the system
+choose what is worth testing; let real trial results decide what price to use. Do not let
+the system change a shopper's price automatically, claim that it caused a purchase, or
+decide that a shopper has finished.
 
 The separate technical guide, `RETAIL_APPLICATION_API.md`, contains the computer commands,
 field names, timing measurements, and connection details needed by the retailer’s IT

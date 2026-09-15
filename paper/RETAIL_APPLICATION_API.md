@@ -1,5 +1,9 @@
 # Retail Application API
 
+Retail operations and merchandising teams should use the plain-language
+[`RETAILER_API_USER_MANUAL.md`](RETAILER_API_USER_MANUAL.md). This document is the
+technical interface and evidence reference for engineering and model-governance teams.
+
 ## Scope
 
 The API exposes only applications supported by the current audits:

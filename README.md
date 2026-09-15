@@ -92,6 +92,8 @@ The completed corrected-data fit and its fail-closed production decision are rep
 The evidence-gated HTTP interface for the successful basket-completion, cross-sell, and
 descriptive-segmentation applications is documented in
 [`paper/RETAIL_APPLICATION_API.md`](paper/RETAIL_APPLICATION_API.md).
+A plain-language operating guide for retail, merchandising and digital-commerce teams is
+available in [`paper/RETAILER_API_USER_MANUAL.md`](paper/RETAILER_API_USER_MANUAL.md).
 The completed rank-one successor, including its locked likelihood, recommendation,
 generation, external-baseline, interaction-embedding and population-certification results,
 is reported in

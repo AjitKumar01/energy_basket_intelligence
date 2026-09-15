@@ -18,7 +18,7 @@ The corrected natural-panel audit no longer supports the earlier conclusion that
 | Basket completion | Distribution over remaining products and count | Natural 256-trip panel: actual remaining mean 6.688, predicted 6.519; MAE 6.119 vs 6.867 training-size baseline. Paired MAE improvement 95% interval -1.215 to -0.219 items. | Mean calibrated; MAE improves, full distribution not yet certified. |
 | Stopping | Masking-aware `P(T=∅ | A,x)` | Brier 0.1663 vs 0.1729; log loss 0.5227 vs 0.5320; AUC 0.6086. Both paired score intervals include zero. | Modest discrimination; improvement unresolved. |
 | Stockout substitution | Alternatives within desired SKU's subcommodity | Held-out-choice proxy: model MRR 0.5492 vs popularity 0.3803 across 32 cases. No stockout labels. | Proxy only; actual substitution not identified. |
-| Price scenarios | Basket probabilities under a declared price vector | 32 observational events: sign agreement 56.25%; child MAE 0.001022, parent MAE 0.001022; model accuracy explicitly not assessed. | Numerically usable scenario, not validated causal effect. |
+| Price scenarios | Basket probabilities under a declared price vector | The original 32-event chain comparison was underpowered. A corrected same-store panel finds a repeatable pooled price signal after holding promotion, display, and mailer status fixed. On an outcome-blind 80-product test panel, the fitted model has Pearson 0.179, rank correlation 0.086, and 2.6% squared-error improvement over no response, but it fails to reproduce on validation or consistently beat the pooled baseline. | Pooled observational learnability; product allocation not validated and no causal effect identified. |
 | Personalized bundles | Candidate bundle odds conditional on cart | Matched-negative proxy: model MRR 0.5392 vs popularity 0.2699 across 27 cases. | Offline proxy; randomized offers needed. |
 | Promotion targeting | Segment/bundle/discount scenario table | Existing MDP has 13 numerically admissible actions, but excludes profit, inventory, visits, switching, and quantities. | Do not deploy as policy. |
 | Assortment planning | Recompute basket law after SKU addition/removal | No historical availability, planogram, cost, capacity, or lost-demand intervention labels. | Not evaluable with current data. |
@@ -38,6 +38,15 @@ P(T | A ⊆ S, x) = exp(score(A ∪ T)) / Σ_U exp(score(A ∪ U))
 A retrospective validation case is built by uniformly selecting two products from the final basket. That observation mechanism is informative about final size. Its correct evaluation law is `q(T|A,x) ∝ P(T|A⊆S,x) / C(|A|+|T|,2)`. The earlier balanced 64-case result omitted this factor and is superseded.
 
 The earlier worked price examples remain candidate-set calculations: a 15% increase in the declared soy SKU moved dairy's two-candidate probability by 0.0354 percentage points. A 20% increase in the declared butter SKU moved its exact-rest addition probability from 0.000879 to 0.000837. These small changes are model scenarios, not evidence that individual shoppers switch.
+
+The subsequent same-product, same-store research audit supersedes the 32-event comparison
+as a price-learnability diagnostic. A response fitted only on training weeks retained a
+negative association on 1,332 held-out test events and improved squared error by 3.0%.
+For 32 products with at least five events in every split, training-to-test slope
+correlation was 0.329 but its product-bootstrap interval included zero. The fitted model
+coefficient correlation also changed sign across periods. The real panel therefore
+supports pooling; it does not yet support confident product-specific effects.
+See [REAL_PRICE_EVIDENCE_RESEARCH.md](REAL_PRICE_EVIDENCE_RESEARCH.md).
 
 The independent 128-particle SMC and deterministic quadrature agreed closely on stopping (mean absolute difference 3.97e-06). Expected remaining size was noisier under SMC (mean absolute difference 0.534 items; maximum 2.264). A high bridge ESS establishes stable importance weights; it does not by itself guarantee that 128 draws precisely estimate every downstream moment.
 

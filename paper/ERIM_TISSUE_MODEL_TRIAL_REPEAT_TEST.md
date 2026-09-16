@@ -92,3 +92,9 @@ Outputs are in `artifacts/erim_tissue_prediction_test_v3/`:
 Tests are in `tests/test_erim_tissue_prediction_test_v3.py`. They check that λ = 0 matches
 the re-test likelihood, that the history indicator is strictly lagged, and that a positive
 λ raises simulated repeat purchasing.
+
+## Transport follow-up
+
+Borrowing coupon delivery from the other arm predicts arm A's lift but not arm B's. B's lift
+came mostly through non-redemption purchasing. See
+[ERIM_TISSUE_TRANSPORT_TEST.md](ERIM_TISSUE_TRANSPORT_TEST.md).

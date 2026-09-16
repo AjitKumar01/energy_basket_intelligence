@@ -142,3 +142,8 @@ Outputs are in `artifacts/erim_tissue_prediction_test_v2/`:
 Tests are in `tests/test_erim_tissue_prediction_test_v2.py`. They cover availability
 mixing, weeks since launch, the coupon alternative against explicit enumeration, and
 zero-value coupons having no effect.
+
+## Trial-and-repeat follow-up
+
+Adding purchase-history dependence did not change the verdict: arm B's predicted lift stayed
+at +0.02. See [ERIM_TISSUE_MODEL_TRIAL_REPEAT_TEST.md](ERIM_TISSUE_MODEL_TRIAL_REPEAT_TEST.md).

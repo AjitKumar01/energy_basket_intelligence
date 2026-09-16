@@ -92,3 +92,9 @@ causal effects.
 - Full run: `artifacts/erim_retail_price_refit/full/` (console `04_full_pipeline.console.log`)
 - Comparison: `artifacts/erim_retail_price_refit/comparison/run_comparison.json` and
   `price_ablation.json`
+
+## Randomized follow-up
+
+The only randomized price-type evidence in the ERIM archives, a household-level Cottonelle
+coupon experiment, is analysed in
+[ERIM_RANDOMIZED_COUPON_EXPERIMENT.md](ERIM_RANDOMIZED_COUPON_EXPERIMENT.md).

@@ -290,8 +290,8 @@ def main() -> None:
     if len(supports) != 1:
         raise RuntimeError("checkpoint size supports differ")
     nmax = supports.pop()
-    batcher = Batcher(data, Features(int(data["n_item"]), int(data["n_store"]), 712,
-                                    include_recency=False), nmax, include_recency=False)
+    batcher = Batcher(data, Features(int(data["n_item"]), int(data["n_store"]),
+                                     include_recency=False), nmax, include_recency=False)
     split_codes = {"train": 0, "validation": 1, "test": 2}
     panels = {}; numerical = {}; arrays = {}
     full_observed = {}

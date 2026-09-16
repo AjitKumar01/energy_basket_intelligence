@@ -9,7 +9,6 @@ evaluating the frozen fitted basket law on validation and test events.
 from __future__ import annotations
 
 import argparse
-import json
 import math
 import os
 from pathlib import Path
@@ -36,115 +35,6 @@ def quantiles(values) -> dict:
     x = np.asarray(values, dtype=np.float64)
     x = x[np.isfinite(x)]
     return {str(q): float(np.quantile(x, q)) for q in (0, .1, .25, .5, .75, .9, 1)}
-
-
-def internal_store_map(baskets: pd.DataFrame) -> pd.DataFrame:
-    raw = pd.read_parquet(ROOT / "data/tx.parquet", columns=["BASKET_ID", "STORE_ID"])
-    raw = raw.drop_duplicates("BASKET_ID")
-    mapping = baskets[["BASKET_ID", "store_id"]].drop_duplicates().merge(
-        raw, on="BASKET_ID", how="left", validate="one_to_one")
-    if mapping.STORE_ID.isna().any():
-        raise RuntimeError("a modeled basket has no raw store identifier")
-    pairs = mapping[["store_id", "STORE_ID"]].drop_duplicates()
-    if pairs.groupby("store_id").STORE_ID.nunique().max() != 1:
-        raise RuntimeError("internal store identifiers do not map one-to-one")
-    return pairs
-
-
-def build_outcome_selected_store_events() -> tuple[pd.DataFrame, dict]:
-    baskets = pd.read_parquet(
-        ROOT / "basket_input/baskets.parquet",
-        columns=["BASKET_ID", "WEEK_NO", "item_id", "store_id"])
-    items = pd.read_parquet(
-        ROOT / "basket_input/items.parquet",
-        columns=["PRODUCT_ID", "item_id", "n_train_lines"])
-    stores = internal_store_map(baskets)
-    prices = pd.read_parquet(ROOT / "data/price_store_week.parquet")
-    prices = prices.merge(items, on="PRODUCT_ID", how="inner", validate="many_to_one")
-    prices = prices.merge(stores, on="STORE_ID", how="inner", validate="many_to_one")
-
-    trips = baskets[["BASKET_ID", "store_id", "WEEK_NO"]].drop_duplicates()
-    denominators = trips.groupby(["store_id", "WEEK_NO"]).size().rename("trips").reset_index()
-    purchases = (baskets.groupby(["store_id", "item_id", "WEEK_NO"])
-                 .BASKET_ID.nunique().rename("purchases").reset_index())
-    prices = prices.merge(
-        denominators, on=["store_id", "WEEK_NO"], how="inner", validate="many_to_one")
-    prices = prices.merge(
-        purchases, on=["store_id", "item_id", "WEEK_NO"], how="left",
-        validate="one_to_one")
-    prices["purchases"] = prices.purchases.fillna(0).astype(np.int64)
-    prices = prices.sort_values(["store_id", "item_id", "WEEK_NO"], kind="stable")
-    grouped = prices.groupby(["store_id", "item_id"], sort=False)
-    for column in ("WEEK_NO", "price", "base_price", "n_tx", "purchases", "trips"):
-        prices[f"previous_{column}"] = grouped[column].shift()
-    prices["week_gap"] = prices.WEEK_NO - prices.previous_WEEK_NO
-    prices["log_price_change"] = np.log(prices.price) - np.log(prices.previous_price)
-    prices["log_base_price_change"] = (
-        np.log(prices.base_price) - np.log(prices.previous_base_price))
-    prices["promotion_depth"] = 1.0 - prices.price / prices.base_price
-    prices["previous_promotion_depth"] = (
-        1.0 - prices.previous_price / prices.previous_base_price)
-    prices["promotion_depth_change"] = (
-        prices.promotion_depth - prices.previous_promotion_depth)
-    events = prices[
-        (prices.week_gap == 1)
-        & (prices.log_price_change.abs() >= math.log(1.01))
-        & (prices.previous_trips > 0)
-    ].copy()
-    events["split"] = np.where(
-        events.WEEK_NO >= 91, "test",
-        np.where(events.WEEK_NO >= 83, "validation", "train"))
-    events["observed_before_incidence"] = events.previous_purchases / events.previous_trips
-    events["observed_after_incidence"] = events.purchases / events.trips
-    events["observed_response"] = (
-        events.observed_after_incidence - events.observed_before_incidence)
-    n_stores = int(json.loads((ROOT / "basket_input/meta.json").read_text())["n_stores"])
-    with np.load(ROOT / "basket_input/promo.npz") as promotion:
-        keys = promotion["keys"]
-
-        def lookup(values, week):
-            query = ((events.item_id.to_numpy(np.int64) * n_stores
-                      + events.store_id.to_numpy(np.int64)) * 128
-                     + week.to_numpy(np.int64))
-            position = np.searchsorted(keys, query)
-            safe = np.minimum(position, len(keys) - 1)
-            found = (position < len(keys)) & (keys[safe] == query)
-            result = np.zeros(len(events), dtype=values.dtype)
-            result[found] = values[position[found]]
-            return result
-
-        for name, values in (("display", promotion["disp"]),
-                             ("mailer", promotion["mail"])):
-            events[name] = lookup(values, events.WEEK_NO)
-            events[f"previous_{name}"] = lookup(values, events.previous_WEEK_NO)
-            events[f"{name}_changed"] = events[name] != events[f"previous_{name}"]
-    support = (events[events.split == "train"].groupby("item_id").log_price_change
-               .agg(training_change_low="min", training_change_high="max",
-                    training_store_events="size"))
-    events = events.join(support, on="item_id")
-    report = {
-        "rows": int(len(events)),
-        "products": int(events.item_id.nunique()),
-        "stores": int(events.store_id.nunique()),
-        "counts_by_split": {
-            str(k): int(v) for k, v in events.split.value_counts().items()},
-        "marketing_change_fraction": {
-            split: {
-                "display": float(frame.display_changed.mean()),
-                "mailer": float(frame.mailer_changed.mean()),
-            }
-            for split, frame in events.groupby("split")
-        },
-        "purchases_per_event_side": {
-            "previous": quantiles(events.previous_purchases),
-            "current": quantiles(events.purchases),
-        },
-        "store_trips_per_event_side": {
-            "previous": quantiles(events.previous_trips),
-            "current": quantiles(events.trips),
-        },
-    }
-    return events, report
 
 
 def build_store_events() -> tuple[pd.DataFrame, dict]:
@@ -388,8 +278,7 @@ def evaluate_fitted_model(events: pd.DataFrame, mask: pd.Series, run_dir: Path,
         for parameter in model.parameters():
             parameter.requires_grad_(False)
     batcher = Batcher(
-        data, Features(int(data["n_item"]), int(data["n_store"]), 712,
-                       include_recency=False),
+        data, Features(int(data["n_item"]), int(data["n_store"]), include_recency=False),
         int(meta["nmax"]), include_recency=False)
     beta = pooled_slope(events[mask & (events.split == "train")])
     rows = []

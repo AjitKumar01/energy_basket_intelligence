@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Finite-horizon, budget-constrained promotion MDP for three customer segments.
+"""Finite-horizon, budget-constrained promotion MDP over the selected customer segments.
 
 The retailer observes a fixed promotion horizon and remaining markdown budget.  Each day
 it may run no promotion or target one segment with a discount on a small product bundle.
@@ -16,9 +16,12 @@ Budget cost
     expected markdown paid on promoted products that the model says will be purchased
 
 Reward
-    incremental basket value at undiscounted shelf prices.  Actual post-discount sales
-    are also reported, but profit is not identified because wholesale costs and store-
-    visit probabilities are absent from the data/model contract.
+    by default, incremental post-discount sales: what the retailer actually collects,
+    so a promotion must pay for its own markdown.  ``--objective list_value`` restores
+    incremental value at undiscounted shelf prices, which treats markdown as free and
+    can select promotions that lower sales.  Both are always reported.  Profit is not
+    identified because wholesale costs and store-visit probabilities are absent from
+    the data/model contract.
 """
 from __future__ import annotations
 
@@ -42,14 +45,31 @@ from data import build
 from features import Features
 from fit import Batcher
 from interaction_particles import rao_blackwell_particle_statistics
-from pipeline_support import particle_delta
+from pipeline_support import (TAIL_THRESHOLD_SELECTION, particle_delta,
+                              size_tail_threshold)
 from price_response import changed_price_context
 from tempered_ais import annealed_smc_logz
-from provenance import file_sha256, strict_json_dumps
+from provenance import file_sha256, model_data_root, strict_json_dumps
 from uncertainty import paired_score_summary
 
 
 torch.set_default_dtype(torch.float64)
+DATA_ROOT = model_data_root(ROOT)
+OBJECTIVES = {
+    "post_discount_sales": "incremental post-discount sales, conditional on a shopping trip",
+    "list_value": ("incremental basket value at undiscounted shelf prices, conditional "
+                   "on a shopping trip; markdown is not charged against the reward"),
+}
+
+
+def objective_reward(row: dict, objective: str) -> tuple[float, float]:
+    """Per-trip (mean, simultaneous lower bound) of the declared policy objective."""
+    if objective == "post_discount_sales":
+        return (row["incremental_post_discount_sales"],
+                row["incremental_post_discount_sales_lcb95"])
+    if objective == "list_value":
+        return row["incremental_list_value"], row["incremental_list_value_lcb95"]
+    raise ValueError(f"unknown objective {objective!r}")
 
 
 def representative_context_panel(data, labels: np.ndarray, segment: int,
@@ -63,12 +83,6 @@ def representative_context_panel(data, labels: np.ndarray, segment: int,
         & (labels[data["trip_user"]] == segment))
     rng = np.random.default_rng(seed + 1009 * segment + 100003 * int(split))
     return eligible[rng.permutation(len(eligible))[:min(count, len(eligible))]]
-
-
-def balanced_context_panel(data, labels: np.ndarray, segment: int,
-                           count: int, seed: int, nmax: int) -> np.ndarray:
-    """Backward-compatible name; now returns a representative test-trip panel."""
-    return representative_context_panel(data, labels, segment, count, seed, nmax, 2)
 
 
 def training_product_bundles(data, labels: np.ndarray, metadata: pd.DataFrame,
@@ -135,12 +149,14 @@ def solve_budget_mdp(actions: list[dict], horizon: int, budget: float,
             return {"feasible":False,"horizon_days":horizon,"budget":0.0,
                     "budget_bins":bins,"minimum_utilization":utilization_floor,
                     "reason":"no zero-cost action is available"}
-        action=max(free,key=lambda row:float(row["daily_incremental_list_value_lcb95"]))
+        action=max(free,key=lambda row:float(row["daily_reward_lcb95"]))
         count={action["action_id"]:horizon}
         return {"feasible":True,"horizon_days":horizon,"budget":0.0,
                 "budget_bins":bins,"budget_bin_width":0.0,
                 "minimum_utilization":0.0,"quantized_budget_utilization":0.0,
                 "expected_markdown_spend":0.0,"expected_spend_fraction_of_budget":0.0,
+                "total_robust_reward_lcb95":horizon*float(action["daily_reward_lcb95"]),
+                "total_reward_mean":horizon*float(action["daily_reward_mean"]),
                 "total_robust_incremental_list_value_lcb95":horizon*float(action["daily_incremental_list_value_lcb95"]),
                 "total_incremental_list_value_mean":horizon*float(action["daily_incremental_list_value_mean"]),
                 "total_incremental_post_discount_sales":horizon*float(action["daily_incremental_post_discount_sales"]),
@@ -150,6 +166,8 @@ def solve_budget_mdp(actions: list[dict], horizon: int, budget: float,
                     "action_id":action["action_id"],"segment":action.get("segment"),
                     "bundle":action.get("bundle"),"discount":action.get("discount",0.0),
                     "expected_markdown_spend":0.0,
+                    "reward_mean":action["daily_reward_mean"],
+                    "reward_lcb95":action["daily_reward_lcb95"],
                     "incremental_list_value_mean":action["daily_incremental_list_value_mean"],
                     "incremental_list_value_lcb95":action["daily_incremental_list_value_lcb95"],
                     "incremental_post_discount_sales":action["daily_incremental_post_discount_sales"]}
@@ -180,7 +198,7 @@ def solve_budget_mdp(actions: list[dict], horizon: int, budget: float,
                 if cost <= remaining_budget and np.isfinite(
                         previous[remaining_budget - cost]):
                     candidates.append((
-                        float(action["daily_incremental_list_value_lcb95"])
+                        float(action["daily_reward_lcb95"])
                         + previous[remaining_budget - cost], action_index))
             if candidates:
                 best, action_index = max(candidates, key=lambda pair: pair[0])
@@ -196,6 +214,7 @@ def solve_budget_mdp(actions: list[dict], horizon: int, budget: float,
     remaining = bins
     trajectory, counts = [], Counter()
     actual_spend = robust_reward = mean_reward = net_sales = size_lift = 0.0
+    robust_list_value = mean_list_value = 0.0
     for remaining_days in range(horizon, 0, -1):
         action_index = int(policy[remaining_days, remaining])
         action = actions[action_index]
@@ -208,6 +227,8 @@ def solve_budget_mdp(actions: list[dict], horizon: int, budget: float,
             "bundle": action.get("bundle"),
             "discount": action.get("discount", 0.0),
             "expected_markdown_spend": action["daily_expected_markdown_spend"],
+            "reward_mean": action["daily_reward_mean"],
+            "reward_lcb95": action["daily_reward_lcb95"],
             "incremental_list_value_mean": (
                 action["daily_incremental_list_value_mean"]),
             "incremental_list_value_lcb95": (
@@ -216,8 +237,10 @@ def solve_budget_mdp(actions: list[dict], horizon: int, budget: float,
                 action["daily_incremental_post_discount_sales"]),
         })
         actual_spend += float(action["daily_expected_markdown_spend"])
-        robust_reward += float(action["daily_incremental_list_value_lcb95"])
-        mean_reward += float(action["daily_incremental_list_value_mean"])
+        robust_reward += float(action["daily_reward_lcb95"])
+        mean_reward += float(action["daily_reward_mean"])
+        robust_list_value += float(action["daily_incremental_list_value_lcb95"])
+        mean_list_value += float(action["daily_incremental_list_value_mean"])
         net_sales += float(action["daily_incremental_post_discount_sales"])
         size_lift += float(action["daily_incremental_distinct_products"])
         remaining -= cost_bins[action_index]
@@ -231,8 +254,10 @@ def solve_budget_mdp(actions: list[dict], horizon: int, budget: float,
         "quantized_budget_utilization": 1.0 - remaining / bins,
         "expected_markdown_spend": actual_spend,
         "expected_spend_fraction_of_budget": actual_spend / budget,
-        "total_robust_incremental_list_value_lcb95": robust_reward,
-        "total_incremental_list_value_mean": mean_reward,
+        "total_robust_reward_lcb95": robust_reward,
+        "total_reward_mean": mean_reward,
+        "total_robust_incremental_list_value_lcb95": robust_list_value,
+        "total_incremental_list_value_mean": mean_list_value,
         "total_incremental_post_discount_sales": net_sales,
         "total_incremental_distinct_products": size_lift,
         "action_day_counts": dict(counts),
@@ -247,7 +272,7 @@ def evaluate_segment_actions(model, batcher, features, data, trips: np.ndarray,
     schedule_axis = torch.linspace(0.0, 1.0, args.levels)
     schedule = 1.0 - (1.0 - schedule_axis).pow(args.power)
     absolute_log_price = torch.from_numpy(
-        np.load(ROOT / "basket_input" / "log_price.npy").astype(np.float64))
+        np.load(DATA_ROOT / "basket_input" / "log_price.npy").astype(np.float64))
     action_specs = [
         {"bundle": bundle_index, "discount": discount,
          "products": bundle["products"]}
@@ -257,6 +282,7 @@ def evaluate_segment_actions(model, batcher, features, data, trips: np.ndarray,
         "size", "list_value", "actual_sales", "markdown", "bundle_incidence",
         "tail", "ess")} for _ in action_specs]
     baseline = {key: [] for key in ("size", "list_value", "tail")}
+    tail_start = int(args.tail_threshold) - 1
     smc_seconds, smc_ess = 0.0, []
 
     for start in range(0, len(trips), args.context_chunk):
@@ -285,7 +311,7 @@ def evaluate_segment_actions(model, batcher, features, data, trips: np.ndarray,
             0, ix.item_trip, factual_incidence * slot_price)
         baseline["size"].extend(factual_size.tolist())
         baseline["list_value"].extend(factual_value.tolist())
-        baseline["tail"].extend(factual_stats.size_probability[:, 59:].sum(1).tolist())
+        baseline["tail"].extend(factual_stats.size_probability[:, tail_start:].sum(1).tolist())
 
         for action_index, action in enumerate(action_specs):
             products = torch.as_tensor(action["products"], dtype=torch.long)
@@ -317,7 +343,7 @@ def evaluate_segment_actions(model, batcher, features, data, trips: np.ndarray,
             target["markdown"].extend(markdown.tolist())
             target["bundle_incidence"].extend(bundle_incidence.tolist())
             target["tail"].extend(
-                stats.size_probability[:, 59:].sum(1).tolist())
+                stats.size_probability[:, tail_start:].sum(1).tolist())
             target["ess"].extend(ess.tolist())
         model.ctx = ctx
         print(f"[promotion-mdp] segment={segment} contexts="
@@ -357,10 +383,13 @@ def evaluate_segment_actions(model, batcher, features, data, trips: np.ndarray,
             "incremental_post_discount_sales": float(
                 incremental_post_discount.mean()),
             "incremental_post_discount_sales_se": sales_summary["standard_error"],
+            "incremental_post_discount_sales_lcb95": float(
+                incremental_post_discount.mean()
+                - args.simultaneous_critical * sales_summary["standard_error"]),
             "markdown_spend": float(markdown.mean()),
             "promoted_bundle_incidence": float(
                 np.mean(values["bundle_incidence"])),
-            "tail_probability_ge_60_max": float(np.max(values["tail"])),
+            "tail_probability_ge_threshold_max": float(np.max(values["tail"])),
             "reweight_ess_min": float(np.min(values["ess"])),
             "_per_context": {
                 "incremental_size": incremental_size,
@@ -377,7 +406,7 @@ def evaluate_segment_actions(model, batcher, features, data, trips: np.ndarray,
         "smc_ess_min": float(np.min(smc_ess)),
         "baseline_expected_size": float(baseline_size.mean()),
         "baseline_list_value": float(baseline_value.mean()),
-        "baseline_tail_probability_ge_60_max": float(np.max(baseline["tail"])),
+        "baseline_tail_probability_ge_threshold_max": float(np.max(baseline["tail"])),
         "actions": rows,
     }
 
@@ -463,6 +492,11 @@ def main() -> None:
     parser.add_argument("--budget-bins", type=int, default=4000)
     parser.add_argument("--minimum-budget-utilization", type=float, default=0.0)
     parser.add_argument("--maximum-tail-probability", type=float, default=0.5)
+    parser.add_argument("--objective", choices=tuple(OBJECTIVES),
+                        default="post_discount_sales",
+                        help="policy reward; both are always reported")
+    parser.add_argument("--tail-threshold", type=int,
+                        help="first basket size of the unsafe tail; default from training")
     parser.add_argument("--minimum-reweight-ess", type=float, default=0.2)
     parser.add_argument("--output", type=Path,
                         default=Path("reports/segment_promotion_mdp.json"))
@@ -475,9 +509,6 @@ def main() -> None:
         raise ValueError("budget fractions must lie in (0,1]")
     if not 0.0 <= args.minimum_budget_utilization <= 1.0:
         raise ValueError("minimum budget utilization must lie in [0,1]")
-    action_family = 3 * args.bundles_per_segment * len(args.discounts)
-    args.simultaneous_critical = float(norm.ppf(1.0 - .05 / (2 * action_family)))
-
     torch.set_num_threads(args.threads)
     checkpoint = args.checkpoint if args.checkpoint.is_absolute() \
         else ROOT / args.checkpoint
@@ -494,14 +525,28 @@ def main() -> None:
     if len(labels) != int(data["n_user"]):
         raise RuntimeError("segment assignment count does not match household count")
     segment_report = json.loads(segment_report_path.read_text())
-    if int(segment_report["chosen_segments"]) != 3:
-        raise RuntimeError("promotion MDP requires the locked three-segment solution")
+    n_segments = int(segment_report["chosen_segments"])
     segment_names = {int(row["segment"]): row["label"]
                      for row in segment_report["segments"]}
-    metadata = pd.read_parquet(ROOT / "basket_input" / "items.parquet") \
-        .sort_values("item_id")
-    features = Features(int(data["n_item"]), int(data["n_store"]), 712,
-                        include_recency=False)
+    if (n_segments < 1 or sorted(segment_names) != list(range(n_segments))
+            or set(np.unique(labels).tolist()) != set(range(n_segments))):
+        raise RuntimeError(
+            "segment assignments do not match the selected segmentation report")
+    action_family = n_segments * args.bundles_per_segment * len(args.discounts)
+    args.simultaneous_critical = float(norm.ppf(1.0 - .05 / (2 * action_family)))
+    tail_threshold_selection = (
+        "explicit_command_line" if args.tail_threshold is not None
+        else TAIL_THRESHOLD_SELECTION)
+    args.tail_threshold = size_tail_threshold(
+        data, int(meta["nmax"]), args.tail_threshold)
+    metadata = pd.read_parquet(DATA_ROOT / "basket_input" / "items.parquet") \
+        .sort_values("item_id").reset_index(drop=True)
+    expected_items = np.arange(int(data["n_item"]), dtype=np.int64)
+    if (len(metadata) != len(expected_items)
+            or not np.array_equal(metadata.item_id.to_numpy(np.int64), expected_items)):
+        raise RuntimeError(
+            "product metadata is not the contiguous catalogue for the active model data")
+    features = Features(int(data["n_item"]), int(data["n_store"]), include_recency=False)
     batcher = Batcher(data, features, int(meta["nmax"]), include_recency=False)
 
     train = np.flatnonzero(
@@ -509,11 +554,11 @@ def main() -> None:
     training_days = max(1, np.unique(data["trip_day"][train]).size)
     total_trips_per_day = len(train) / training_days
     train_segment_count = np.bincount(
-        labels[data["trip_user"][train]], minlength=3)
+        labels[data["trip_user"][train]], minlength=n_segments)
     traffic_share = train_segment_count / train_segment_count.sum()
 
     selection_segments, evaluation_segments = [], []
-    for segment in range(3):
+    for segment in range(n_segments):
         bundles = training_product_bundles(
             data, labels, metadata, segment,
             args.bundles_per_segment, args.products_per_bundle)
@@ -556,6 +601,7 @@ def main() -> None:
     actions = [{
         "action_id": "no_promotion", "segment": None, "bundle": None,
         "discount": 0.0, "daily_expected_markdown_spend": 0.0,
+        "daily_reward_mean": 0.0, "daily_reward_lcb95": 0.0,
         "daily_incremental_list_value_mean": 0.0,
         "daily_incremental_list_value_lcb95": 0.0,
         "daily_incremental_post_discount_sales": 0.0,
@@ -564,11 +610,12 @@ def main() -> None:
     for segment_row in selection_segments:
         scale = segment_row["expected_trips_per_day"]
         for row in segment_row["actions"]:
-            if (row["tail_probability_ge_60_max"] >= args.maximum_tail_probability
+            if (row["tail_probability_ge_threshold_max"] >= args.maximum_tail_probability
                     or row["reweight_ess_min"] < args.minimum_reweight_ess):
                 continue
             bundle = int(row["bundle"])
             discount = float(row["discount"])
+            reward_mean, reward_lcb95 = objective_reward(row, args.objective)
             actions.append({
                 "action_id": f"segment_{segment_row['segment']}_bundle_{bundle}_"
                              f"discount_{int(round(100 * discount))}",
@@ -580,6 +627,8 @@ def main() -> None:
                 "products": segment_row["bundles"][bundle]["products"],
                 "discount": discount,
                 "daily_expected_markdown_spend": row["markdown_spend"] * scale,
+                "daily_reward_mean": reward_mean * scale,
+                "daily_reward_lcb95": reward_lcb95 * scale,
                 "daily_incremental_list_value_mean": (
                     row["incremental_list_value"] * scale),
                 "daily_incremental_list_value_lcb95": (
@@ -588,7 +637,7 @@ def main() -> None:
                     row["incremental_post_discount_sales"] * scale),
                 "daily_incremental_distinct_products": (
                     row["incremental_distinct_products"] * scale),
-                "tail_probability_ge_60_max": row["tail_probability_ge_60_max"],
+                "tail_probability_ge_threshold_max": row["tail_probability_ge_threshold_max"],
                 "reweight_ess_min": row["reweight_ess_min"],
             })
     maximum_daily_spend = max(
@@ -610,6 +659,7 @@ def main() -> None:
     frozen_policy = {
         "checkpoint_sha256": file_sha256(checkpoint),
         "data_fingerprint_sha256": blob["data_fingerprint_sha256"],
+        "objective": args.objective,
         "selection_split": "validation", "evaluation_split": "test",
         "selection_context_sampling": "simple random trips within segment",
         "action_family": action_family,
@@ -649,12 +699,15 @@ def main() -> None:
         "horizon_days": args.horizon_days,
         "transition": (
             "one day elapses and expected markdown spend is deducted from the budget"),
-        "reward": (
-            "incremental basket value at undiscounted shelf prices, conditional on a "
-            "shopping trip"),
+        "objective": args.objective,
+        "reward": OBJECTIVES[args.objective],
         "budget_cost": (
             "discount times shelf price times model-implied promoted-product incidence"),
         "minimum_budget_utilization": args.minimum_budget_utilization,
+        "segments_selected": n_segments,
+        "tail_threshold": args.tail_threshold,
+        "tail_threshold_selection": tail_threshold_selection,
+        "maximum_tail_probability": args.maximum_tail_probability,
         "selection_split": "validation", "evaluation_split": "test",
         "context_sampling": "simple random trips within segment; trip-weighted estimand",
         "simultaneous_critical_value": args.simultaneous_critical,
@@ -692,6 +745,7 @@ def main() -> None:
             key: scenario.get(key) for key in (
                 "budget_fraction_of_maximum_action_spend", "budget",
                 "feasible", "expected_spend_fraction_of_budget",
+                "total_robust_reward_lcb95", "total_reward_mean",
                 "total_robust_incremental_list_value_lcb95",
                 "total_incremental_list_value_mean",
                 "total_incremental_post_discount_sales", "action_day_counts")

@@ -32,7 +32,8 @@ from audit_population_size import resumable_screen, screen_signature
 from data import build
 from features import Features
 from fit import Batcher
-from pipeline_support import supported_trips
+from pipeline_support import (TAIL_THRESHOLD_SELECTION, size_tail_threshold,
+                              supported_trips)
 from provenance import file_sha256, strict_json_dumps
 
 
@@ -144,7 +145,8 @@ def household_cluster_se(values: np.ndarray, household: np.ndarray) -> float:
 
 def cap_households(log_probability: np.ndarray, household: np.ndarray,
                    kappa: np.ndarray, n_household: int,
-                   screen_tail_cap: float) -> tuple[np.ndarray, np.ndarray]:
+                   screen_tail_cap: float,
+                   tail_threshold: int) -> tuple[np.ndarray, np.ndarray]:
     """Project onto kappa_h <= u_h, where the worst screen tail equals the cap."""
     size = np.arange(1, log_probability.shape[1] + 1, dtype=np.float64)
     result = kappa.copy()
@@ -157,7 +159,7 @@ def cap_households(log_probability: np.ndarray, household: np.ndarray,
         def maximum_tail(value: float) -> float:
             tilted = log_probability[index] + value * size
             tilted -= logsumexp(tilted, axis=1, keepdims=True)
-            return float(np.exp(tilted)[:, 59:].sum(1).max())
+            return float(np.exp(tilted)[:, tail_threshold - 1:].sum(1).max())
 
         if maximum_tail(result[h]) <= screen_tail_cap:
             continue
@@ -210,6 +212,8 @@ def main() -> None:
     parser.add_argument("--rank", type=int, required=True)
     parser.add_argument("--screen-level", type=int, required=True)
     parser.add_argument("--screen-tail-cap", type=float, default=0.35)
+    parser.add_argument("--tail-threshold", type=int,
+                        help="first basket size of the capped tail; default from training")
     parser.add_argument("--ridge-grid", type=float, nargs="+",
                         default=[800, 1600, 2400, 3200, 4800, 6400, 9600])
     parser.add_argument("--minimum-crossfit-gain", type=float, default=0.0)
@@ -244,12 +248,12 @@ def main() -> None:
         raise RuntimeError(
             "checkpoint does not use the identified rank-one household-size coordinate")
     population = supported_trips(data, 0, int(meta["nmax"]))
+    tail_threshold = size_tail_threshold(data, int(meta["nmax"]), args.tail_threshold)
     if args.contexts < 0:
         raise ValueError("contexts must be nonnegative")
     if args.contexts:
         population = population[:min(args.contexts, len(population))]
-    features = Features(int(data["n_item"]), int(data["n_store"]), 712,
-                        include_recency=False)
+    features = Features(int(data["n_item"]), int(data["n_store"]), include_recency=False)
     batcher = Batcher(data, features, int(meta["nmax"]), include_recency=False)
     report_path = args.report if args.report.is_absolute() else ROOT / args.report
     report_path.parent.mkdir(parents=True, exist_ok=True)
@@ -315,7 +319,7 @@ def main() -> None:
     # subject to the downstream high-rule likelihood and population certification gates.
     kappa, upper_bound = cap_households(
         base_log_probability, household, kappa, n_household,
-        args.screen_tail_cap)
+        args.screen_tail_cap, tail_threshold)
     safety_projection_applied = bool(np.isfinite(upper_bound).any())
     final_gain = gain(
         base_log_probability, observed, household,
@@ -323,7 +327,7 @@ def main() -> None:
     tilted = normalized_tilt(base_log_probability, kappa, household)
     probability = np.exp(tilted)
     size = np.arange(1, int(meta["nmax"]) + 1, dtype=np.float64)
-    tail = probability[:, 59:].sum(1)
+    tail = probability[:, tail_threshold - 1:].sum(1)
     expected = probability @ size
 
     parent_kappa = model.theta_c()[:, -1].detach().cpu().numpy()
@@ -365,12 +369,16 @@ def main() -> None:
         "full_fit_gain_se": household_cluster_se(final_gain, household),
         "full_fit_gain_se_method": "household_cluster_robust",
         "screen_tail_cap": args.screen_tail_cap,
+        "tail_threshold": tail_threshold,
+        "tail_threshold_selection": (
+            "explicit_command_line" if args.tail_threshold is not None else
+            TAIL_THRESHOLD_SELECTION),
         "capped_households": int(np.isfinite(upper_bound).sum()),
         "kappa_quantiles": np.quantile(
             kappa, [0, .01, .1, .5, .9, .99, 1]).tolist(),
         "expected_size_mean": float(expected.mean()),
-        "tail_rate_ge_60": float(tail.mean()),
-        "maximum_screen_tail_ge_60": float(tail.max()),
+        "tail_rate_ge_threshold": float(tail.mean()),
+        "maximum_screen_tail_ge_threshold": float(tail.max()),
         "contexts_tail_probability_ge_half": int((tail >= .5).sum()),
         "contexts_expected_size_ge_40": int((expected >= 40).sum()),
         "base_screen": provenance,
@@ -409,6 +417,7 @@ def main() -> None:
         "safety_projection_applied": safety_projection_applied,
         "selected_ridge": selected["ridge"] if correction_supported else None,
         "screen_tail_cap": args.screen_tail_cap,
+        "tail_threshold": tail_threshold,
         "mean_gauge_transfer": mean_kappa,
     }
     temporary = Path(str(output) + ".tmp")

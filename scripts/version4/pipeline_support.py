@@ -14,6 +14,22 @@ def supported_trips(data, split: int, nmax: int) -> np.ndarray:
         & (data["trip_nlines"] <= int(nmax)))
 
 
+TAIL_THRESHOLD_SELECTION = "one_above_training_97.5_percentile_clipped_to_model_support"
+
+
+def size_tail_threshold(data, nmax: int, override: int | None = None) -> int:
+    """First basket size of the upper tail, derived from training sizes, not a dataset."""
+    if override is not None:
+        threshold = int(override)
+    else:
+        sizes = np.asarray(data["trip_nlines"])[supported_trips(data, 0, nmax)]
+        threshold = min(int(nmax), max(
+            2, int(np.quantile(sizes, .975, method="higher")) + 1))
+    if not 2 <= threshold <= int(nmax):
+        raise ValueError("tail-threshold must be within 2..nmax")
+    return threshold
+
+
 def smolyak_rule(model, rank: int, level: int):
     if rank == 0:
         # The latent integral is a constant when Phi=0, including a fitted size curve.
@@ -28,7 +44,6 @@ def smolyak_rule(model, rank: int, level: int):
 
 def install_quadrature(model, quadrature) -> None:
     model.quad = quadrature
-    model.quad_a = None
 
 
 def copied_context(context):

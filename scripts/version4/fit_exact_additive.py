@@ -101,6 +101,10 @@ def parse_args():
         dest="supported_price_coefficients", type=Path,
         help=("certified observational coefficient JSON from "
               "fit_supported_price_response.py"))
+    parser.add_argument(
+        "--disable-price-response", action="store_true",
+        help=("fix every price sensitivity to zero when held-out observational price "
+              "evidence is not certified"))
     parser.add_argument("--pool-prod", type=float, default=0.0)
     parser.add_argument("--lam-centre", type=int, default=0)
     parser.add_argument("--lam-sd-max", type=float, default=0.0)
@@ -115,6 +119,22 @@ def atomic_save(path, payload):
     temporary = Path(str(path) + ".tmp")
     torch.save(payload, temporary)
     os.replace(temporary, path)
+
+
+def material_validation_patience(evaluations, minimum_delta):
+    """Count evaluations since validation last improved by the declared amount."""
+    if not evaluations:
+        return 0
+    anchor = float(evaluations[0]["basket_loglik"])
+    since = 0
+    for row in evaluations[1:]:
+        value = float(row["basket_loglik"])
+        if value > anchor + float(minimum_delta):
+            anchor = value
+            since = 0
+        else:
+            since += 1
+    return since
 
 
 def load_model(artifact, data):
@@ -192,7 +212,17 @@ def load_supported_price_sensitivity(path, catalogue_products):
         raise RuntimeError("price coefficient artifact is not certified")
     level = payload.get("level")
     global_sensitivity = float(payload["global_sensitivity"])
-    sensitivity = np.full(int(catalogue_products), global_sensitivity, dtype=np.float64)
+    use_global_fallback = bool(
+        payload.get("unsupported_catalogue_products_use_global_sensitivity", True))
+    sensitivity = np.full(
+        int(catalogue_products), global_sensitivity if use_global_fallback else 0.0,
+        dtype=np.float64)
+    if not use_global_fallback:
+        supported = np.asarray(payload.get("supported_item_ids", []), dtype=np.int64)
+        if (len(supported) != len(np.unique(supported))
+                or (supported < 0).any() or (supported >= catalogue_products).any()):
+            raise RuntimeError("price coefficient artifact has invalid supported item IDs")
+        sensitivity[supported] = global_sensitivity
     estimated_products = 0
     if level == "product":
         rows = payload.get("product_sensitivity", [])
@@ -212,9 +242,16 @@ def load_supported_price_sensitivity(path, catalogue_products):
         "coefficient_sha256": file_sha256(path),
         "estimated_product_deviations": estimated_products,
         "unestimated_products_using_global_sensitivity":
-            int(catalogue_products - estimated_products),
+            int(catalogue_products - estimated_products) if use_global_fallback else 0,
+        "unsupported_products_fixed_to_zero":
+            int(np.sum(sensitivity == 0.0)) if not use_global_fallback else 0,
         "individual_coefficient_interpretation_supported": bool(
             payload.get("individual_coefficient_interpretation_supported", False)),
+        "price_feature_contract": str(
+            payload.get("price_feature_contract", "chain_and_store")),
+        "price_response_estimator": str(
+            payload.get("price_response_estimator",
+                        "matched_store_conditional_binomial_hierarchy_v1")),
     }
 
 
@@ -271,10 +308,11 @@ def main():
     args = parse_args()
     price_provenance = None
     if args.supported_price_coefficients is not None:
-        if args.global_price_sensitivity > 0:
+        if args.global_price_sensitivity > 0 or args.disable_price_response:
             raise SystemExit(
-                "use either --supported-price-coefficients or "
-                "--global-price-sensitivity, not both")
+                "use only one price-response configuration")
+    if args.disable_price_response and args.global_price_sensitivity > 0:
+        raise SystemExit("use only one price-response configuration")
     if args.global_price_sensitivity < 0:
         raise SystemExit("--global-price-sensitivity must be nonnegative")
     if ((args.global_price_sensitivity > 0
@@ -305,6 +343,9 @@ def main():
         supported_price_sensitivity = np.full(
             model.J, args.global_price_sensitivity, dtype=np.float64)
         supported_price_level = "global"
+    elif args.disable_price_response:
+        supported_price_sensitivity = np.zeros(model.J, dtype=np.float64)
+        supported_price_level = "disabled"
     supported_price_audit = (
         configure_supported_price(
             model, supported_price_sensitivity, supported_price_level)
@@ -313,8 +354,15 @@ def main():
         supported_price_audit.update(price_provenance)
     if int(meta["active_rank"]) != 8:
         raise RuntimeError("expected the certified rank-8 parent artifact")
-    features = Features(int(data["n_item"]), int(data["n_store"]), 712,
-                        include_recency=not bool(meta.get("no_rec", False)))
+    price_feature_contract = (
+        price_provenance.get("price_feature_contract", "chain_and_store")
+        if price_provenance is not None else "chain_and_store")
+    if price_feature_contract not in {"chain_and_store", "chain_product_week_only"}:
+        raise RuntimeError(f"unknown price feature contract {price_feature_contract!r}")
+    features = Features(
+        int(data["n_item"]), int(data["n_store"]),
+        include_recency=not bool(meta.get("no_rec", False)),
+        include_store_price=price_feature_contract == "chain_and_store")
     batcher = Batcher(data, features, int(meta["nmax"]),
                       include_recency=not bool(meta.get("no_rec", False)))
     train = supported_trips(data, 0, int(meta["nmax"]))
@@ -433,7 +481,11 @@ def main():
         scheduler = resumed.get("scheduler", {})
         plateau_anchor = float(scheduler.get("plateau_anchor", best_score))
         plateau_evaluations = int(scheduler.get("plateau_evaluations", 0))
-        evaluations_since_best = int(scheduler.get("evaluations_since_best", 0))
+        if scheduler.get("convergence_patience_basis") == "material_validation_gain":
+            evaluations_since_best = int(scheduler.get("evaluations_since_best", 0))
+        else:
+            evaluations_since_best = material_validation_patience(
+                evaluations, args.validation_min_delta)
         saved = next(x for x in reversed(evaluations)
                      if int(x["iter"]) == start_iteration)
         tolerance = 5e-10
@@ -447,6 +499,12 @@ def main():
             "format": 2,
             "estimator": "exact_version4_no_gram_dynamic_program",
             "price_response_estimator": (
+                "fixed_zero_after_failed_heldout_support"
+                if supported_price_level == "disabled" else
+                price_provenance.get(
+                    "price_response_estimator",
+                    "matched_store_conditional_binomial_hierarchy_v1")
+                if price_provenance is not None else
                 "matched_store_conditional_binomial_hierarchy_v1"
                 if supported_price_audit is not None else "exact_dp_fourth_order"),
             "supported_price_component": supported_price_audit,
@@ -477,6 +535,7 @@ def main():
                 "plateau_anchor": plateau_anchor,
                 "plateau_evaluations": plateau_evaluations,
                 "evaluations_since_best": evaluations_since_best,
+                "convergence_patience_basis": "material_validation_gain",
                 "learning_rate": float(optimizer.param_groups[0]["lr"]),
             },
             "evaluations": evaluations,
@@ -626,16 +685,15 @@ def main():
             if numerical_improved:
                 best_score = current["basket_loglik"]
                 best_iteration = iteration
-                evaluations_since_best = 0
                 atomic_save(best_path, payload(iteration))
                 print(f"[exact-additive] new best checkpoint at {iteration}", flush=True)
-            else:
-                evaluations_since_best += 1
             if material_improved:
                 plateau_anchor = current["basket_loglik"]
                 plateau_evaluations = 0
+                evaluations_since_best = 0
             else:
                 plateau_evaluations += 1
+                evaluations_since_best += 1
             if (args.lr_patience > 0
                     and plateau_evaluations >= args.lr_patience):
                 old_lr = float(optimizer.param_groups[0]["lr"])
@@ -665,7 +723,8 @@ def main():
                     and evaluations_since_best >= args.convergence_patience):
                 converged = True
                 print(f"[exact-additive] convergence declared at {iteration}: "
-                      f"{evaluations_since_best} evaluations since best at minimum LR",
+                      f"{evaluations_since_best} evaluations since a material "
+                      "validation gain at minimum LR",
                       flush=True)
                 break
     outcome = "converged" if converged else "reached safety ceiling"

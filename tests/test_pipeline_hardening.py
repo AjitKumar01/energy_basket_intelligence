@@ -119,6 +119,35 @@ def test_model_data_fingerprint_detects_changed_model_input(tmp_path):
         load_data_fingerprint(tmp_path, verify_files=True)
 
 
+def test_fingerprint_verifies_recorded_optional_panels_only(tmp_path, monkeypatch):
+    monkeypatch.delenv("ENERGY_MODEL_DATA_ROOT", raising=False)
+    basket = tmp_path / "basket_input"
+    data = tmp_path / "data"
+    basket.mkdir()
+    data.mkdir()
+    (basket / "preprocessing_manifest.json").write_text(json.dumps({"cohort": {}}))
+    (basket / "items_affinity.parquet").write_bytes(b"partition")
+    (basket / "affinity_manifest.json").write_text(json.dumps({
+        "partition_sha256": file_sha256(basket / "items_affinity.parquet"),
+    }))
+    (basket / "meta.json").write_text(json.dumps({"price_basis": "shelf"}))
+    (data / "build_meta.json").write_text(json.dumps({"price_basis": "shelf"}))
+    (basket / "v3_index_affinity.npz").write_bytes(b"ragged-index")
+    first = build_data_fingerprint(tmp_path)
+    assert "price_evidence_panel" not in first["files"]
+
+    # An optional panel that appears after the identity was written does not invalidate it.
+    (data / "price_week.parquet").write_bytes(b"later-panel")
+    assert load_data_fingerprint(tmp_path, verify_files=True) == first
+
+    # A recorded optional panel is still re-hashed.
+    second = build_data_fingerprint(tmp_path)
+    assert "price_evidence_panel" in second["files"]
+    (data / "price_week.parquet").write_bytes(b"tampered-panel")
+    with pytest.raises(ValueError, match="model-facing files differ"):
+        load_data_fingerprint(tmp_path, verify_files=True)
+
+
 def test_failed_rank_attempt_never_reuses_previous_basis(tmp_path, monkeypatch):
     import test_pipeline_resurrection as resurrection
 
@@ -145,3 +174,21 @@ def test_failed_rank_attempt_never_reuses_previous_basis(tmp_path, monkeypatch):
         pipeline.rank_selection(FailedDriver(), parent, 100)
     assert old_basis.read_bytes() == b"old-basis"
     assert old_report.read_text() == '{"largest_stable_rank": 8}'
+
+
+def test_failed_price_evidence_verdict_fits_zero_price_instead_of_aborting(tmp_path):
+    import test_pipeline_resurrection as resurrection
+
+    pipeline = resurrection.pipeline
+    report = tmp_path / "report.json"
+    coefficients = tmp_path / "coefficients.json"
+    report.write_text(json.dumps({"passed": False}))
+    assert pipeline.price_configuration_from_evidence(2, report, coefficients) == (
+        "--disable-price-response",)
+    report.write_text(json.dumps({"passed": True}))
+    assert pipeline.price_configuration_from_evidence(0, report, coefficients) == (
+        "--supported-price-coefficients", coefficients)
+    for status, passed in ((1, False), (2, True), (0, False)):
+        report.write_text(json.dumps({"passed": passed}))
+        with pytest.raises(SystemExit):
+            pipeline.price_configuration_from_evidence(status, report, coefficients)

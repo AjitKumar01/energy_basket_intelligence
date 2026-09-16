@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import List, Optional, Sequence
+from typing import List, Optional
 
 import torch
 
@@ -498,81 +498,6 @@ def rao_blackwell_selected_incidence(model, ix, states: BasketParticles,
             conditional[b] = torch.sigmoid(logit)
         answer += weight[p]*conditional
     return answer
-
-
-def controlled_particle_statistics(model, ix, states: BasketParticles,
-                                   log_weights: torch.Tensor
-                                   ) -> WeightedParticleStatistics:
-    """Exact-base controls plus one-site Rao--Blackwell interaction statistics.
-
-    For item incidence and basket size, the no-interaction expectation is available from
-    one differentiable base DP.  The controlled estimate is
-
-    ``base_exact + target_weighted_sample - base_unweighted_sample``.
-
-    At zero interaction the two sample terms cancel exactly, leaving the exact base score.
-    At nonzero interaction only the interaction-induced correction is stochastic.  The
-    Phi and interaction blocks use exact one-site conditional expectations; an
-    exact base Phi control would require a native second derivative, which is deliberately
-    not assumed here.
-    """
-    weighted = weighted_particle_statistics(model, ix, states, log_weights)
-    unweighted = weighted_particle_statistics(model, ix, states)
-    conditional = rao_blackwell_particle_statistics(model, ix, states, log_weights)
-
-    with torch.enable_grad():
-        slot_b = model.b_flat(ix).detach().requires_grad_(True)
-        log_size = differentiable_log_size_beta0(model, ix, slot_b)
-        log_z = torch.logsumexp(log_size, dim=-1)
-        slot_incidence, rho_c_gradient = torch.autograd.grad(
-            log_z.sum(), (slot_b, model.rho_c))
-        slot_incidence = slot_incidence.detach()
-        base_category_total = -rho_c_gradient.detach()
-    base_incidence = torch.zeros(ix.B, model.J, dtype=model.phi.dtype,
-                                 device=model.phi.device)
-    base_incidence.index_put_((ix.item_trip, ix.item), slot_incidence,
-                              accumulate=True)
-    base_size = torch.softmax(log_size.detach(), dim=-1)
-    controlled_category_total = (base_category_total
-                                 + weighted.category_pairs.sum(0)
-                                 - unweighted.category_pairs.sum(0))
-
-    return WeightedParticleStatistics(
-        item_incidence=(base_incidence + weighted.item_incidence
-                        - unweighted.item_incidence),
-        size_probability=(base_size + weighted.size_probability
-                          - unweighted.size_probability),
-        category_pairs=(controlled_category_total.unsqueeze(0)
-                        .expand(ix.B, -1) / ix.B),
-        interaction=conditional.interaction,
-        phi_score=conditional.phi_score)
-
-
-def fisher_negative_surrogate(model, ix, statistics: WeightedParticleStatistics
-                              ) -> torch.Tensor:
-    """Scalar whose gradient is the supplied Fisher negative phase.
-
-    Particle statistics are treated as fixed Monte Carlo estimates.  Differentiating this
-    scalar propagates item incidence through the original ``b_flat`` customer/price/context
-    architecture, size probability through the original ``rho_0`` parameterization,
-    category pairs through ``rho_c``, and the pair score through ``Phi``.
-    """
-    if statistics.item_incidence.shape != (ix.B, model.J):
-        raise ValueError("item incidence has the wrong shape")
-    if statistics.size_probability.shape != (ix.B, model.nmax):
-        raise ValueError("size probability has the wrong shape")
-    if statistics.category_pairs.shape != (ix.B, model.C):
-        raise ValueError("category-pair statistic has the wrong shape")
-    if statistics.phi_score.shape != model.phi.shape:
-        raise ValueError("Phi score has the wrong shape")
-
-    slot_incidence = statistics.item_incidence[ix.item_trip, ix.item].detach()
-    utility = (slot_incidence * model.b_flat(ix)).sum()
-    category = -(statistics.category_pairs.detach().sum(0) * model.rho_c).sum()
-    size = -(statistics.size_probability.detach()
-             * model.rho_0()[1:model.nmax + 1].unsqueeze(0)).sum()
-    interaction = (statistics.phi_score.detach() * model.phi).sum()
-    return (utility + category + size + interaction) / ix.B
 
 
 @torch.no_grad()

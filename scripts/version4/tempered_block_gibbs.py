@@ -24,6 +24,7 @@ import torch
 
 from ragged import esp_log_bucketed, seg_max
 from poly_degree_native import log_poly_tree_degree_native
+from stratified_natural import SIZE_BAND_LOWER_BOUNDS
 
 
 @dataclass
@@ -535,10 +536,7 @@ def default_size_bands(nmax: int) -> list[tuple[int, int]]:
     """Declared non-overlapping size bands covering ``1..nmax`` exactly."""
     if int(nmax) < 1:
         raise ValueError("nmax must be positive")
-    # Sixty is the declared production extreme-basket threshold.  Giving N>=60 its own
-    # stratum prevents an unbiased but broad 41:80 band from spending all of its draws
-    # below the safety boundary.
-    cut = (1, 5, 11, 21, 41, 60, 81, int(nmax) + 1)
+    cut = (*SIZE_BAND_LOWER_BOUNDS, int(nmax) + 1)
     bands = []
     for lo, hi_exclusive in zip(cut[:-1], cut[1:]):
         if lo > nmax:

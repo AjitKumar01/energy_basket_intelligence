@@ -10,12 +10,11 @@ from pathlib import Path
 import time
 
 import numpy as np
-import pandas as pd
 import torch
 
 os.environ.setdefault("V3_AFFINITY", "1")
 
-from checkpoint_io import ROOT, load_checkpoint
+from checkpoint_io import load_checkpoint
 from data import build
 from features import Features
 from fit import Batcher
@@ -95,6 +94,10 @@ def sample_replicate(model, batcher, trips, particles, seed, chunk, item_categor
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--run-dir", type=Path, required=True)
+    parser.add_argument(
+        "--checkpoint", type=Path,
+        help=("explicit final checkpoint; when omitted, retain the historical "
+              "RUN_DIR/artifacts/candidate_rank1.pt layout"))
     parser.add_argument("--protocol", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--per-context-output", type=Path, required=True)
@@ -106,7 +109,10 @@ def main():
     started = time.monotonic(); torch.set_num_threads(args.threads)
     protocol_path = args.protocol.resolve(); protocol = json.loads(protocol_path.read_text())
     spec = protocol["generation"]; run_dir = args.run_dir.resolve()
-    checkpoint = run_dir / "artifacts/candidate_rank1.pt"
+    checkpoint = (args.checkpoint.resolve() if args.checkpoint is not None
+                  else run_dir / "artifacts/candidate_rank1.pt")
+    if not checkpoint.is_file():
+        raise FileNotFoundError(f"final checkpoint not found: {checkpoint}")
     data = build(); model, blob, meta = load_checkpoint(
         checkpoint, data,
         required_capabilities=("conditional_nonempty_incidence", "gram_interactions"))
@@ -116,38 +122,48 @@ def main():
         data, population, int(spec["contexts"]), int(spec["seed"]))
     if len(trips) != min(int(spec["contexts"]), len(population)):
         raise RuntimeError("failed to construct the frozen generation panel")
-    batcher = Batcher(data, Features(int(data["n_item"]), int(data["n_store"]), 712,
-                                    include_recency=False), int(meta["nmax"]),
+    batcher = Batcher(data, Features(int(data["n_item"]), int(data["n_store"]),
+                                     include_recency=False), int(meta["nmax"]),
                       include_recency=False)
     singular = torch.linalg.svdvals(model.phi); rank = int((singular > singular[0]*1e-10).sum())
-    observed, q7 = collect_size_law(model, batcher, trips,
-                                    smolyak_rule(model, rank, rank + 2), args.chunk, "generation-q7")
-    _, q8 = collect_size_law(model, batcher, trips,
-                             smolyak_rule(model, rank, rank + 3), args.chunk, "generation-q8")
-    axis = np.arange(1, model.nmax + 1); q7_mean = np.exp(q7) @ axis; q8_mean = np.exp(q8) @ axis
+    lower_level, reference_level, followup_level = rank + 2, rank + 3, rank + 4
+    observed, lower_log_probability = collect_size_law(
+        model, batcher, trips, smolyak_rule(model, rank, lower_level),
+        args.chunk, f"generation-q{lower_level}")
+    _, reference_log_probability = collect_size_law(
+        model, batcher, trips, smolyak_rule(model, rank, reference_level),
+        args.chunk, f"generation-q{reference_level}")
+    axis = np.arange(1, model.nmax + 1)
+    lower_mean = np.exp(lower_log_probability) @ axis
+    reference_rule_mean = np.exp(reference_log_probability) @ axis
     reference_tolerance = float(spec["model_sampling_absolute_items"])
-    initial_reference_gap = np.abs(q8_mean-q7_mean)
-    reference_mean = q8_mean.copy()
-    reference_rule = np.full(len(trips), rank+3, dtype=np.int16)
+    initial_reference_gap = np.abs(reference_rule_mean - lower_mean)
+    reference_mean = reference_rule_mean.copy()
+    reference_rule = np.full(len(trips), reference_level, dtype=np.int16)
     reference_failures = np.flatnonzero(initial_reference_gap > reference_tolerance)
     q9_followup_gap = np.empty(0, dtype=np.float64)
     if len(reference_failures):
-        _, q9 = collect_size_law(
+        _, followup_log_probability = collect_size_law(
             model, batcher, trips[reference_failures],
-            smolyak_rule(model, rank, rank+4), args.chunk, "generation-q9-followup")
-        q9_mean = np.exp(q9) @ axis
-        q9_followup_gap = np.abs(q9_mean-q8_mean[reference_failures])
-        reference_mean[reference_failures] = q9_mean
-        reference_rule[reference_failures] = rank+4
+            smolyak_rule(model, rank, followup_level), args.chunk,
+            f"generation-q{followup_level}-followup")
+        followup_mean = np.exp(followup_log_probability) @ axis
+        q9_followup_gap = np.abs(
+            followup_mean - reference_rule_mean[reference_failures])
+        reference_mean[reference_failures] = followup_mean
+        reference_rule[reference_failures] = followup_level
     reference_fidelity_pass = bool(
         not len(reference_failures) or np.max(q9_followup_gap) <= reference_tolerance)
-    metadata = pd.read_parquet(ROOT / "basket_input/items.parquet").sort_values("item_id")
-    item_category = metadata.cat_id.to_numpy(np.int64)
+    item_category = model.cat_of.detach().cpu().numpy().astype(np.int64)
     observed_item = np.zeros(model.J); observed_category = np.zeros(model.C)
-    for trip in trips:
+    observed_item_by_context = np.zeros((len(trips), model.J), dtype=np.int8)
+    observed_category_by_context = np.zeros((len(trips), model.C), dtype=np.int8)
+    for context_index, trip in enumerate(trips):
         lo, hi = int(data["line_ptr"][trip]), int(data["line_ptr"][trip + 1])
         items = np.unique(data["line_item"][lo:hi])
         np.add.at(observed_item, items, 1); np.add.at(observed_category, item_category[items], 1)
+        observed_item_by_context[context_index, items] = 1
+        np.add.at(observed_category_by_context[context_index], item_category[items], 1)
     seeds = [int(spec["seed"]) + 1009 * (i + 1) for i in range(args.replicates)]
     generated, particle_expected, ess, pooled_item, pooled_category = [], [], [], [], []
     sample_items, sample_ptr = [], []
@@ -184,8 +200,12 @@ def main():
                       "passed" if factual_pass else "failed")
     per_path = args.per_context_output.resolve(); per_path.parent.mkdir(parents=True, exist_ok=True)
     np.savez_compressed(per_path, trips=trips, household=data["trip_user"][trips],
-                        observed_size=observed, q7_expected_size=q7_mean,
-                        q8_expected_size=q8_mean, generated_size=generated,
+                        observed_size=observed,
+                        lower_rule_expected_size=lower_mean,
+                        reference_rule_expected_size=reference_rule_mean,
+                        lower_quadrature_level=np.asarray(lower_level),
+                        reference_quadrature_level_base=np.asarray(reference_level),
+                        generated_size=generated,
                         particle_expected_size=particle_expected,
                         reference_expected_size=reference_mean,
                         reference_quadrature_level=reference_rule,
@@ -198,6 +218,35 @@ def main():
     np.savez_compressed(sample_path, **sample_record)
     generated_size_count = np.bincount(generated.ravel(), minlength=model.nmax + 1)[1:]
     observed_size_count = np.bincount(observed, minlength=model.nmax + 1)[1:]
+    training_maximum = int(np.max(
+        data["trip_nlines"][data["trip_split"] == 0]))
+    split_rng = np.random.default_rng(int(spec["seed"]) + 700001)
+    split_order = split_rng.permutation(len(trips))
+    split_left, split_right = np.array_split(split_order, 2)
+    observed_split_half = {
+        "contexts_per_half": [int(len(split_left)), int(len(split_right))],
+        "size_total_variation": tv(
+            np.bincount(observed[split_left], minlength=model.nmax + 1)[1:],
+            np.bincount(observed[split_right], minlength=model.nmax + 1)[1:]),
+        "category_total_variation": tv(
+            observed_category_by_context[split_left].sum(0),
+            observed_category_by_context[split_right].sum(0)),
+        "item_total_variation": tv(
+            observed_item_by_context[split_left].sum(0),
+            observed_item_by_context[split_right].sum(0)),
+    }
+    generated_pairwise = []
+    for left in range(args.replicates):
+        for right in range(left + 1, args.replicates):
+            generated_pairwise.append({
+                "size_total_variation": tv(
+                    np.bincount(generated[left], minlength=model.nmax + 1)[1:],
+                    np.bincount(generated[right], minlength=model.nmax + 1)[1:]),
+                "category_total_variation": tv(
+                    pooled_category[left], pooled_category[right]),
+                "item_total_variation": tv(
+                    pooled_item[left], pooled_item[right]),
+            })
     output = {
         "status": "completed", "checkpoint": str(checkpoint),
         "checkpoint_sha256": file_sha256(checkpoint),
@@ -219,9 +268,12 @@ def main():
             "reference_fidelity": {
                 "status": "passed" if reference_fidelity_pass else "failed",
                 "tolerance_items": reference_tolerance,
-                "maximum_q7_q8_expected_size_gap": float(initial_reference_gap.max()),
-                "q9_followup_contexts": int(len(reference_failures)),
-                "maximum_q8_q9_followup_gap": (
+                "lower_quadrature_level": lower_level,
+                "reference_quadrature_level": reference_level,
+                "followup_quadrature_level": followup_level,
+                "maximum_lower_reference_expected_size_gap": float(initial_reference_gap.max()),
+                "followup_contexts": int(len(reference_failures)),
+                "maximum_reference_followup_gap": (
                     float(q9_followup_gap.max()) if len(q9_followup_gap) else 0.0),
             },
         },
@@ -233,6 +285,31 @@ def main():
             "size_total_variation": tv(observed_size_count, generated_size_count),
             "category_total_variation": tv(observed_category, np.sum(pooled_category, axis=0)),
             "item_total_variation": tv(observed_item, np.sum(pooled_item, axis=0)),
+            "observed_split_half_noise_reference": observed_split_half,
+            "generated_replicate_pairwise_total_variation": {
+                key: {
+                    "mean": float(np.mean([row[key] for row in generated_pairwise])),
+                    "maximum": float(np.max([row[key] for row in generated_pairwise])),
+                }
+                for key in (
+                    "size_total_variation", "category_total_variation",
+                    "item_total_variation")
+            },
+            "unobserved_support_extension": {
+                "status": ("not_identifiable" if training_maximum < model.nmax
+                           else "not_applicable"),
+                "observed_training_maximum": training_maximum,
+                "model_support_maximum": int(model.nmax),
+                "observed_validation_baskets_above_training_maximum": int(
+                    np.sum(observed > training_maximum)),
+                "generated_baskets_above_training_maximum": int(
+                    np.sum(generated > training_maximum)),
+                "generated_rate_above_training_maximum": float(
+                    np.mean(generated > training_maximum)),
+                "interpretation": (
+                    "generated sizes above the training maximum are extrapolations, "
+                    "not empirically calibrated outcomes"),
+            },
             "interpretation": "fixed observed contexts; household-cluster uncertainty conditions on the fit",
         },
         "per_context_output": str(per_path), "per_context_sha256": file_sha256(per_path),

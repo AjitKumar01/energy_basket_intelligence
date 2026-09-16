@@ -1,0 +1,14 @@
+{
+  "schema_version": 1,
+  "dataset": "erim_multi_category",
+  "scope": "nonempty tracked-category sub-baskets",
+  "generation": {
+    "contexts": 1024,
+    "particles": 32,
+    "seed": 64101,
+    "model_sampling_absolute_items": 0.02,
+    "model_sampling_mc_se_multiplier": 5,
+    "equivalence_method": "two_sided_interval_contained",
+    "observed_mean_equivalence_margin_items": 0.25
+  }
+}

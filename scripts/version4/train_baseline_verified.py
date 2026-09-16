@@ -219,7 +219,7 @@ def main(a):
     data_fingerprint = load_data_fingerprint(
         root, verify_files=True)["fingerprint_sha256"]
     J, S = int(D["n_item"]), int(D["n_store"])
-    batcher = Batches(D, Features(J, S, 712))
+    batcher = Batches(D, Features(J, S))
     tr = supported_training(D, a.nmax, a.R)
     # Exact fit.py manifest: support filter, fixed permutation, then the prefix.  A raw
     # prefix is about eight nats easier on these data; an independently sampled manifest

@@ -11,6 +11,13 @@ from typing import Any, Mapping
 
 
 FINGERPRINT_SCHEMA = 1
+OPTIONAL_FINGERPRINT_FILES = frozenset({"observed_promotion_panel", "price_evidence_panel"})
+
+
+def model_data_root(default: str | Path) -> Path:
+    """Resolve an isolated model-data bundle without changing source-code paths."""
+    configured = os.environ.get("ENERGY_MODEL_DATA_ROOT")
+    return Path(configured).expanduser().resolve() if configured else Path(default).resolve()
 
 
 def file_sha256(path: str | Path) -> str:
@@ -53,9 +60,15 @@ def strict_json_dumps(value: Any, *, indent: int = 2) -> str:
     return json.dumps(json_safe(value), indent=indent, allow_nan=False) + "\n"
 
 
-def build_data_fingerprint(root: str | Path, *, write: bool = True) -> dict[str, Any]:
-    """Build one immutable identity for all model-facing data and support files."""
-    root = Path(root).resolve()
+def build_data_fingerprint(root: str | Path, *, write: bool = True,
+                           optional_names: set[str] | None = None) -> dict[str, Any]:
+    """Build one immutable identity for all model-facing data and support files.
+
+    Optional panels are included when present.  Verification passes the optional names a
+    stored fingerprint recorded, so a bundle written before an optional panel was added to
+    the identity still verifies, while every file it did record is re-hashed.
+    """
+    root = model_data_root(root)
     basket = root / "basket_input"
     data = root / "data"
     paths = {
@@ -66,6 +79,18 @@ def build_data_fingerprint(root: str | Path, *, write: bool = True) -> dict[str,
         "base_build_meta": data / "build_meta.json",
         "ragged_index": basket / "v3_index_affinity.npz",
     }
+    optional_paths = {
+        "observed_promotion_panel": basket / "promo_observed.npz",
+        "price_evidence_panel": data / "price_week.parquet",
+    }
+    if optional_names is None:
+        paths.update({name: path for name, path in optional_paths.items()
+                      if path.is_file()})
+    else:
+        unknown = set(optional_names).difference(optional_paths)
+        if unknown:
+            raise ValueError(f"unknown optional fingerprint files: {sorted(unknown)}")
+        paths.update({name: optional_paths[name] for name in optional_names})
     missing = [str(path) for path in paths.values() if not path.is_file()]
     if missing:
         raise FileNotFoundError(
@@ -75,8 +100,8 @@ def build_data_fingerprint(root: str | Path, *, write: bool = True) -> dict[str,
     basket_meta = json.loads(paths["basket_meta"].read_text())
     build_meta = json.loads(paths["base_build_meta"].read_text())
     price_basis = basket_meta.get("price_basis")
-    if price_basis not in {"loyalty", "base"}:
-        raise ValueError("basket metadata has no valid price_basis")
+    if not isinstance(price_basis, str) or not price_basis.strip():
+        raise ValueError("basket metadata has no declared price_basis")
     if build_meta.get("price_basis") != price_basis:
         raise ValueError("Stage-01 and basket metadata price bases differ")
     affinity_digest = file_sha256(paths["affinity_partition"])
@@ -106,7 +131,7 @@ def load_data_fingerprint(root: str | Path, *, verify_files: bool = False) -> di
     every invocation. ``verify_files`` is available to standalone consumers that did not
     enter through the driver.
     """
-    root = Path(root).resolve()
+    root = model_data_root(root)
     path = root / "basket_input" / "model_data_fingerprint.json"
     if not path.is_file():
         raise FileNotFoundError(
@@ -119,7 +144,10 @@ def load_data_fingerprint(root: str | Path, *, verify_files: bool = False) -> di
         raise ValueError("model-data fingerprint failed its self digest")
     result["fingerprint_sha256"] = digest
     if verify_files:
-        rebuilt = build_data_fingerprint(root, write=False)
+        recorded_optional = set(result.get("files", {})).intersection(
+            OPTIONAL_FINGERPRINT_FILES)
+        rebuilt = build_data_fingerprint(
+            root, write=False, optional_names=recorded_optional)
         if rebuilt["fingerprint_sha256"] != digest:
             raise ValueError("model-facing files differ from model_data_fingerprint.json")
     return result
@@ -134,13 +162,6 @@ def require_fingerprint(recorded: str | None, root: str | Path) -> dict[str, Any
         raise ValueError(
             "artifact data fingerprint differs from the current audited dataset")
     return current
-
-
-def artifact_identity(path: str | Path, *, data_fingerprint_sha256: str) -> dict[str, str]:
-    return {
-        "artifact_sha256": file_sha256(path),
-        "data_fingerprint_sha256": data_fingerprint_sha256,
-    }
 
 
 if __name__ == "__main__":

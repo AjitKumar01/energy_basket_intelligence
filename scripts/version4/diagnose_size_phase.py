@@ -41,8 +41,11 @@ def interval_summary(values: np.ndarray) -> dict:
     bands = ((1, 4), (5, 10), (11, 20), (21, 40), (41, 80), (81, 119))
     answer = {}
     for lo, hi in bands:
-        section = values[:, lo - 1:hi]
-        answer[f"{lo}:{hi + 1}"] = {
+        if lo > values.shape[1]:
+            continue
+        stop = min(hi, values.shape[1])
+        section = values[:, lo - 1:stop]
+        answer[f"{lo}:{stop + 1}"] = {
             "mean": float(section.mean()),
             "p95": float(np.quantile(section, 0.95)),
             "maximum": float(section.max()),
@@ -54,7 +57,7 @@ def panel_summary(name: str, selected: np.ndarray, observed: np.ndarray,
                   child_log_probability: np.ndarray,
                   child_h: np.ndarray, child_beta0_h: np.ndarray,
                   parent_h: np.ndarray, child_rho: np.ndarray,
-                  parent_rho: np.ndarray) -> dict:
+                  parent_rho: np.ndarray, tail_threshold: int) -> dict:
     log_odds = np.diff(child_log_probability[selected], axis=1)
     h_increment = np.diff(child_h[selected], axis=1)
     rho_increment = np.diff(child_rho)[None, :]
@@ -63,7 +66,12 @@ def panel_summary(name: str, selected: np.ndarray, observed: np.ndarray,
     nuisance_increment = np.diff(
         child_beta0_h[selected] - parent_h[selected], axis=1)
     rho_change_increment = np.diff(child_rho - parent_rho)[None, :]
-    tail = log_odds[:, 19:]
+    # A tail threshold of t examines the successive odds beginning at size t:
+    # P(N=t+1)/P(N=t), ..., P(N=nmax)/P(N=nmax-1).
+    tail_start = tail_threshold - 1
+    if tail_start >= log_odds.shape[1]:
+        raise ValueError("tail threshold leaves no successive size odds to diagnose")
+    tail = log_odds[:, tail_start:]
     positive_tail = tail > 0
     return {
         "name": name, "contexts": int(len(selected)),
@@ -71,11 +79,12 @@ def panel_summary(name: str, selected: np.ndarray, observed: np.ndarray,
         "model_expected_size_mean": float(np.mean(
             np.exp(child_log_probability[selected]) @
             np.arange(1, child_log_probability.shape[1] + 1))),
-        "contexts_with_any_positive_size_log_odds_after_20": int(
+        "tail_threshold": int(tail_threshold),
+        "contexts_with_any_positive_size_log_odds_after_threshold": int(
             positive_tail.any(axis=1).sum()),
-        "maximum_size_log_odds_after_20": float(tail.max()),
-        "argmax_starting_size_after_20": int(np.unravel_index(
-            np.argmax(tail), tail.shape)[1] + 20),
+        "maximum_size_log_odds_after_threshold": float(tail.max()),
+        "argmax_starting_size_after_threshold": int(np.unravel_index(
+            np.argmax(tail), tail.shape)[1] + tail_threshold),
         "size_log_odds": interval_summary(log_odds),
         "catalogue_pressure_increment": interval_summary(h_increment),
         "gram_contribution_to_pressure_increment": interval_summary(gram_increment),
@@ -95,6 +104,7 @@ def main() -> None:
     parser.add_argument("--confirmed-panel", type=Path,
                         default=Path("reports/population_size_confirm_per_trip.npz"))
     parser.add_argument("--contexts-per-panel", type=int, default=64)
+    parser.add_argument("--tail-threshold", type=int)
     parser.add_argument("--chunk", type=int, default=32)
     parser.add_argument("--threads", type=int, default=8)
     parser.add_argument("--output", type=Path,
@@ -110,6 +120,13 @@ def main() -> None:
     child, child_blob, child_meta = load_checkpoint(child_path, data)
     if int(meta["nmax"]) != int(child_meta["nmax"]):
         raise ValueError("parent and child supports differ")
+    training_sizes = np.asarray(data["trip_nlines"])[data["trip_split"] == 0]
+    automatic_tail_threshold = min(
+        int(child_meta["nmax"]) - 1,
+        max(1, int(np.quantile(training_sizes, .975, method="higher")) + 1))
+    tail_threshold = args.tail_threshold or automatic_tail_threshold
+    if not 1 <= tail_threshold < int(child_meta["nmax"]):
+        raise ValueError("tail threshold must be between 1 and nmax - 1")
     panel = np.load(panel_path)
     trips = np.asarray(panel["trips"], dtype=np.int64)
     observed = np.asarray(panel["observed"], dtype=np.int64)
@@ -124,7 +141,7 @@ def main() -> None:
     lower_risk = order[:args.contexts_per_panel]
     high = order[-args.contexts_per_panel:]
     batcher = Batcher(
-        data, Features(int(data["n_item"]), int(data["n_store"]), 712,
+        data, Features(int(data["n_item"]), int(data["n_store"]),
                        include_recency=False), child.nmax, include_recency=False)
     parent_h, _ = beta0_components(parent, batcher, trips, args.chunk)
     child_beta0_h, _ = beta0_components(child, batcher, trips, args.chunk)
@@ -146,11 +163,13 @@ def main() -> None:
             "independently confirmed high-risk panel"),
         "high_expected_size": panel_summary(
             "high_expected_size", high, observed, child_log_probability,
-            child_h, child_beta0_h, parent_h, child_rho, parent_rho),
+            child_h, child_beta0_h, parent_h, child_rho, parent_rho,
+            tail_threshold),
         "lower_expected_size_within_confirmed_panel": panel_summary(
             "lower_expected_size_within_confirmed_panel", lower_risk, observed,
             child_log_probability,
-            child_h, child_beta0_h, parent_h, child_rho, parent_rho),
+            child_h, child_beta0_h, parent_h, child_rho, parent_rho,
+            tail_threshold),
         "per_context_output": str(args.output.with_suffix(".npz")),
     }
     output = args.output if args.output.is_absolute() else ROOT / args.output

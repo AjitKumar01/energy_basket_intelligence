@@ -37,7 +37,7 @@ from conditional_basket import conditional_completion_quadrature  # noqa: E402
 from data import build  # noqa: E402
 from features import Features  # noqa: E402
 from fit import Batcher  # noqa: E402
-from provenance import file_sha256  # noqa: E402
+from provenance import file_sha256, model_data_root  # noqa: E402
 from ragged import RaggedIndex, smolyak_grid  # noqa: E402
 
 
@@ -53,6 +53,19 @@ DEFAULT_SEGMENT_REPORT = (
 
 def configured_path(environment: str, default: Path) -> Path:
     return Path(os.environ.get(environment, str(default))).expanduser().resolve()
+
+
+def validate_context_range(day: int, week: int, *, n_days: int,
+                           week_min: int, week_max: int) -> None:
+    """Reject contexts the fitted price and promotion panels cannot index."""
+    if not 0 <= int(day) < int(n_days):
+        raise RetailAPIError(
+            f"day must lie in 0..{int(n_days) - 1} for the fitted price panel",
+            code="context_out_of_range")
+    if not int(week_min) <= int(week) <= int(week_max):
+        raise RetailAPIError(
+            f"week must lie in {int(week_min)}..{int(week_max)} for the fitted "
+            "promotion coverage", code="context_out_of_range")
 
 
 def padded_rule(model, active_rank: int, level: int):
@@ -95,8 +108,7 @@ class RetailModelService:
             parameter.requires_grad_(False)
         self.checkpoint_sha256 = file_sha256(self.checkpoint)
         self.features = Features(
-            int(self.data["n_item"]), int(self.data["n_store"]), 712,
-            include_recency=False)
+            int(self.data["n_item"]), int(self.data["n_store"]), include_recency=False)
         self.batcher = Batcher(
             self.data, self.features, int(self.meta["nmax"]), include_recency=False)
         self._lock = threading.RLock()
@@ -132,7 +144,7 @@ class RetailModelService:
                 status_code=503, code="evidence_gate_failed")
 
     def _load_products(self):
-        products = pd.read_parquet(ROOT / "basket_input/items.parquet")
+        products = pd.read_parquet(model_data_root(ROOT) / "basket_input" / "items.parquet")
         products = products.sort_values("item_id", kind="stable").reset_index(drop=True)
         if not np.array_equal(products.item_id.to_numpy(),
                               np.arange(int(self.data["n_item"]))):
@@ -212,6 +224,9 @@ class RetailModelService:
             raise RetailAPIError("household_index is outside the fitted cohort")
         if context.store_index >= int(self.data["n_store"]):
             raise RetailAPIError("store_index is outside the fitted store set")
+        validate_context_range(
+            context.day, context.week, n_days=int(self.features.dev.shape[1]),
+            week_min=self.features.promo_week_min, week_max=self.features.promo_week_max)
         C = int(self.data["n_cat"])
         ptr, store_items = self.data["store_cat_ptr"], self.data["store_items"]
         item_blocks, row_of, row_trip, row_cat = [], [], [], []
@@ -332,9 +347,7 @@ class RetailModelService:
                     status_code=503, code="numerical_gate_failed")
             incidence = np.clip(incidence, 0.0, 1.0)
             available = ix.item.detach().numpy()
-            candidates = np.asarray([
-                int(item) for item in available if int(item) not in set(internal)],
-                dtype=np.int64)
+            candidates = available[~np.isin(available, internal)].astype(np.int64)
             score = incidence[candidates]
             external = self.internal_to_external[candidates]
             order = np.lexsort((external, -score))[:request.top_k]

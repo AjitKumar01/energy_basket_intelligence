@@ -90,8 +90,7 @@ def main():
     half_a = rng.random(args.trips) < 0.5
     if half_a.all() or (~half_a).all():
         raise RuntimeError("degenerate split-half assignment")
-    features = Features(int(data["n_item"]), int(data["n_store"]), 712,
-                        include_recency=False)
+    features = Features(int(data["n_item"]), int(data["n_store"]), include_recency=False)
     batcher = Batcher(data, features, int(meta["nmax"]), include_recency=False)
     draw_seed = args.seed + 1 if args.draw_seed is None else args.draw_seed
     generator = torch.Generator().manual_seed(draw_seed)

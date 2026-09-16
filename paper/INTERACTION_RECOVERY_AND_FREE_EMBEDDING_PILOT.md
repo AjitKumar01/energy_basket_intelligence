@@ -74,7 +74,9 @@ The higher-precision primary rank run is logged at:
 `artifacts/interaction_recovery_20260913/01_spectral_precision.log`
 
 The follow-up driver waits for that report, confirms the rank, fits both arms,
-then runs likelihood and recommendation audits:
+then runs likelihood and recommendation audits. Because free-embedding refinement did not
+improve the model, the driver and pilot modules were removed in the 16 September 2026
+codebase audit; the command below reproduces the pilot from git history:
 
 ```sh
 python -u scripts/run_interaction_recovery.py \

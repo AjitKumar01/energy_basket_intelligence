@@ -140,8 +140,8 @@ def main():
     items=pd.read_parquet("basket_input/items.parquet").set_index("item_id")
     eligible=eligible[eligible.item_id.map(items.n_train_lines)>=spec["minimum_training_lines_per_product"]]
     rng=np.random.default_rng(int(spec["seed"])); eligible=eligible.iloc[rng.permutation(len(eligible))]
-    batcher=Batcher(data,Features(int(data["n_item"]),int(data["n_store"]),712,
-                    include_recency=False),int(meta["nmax"]),include_recency=False)
+    batcher=Batcher(data,Features(int(data["n_item"]),int(data["n_store"]),
+                                  include_recency=False),int(meta["nmax"]),include_recency=False)
     rows=[]; excluded={"unsupported_training_price_depth":unsupported_depth,
                        "insufficient_contexts":0,"low_ess":0}
     for candidate_number, record in enumerate(eligible.itertuples(index=False), start=1):

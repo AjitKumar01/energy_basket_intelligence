@@ -128,11 +128,21 @@ def test_retail_context_accepts_independent_source_day_and_week(client):
     invalid = client.post("/v1/baskets/complete", json={
         "context": {
             "kind": "retail_context", "household_index": 1,
-            "store_index": 2, "day": 650, "week": 102,
+            "store_index": 2, "day": 650, "week": 0,
         },
         "revealed_product_ids": [818980],
     })
     assert invalid.status_code == 422
+
+
+def test_context_range_follows_the_fitted_dataset_not_a_fixed_calendar():
+    from retail_api.service import validate_context_range
+    # ERIM-like panel: 357 days, promotion coverage weeks 1..51.
+    validate_context_range(0, 1, n_days=357, week_min=1, week_max=51)
+    for day, week in ((357, 10), (10, 52)):
+        with pytest.raises(RetailAPIError) as error:
+            validate_context_range(day, week, n_days=357, week_min=1, week_max=51)
+        assert error.value.code == "context_out_of_range"
 
 
 def test_product_and_segment_endpoints(client):

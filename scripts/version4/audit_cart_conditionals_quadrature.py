@@ -3,8 +3,6 @@
 from __future__ import annotations
 
 import argparse
-import json
-import math
 import os
 import time
 from pathlib import Path
@@ -14,7 +12,7 @@ import torch
 
 os.environ.setdefault("V3_AFFINITY", "1")
 
-from checkpoint_io import ROOT, load_checkpoint
+from checkpoint_io import load_checkpoint
 from conditional_basket import conditional_completion_quadrature
 from data import build
 from evaluate_retail_applications import (
@@ -50,7 +48,7 @@ def panel(args):
     low_rule = padded_rule(model, active_rank, low_level)
     high_rule = padded_rule(model, active_rank, high_level)
     batcher = Batcher(
-        data, Features(int(data["n_item"]), int(data["n_store"]), 712,
+        data, Features(int(data["n_item"]), int(data["n_store"]),
                        include_recency=False), int(meta["nmax"]), include_recency=False)
     population = np.flatnonzero(
         (data["trip_split"] == 1) & (data["trip_nlines"] <= int(meta["nmax"])))

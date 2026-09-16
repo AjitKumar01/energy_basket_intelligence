@@ -5,7 +5,6 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
-import math
 import os
 from pathlib import Path
 
@@ -18,7 +17,8 @@ from checkpoint_io import ROOT, load_checkpoint
 from data import build
 from features import Features
 from fit import Batcher
-from pipeline_support import (collect_size_law, install_quadrature, smolyak_rule,
+from pipeline_support import (TAIL_THRESHOLD_SELECTION, collect_size_law,
+                              install_quadrature, size_tail_threshold, smolyak_rule,
                               supported_trips)
 from provenance import file_sha256, strict_json_dumps
 from uncertainty import household_cluster_se
@@ -27,25 +27,30 @@ from uncertainty import household_cluster_se
 torch.set_default_dtype(torch.float64)
 
 
-def metrics(log_probability: np.ndarray, observed: np.ndarray) -> dict:
+def metrics(log_probability: np.ndarray, observed: np.ndarray,
+            tail_threshold: int, low_observed_threshold: int) -> dict:
     probability = np.exp(log_probability)
     size = np.arange(1, probability.shape[1] + 1, dtype=np.float64)
     mean = probability @ size
-    tail = probability[:, 59:].sum(1)
-    observed_tail = np.asarray(observed) >= 60
-    low_observed = np.asarray(observed) < 40
+    tail = probability[:, tail_threshold - 1:].sum(1)
+    observed_tail = np.asarray(observed) >= tail_threshold
+    low_observed = np.asarray(observed) < low_observed_threshold
     return {
         "contexts": int(len(observed)),
         "observed_mean": float(np.mean(observed)),
         "model_mean": float(np.mean(mean)),
-        "observed_tail_rate_ge_60": float(np.mean(observed_tail)),
-        "model_tail_rate_ge_60": float(np.mean(tail)),
-        "contexts_expected_size_ge_40": int(np.sum(mean >= 40)),
-        "contexts_expected_size_ge_60": int(np.sum(mean >= 60)),
+        "tail_threshold": int(tail_threshold),
+        "low_observed_threshold": int(low_observed_threshold),
+        "observed_tail_rate": float(np.mean(observed_tail)),
+        "model_tail_rate": float(np.mean(tail)),
+        "contexts_expected_size_ge_low_threshold": int(
+            np.sum(mean >= low_observed_threshold)),
+        "contexts_expected_size_ge_tail_threshold": int(
+            np.sum(mean >= tail_threshold)),
         "contexts_tail_probability_ge_half": int(np.sum(tail >= 0.5)),
         "maximum_conditional_mean": float(np.max(mean)),
-        "maximum_tail_probability_ge_60": float(np.max(tail)),
-        "maximum_tail_probability_when_observed_lt_40": float(
+        "maximum_tail_probability": float(np.max(tail)),
+        "maximum_tail_probability_when_observed_is_low": float(
             np.max(tail[low_observed]) if np.any(low_observed) else 0.0),
     }
 
@@ -87,6 +92,32 @@ def resilient_size_panel(model, batcher, trips, rules, levels):
         raise FloatingPointError(
             f"all screen escalation levels failed for trip {int(trips[0])}: "
             f"{last_error}") from last_error
+
+
+def collect_resilient_size_law(model, batcher, trips, rules, levels,
+                               chunk: int, label: str):
+    """Evaluate a panel while escalating only contexts with invalid signed masses."""
+    if len(rules) != len(levels) or not rules:
+        raise ValueError("one numerical level is required for every quadrature rule")
+    observed, log_probability, used_level = [], [], []
+    for start in range(0, len(trips), chunk):
+        sub = trips[start:start + chunk]
+        got_observed, got_probability, got_level = resilient_size_panel(
+            model, batcher, sub, rules, levels)
+        observed.append(got_observed)
+        log_probability.append(got_probability)
+        used_level.append(got_level)
+        if ((start // chunk + 1) % 20 == 0 or start + chunk >= len(trips)):
+            print(f"[size-law] {label} {min(start + chunk, len(trips))}/"
+                  f"{len(trips)}", flush=True)
+    return (np.concatenate(observed), np.concatenate(log_probability),
+            np.concatenate(used_level))
+
+
+def level_usage(levels: np.ndarray) -> dict[str, int]:
+    unique, counts = np.unique(levels, return_counts=True)
+    return {str(int(level)): int(count)
+            for level, count in zip(unique, counts)}
 
 
 def implementation_signature():
@@ -199,6 +230,10 @@ def main() -> None:
     parser.add_argument("--tail-rate-slack", type=float, default=5e-4)
     parser.add_argument("--calibration-margin", type=float, default=5e-4,
                         help="separate absolute observed/model tail-calibration margin")
+    parser.add_argument("--tail-threshold", type=int,
+                        help="first basket size in the scientifically relevant upper tail")
+    parser.add_argument("--low-observed-threshold", type=int,
+                        help="observed size below which a large predicted tail is unsafe")
     parser.add_argument("--maximum-screen-confirm-mean-gap",
                         "--maximum-q9-q8-mean-gap",
                         dest="maximum_screen_confirm_mean_gap",
@@ -219,14 +254,25 @@ def main() -> None:
     model, blob, meta = load_checkpoint(
         checkpoint, data,
         required_capabilities=("conditional_nonempty_incidence", "gram_interactions"))
+    training_population = supported_trips(data, 0, int(meta["nmax"]))
+    training_sizes = np.asarray(data["trip_nlines"])[training_population]
+    observed_training_maximum = int(training_sizes.max())
+    support_extension_threshold = (
+        observed_training_maximum + 1
+        if observed_training_maximum < int(model.nmax) else None)
+    tail_threshold = size_tail_threshold(
+        data, int(meta["nmax"]), args.tail_threshold)
+    low_observed_threshold = args.low_observed_threshold or min(
+        40, max(1, tail_threshold - 1))
+    if not 1 <= low_observed_threshold < tail_threshold:
+        raise ValueError("low-observed-threshold must be within 1..tail-threshold-1")
     population = supported_trips(data, split_code, int(meta["nmax"]))
     full_population_size = len(population)
     if args.contexts < 0:
         raise ValueError("contexts must be nonnegative")
     if args.contexts:
         population = population[:min(args.contexts, len(population))]
-    features = Features(int(data["n_item"]), int(data["n_store"]), 712,
-                        include_recency=False)
+    features = Features(int(data["n_item"]), int(data["n_store"]), include_recency=False)
     batcher = Batcher(data, features, int(meta["nmax"]), include_recency=False)
     output = args.output if args.output.is_absolute() else ROOT / args.output
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -236,23 +282,37 @@ def main() -> None:
         model, batcher, population, checkpoint, args.rank, screen_levels,
         args.chunk, output, f"{args.split}-q{args.screen_level}",
         blob["data_fingerprint_sha256"])
-    screen = metrics(q8, observed)
+    screen = metrics(q8, observed, tail_threshold, low_observed_threshold)
     probability = np.exp(q8)
     size = np.arange(1, probability.shape[1] + 1, dtype=np.float64)
-    risk = probability[:, 59:].sum(1) + (probability @ size) / 120.0
+    risk = (probability[:, tail_threshold - 1:].sum(1)
+            + (probability @ size) / float(model.nmax))
     count = min(args.confirm_contexts, len(population))
     chosen_index = np.argsort(risk, kind="stable")[-count:]
     confirm_trips = population[chosen_index]
-    confirm_observed, q9 = collect_size_law(
-        model, batcher, confirm_trips,
-        smolyak_rule(model, args.rank, args.confirm_level), args.chunk,
+    confirm_levels = [args.confirm_level, args.confirm_level + 1,
+                      args.confirm_level + 2]
+    confirm_rules = [smolyak_rule(model, args.rank, level)
+                     for level in confirm_levels]
+    confirm_observed, q9, confirm_used_level = collect_resilient_size_law(
+        model, batcher, confirm_trips, confirm_rules, confirm_levels, args.chunk,
         f"tail-q{args.confirm_level}")
     confirm_output = output.with_name(output.stem + "_confirm_per_trip.npz")
     np.savez_compressed(
         confirm_output, trips=confirm_trips, observed=confirm_observed,
         screen_log_probability=q8[chosen_index],
-        confirm_log_probability=q9)
-    confirm = metrics(q9, confirm_observed)
+        confirm_log_probability=q9, confirm_level=confirm_used_level)
+    confirm = metrics(
+        q9, confirm_observed, tail_threshold, low_observed_threshold)
+    extension_screen = None
+    extension_confirm = None
+    if support_extension_threshold is not None:
+        extension_screen = metrics(
+            q8, observed, support_extension_threshold,
+            observed_training_maximum)
+        extension_confirm = metrics(
+            q9, confirm_observed, support_extension_threshold,
+            observed_training_maximum)
     q8_mean = np.exp(q8[chosen_index]) @ size
     q9_mean = np.exp(q9) @ size
     fidelity = {
@@ -291,16 +351,16 @@ def main() -> None:
         })
     numerical_fidelity_passed = bool(
         not len(failed_fidelity) or followup["status"] == "passed")
-    q8_tail = np.exp(q8[:, 59:]).sum(1)
+    q8_tail = np.exp(q8[:, tail_threshold - 1:]).sum(1)
     q9_probability = np.exp(q9)
-    q9_tail = q9_probability[:, 59:].sum(1)
+    q9_tail = q9_probability[:, tail_threshold - 1:].sum(1)
     positive_mean_error = float(np.max(np.maximum(q9_mean - q8_mean, 0.0)))
     positive_tail_error = float(np.max(np.maximum(
         q9_tail - q8_tail[chosen_index], 0.0)))
     chosen_mask = np.zeros(len(population), dtype=bool)
     chosen_mask[chosen_index] = True
     omitted = ~chosen_mask
-    omitted_low = omitted & (observed < 40)
+    omitted_low = omitted & (observed < low_observed_threshold)
     omitted_mean_upper = float(
         np.max((probability @ size)[omitted]) + positive_mean_error
         if np.any(omitted) else 0.0)
@@ -326,17 +386,18 @@ def main() -> None:
     calibration_index = calibration_rng.choice(
         len(population), size=calibration_count, replace=False)
     calibration_trips = population[calibration_index]
-    calibration_observed, calibration_q9 = collect_size_law(
-        model, batcher, calibration_trips,
-        smolyak_rule(model, args.rank, args.confirm_level), args.chunk,
+    calibration_observed, calibration_q9, calibration_used_level = \
+        collect_resilient_size_law(
+        model, batcher, calibration_trips, confirm_rules, confirm_levels, args.chunk,
         f"calibration-q{args.confirm_level}")
-    calibration_q9_tail = np.exp(calibration_q9[:, 59:]).sum(1)
+    calibration_q9_tail = np.exp(
+        calibration_q9[:, tail_threshold - 1:]).sum(1)
     calibration_q8_tail = q8_tail[calibration_index]
     tail_difference = calibration_q9_tail - calibration_q8_tail
     tail_bias = float(tail_difference.mean())
     tail_bias_se = household_cluster_se(
         tail_difference, data["trip_user"][calibration_trips])
-    corrected_tail = float(screen["model_tail_rate_ge_60"] + tail_bias)
+    corrected_tail = float(screen["model_tail_rate"] + tail_bias)
     corrected_tail_upper = float(corrected_tail + 1.96 * tail_bias_se)
     calibration_output = output.with_name(
         output.stem + "_calibration_per_trip.npz")
@@ -344,10 +405,15 @@ def main() -> None:
         calibration_output, trips=calibration_trips,
         observed=calibration_observed,
         screen_tail_probability=calibration_q8_tail,
-        confirm_tail_probability=calibration_q9_tail)
+        confirm_tail_probability=calibration_q9_tail,
+        confirm_level=calibration_used_level)
     tail_calibration = {
         "contexts": calibration_count,
         "seed": args.calibration_seed,
+        "requested_confirm_level": args.confirm_level,
+        "level_counts": level_usage(calibration_used_level),
+        "escalated_contexts": int(np.sum(
+            calibration_used_level > args.confirm_level)),
         "screen_tail_rate": float(calibration_q8_tail.mean()),
         "confirm_tail_rate": float(calibration_q9_tail.mean()),
         "confirm_minus_screen_tail_bias": tail_bias,
@@ -356,8 +422,9 @@ def main() -> None:
         "full_screen_bias_corrected_tail_rate_95_upper": corrected_tail_upper,
         "per_trip_output": str(calibration_output),
     }
-    calibration_error = corrected_tail - screen["observed_tail_rate_ge_60"]
-    screen_calibration_score = q8_tail - (observed >= 60).astype(np.float64)
+    calibration_error = corrected_tail - screen["observed_tail_rate"]
+    screen_calibration_score = q8_tail - (
+        observed >= tail_threshold).astype(np.float64)
     screen_calibration_se = household_cluster_se(
         screen_calibration_score, data["trip_user"][population])
     # Do not assume independence between the full-panel screen error and the random
@@ -383,19 +450,56 @@ def main() -> None:
                            "household-cluster and quadrature-bias uncertainty; not "
                            "future-population coverage"),
     }
+    support_extension = {
+        "status": "not_applicable",
+        "observed_training_maximum": observed_training_maximum,
+        "model_support_maximum": int(model.nmax),
+        "interpretation": "model support does not extend beyond the observed training maximum",
+    }
+    if support_extension_threshold is not None:
+        extension_q8_tail = np.exp(
+            q8[:, support_extension_threshold - 1:]).sum(1)
+        extension_calibration_q8 = extension_q8_tail[calibration_index]
+        extension_calibration_q9 = np.exp(
+            calibration_q9[:, support_extension_threshold - 1:]).sum(1)
+        extension_difference = (
+            extension_calibration_q9 - extension_calibration_q8)
+        extension_bias = float(extension_difference.mean())
+        extension_bias_se = household_cluster_se(
+            extension_difference, data["trip_user"][calibration_trips])
+        extension_corrected_rate = float(
+            extension_screen["model_tail_rate"] + extension_bias)
+        support_extension = {
+            "status": "not_identifiable",
+            "observed_training_maximum": observed_training_maximum,
+            "model_support_maximum": int(model.nmax),
+            "first_unobserved_size": support_extension_threshold,
+            "screen": extension_screen,
+            "high_risk_confirmation_for_primary_tail": extension_confirm,
+            "quadrature_bias_corrected_population_rate": extension_corrected_rate,
+            "quadrature_bias_standard_error": extension_bias_se,
+            "quadrature_bias_corrected_rate_95_upper": float(
+                extension_corrected_rate + 1.96 * extension_bias_se),
+            "observed_events_in_evaluated_split": int(
+                np.sum(observed >= support_extension_threshold)),
+            "interpretation": (
+                "No training basket identifies probabilities above the observed "
+                "training maximum. Nonzero mass there is model extrapolation and is "
+                "reported separately from calibration on the observed tail."),
+        }
     allowed_rate = (args.maximum_tail_rate_ratio
-                    * screen["observed_tail_rate_ge_60"]
+                    * screen["observed_tail_rate"]
                     + args.tail_rate_slack)
     gates = {
         "population_tail_rate_calibrated":
             corrected_tail_upper <= allowed_rate,
         "no_low_observed_context_has_majority_extreme_tail":
-            confirm["maximum_tail_probability_when_observed_lt_40"]
+            confirm["maximum_tail_probability_when_observed_is_low"]
             <= args.maximum_low_observed_tail,
         "adaptive_screen_covers_unconfirmed_extreme_tail":
             omitted_tail_upper <= args.maximum_low_observed_tail,
         "adaptive_screen_covers_unconfirmed_expected_size":
-            omitted_mean_upper < 60.0,
+            omitted_mean_upper < float(tail_threshold),
     }
     result = {
         "checkpoint": str(checkpoint), "split": args.split,
@@ -404,7 +508,12 @@ def main() -> None:
         "trained_capabilities": blob["trained_capabilities"],
         "full_population_contexts": int(full_population_size),
         "screened_complete_population": bool(len(population) == full_population_size),
-        "support": "1..120", "rank": args.rank,
+        "support": f"1..{model.nmax}", "rank": args.rank,
+        "tail_threshold": tail_threshold,
+        "tail_threshold_selection": (
+            "explicit_command_line" if args.tail_threshold is not None else
+            TAIL_THRESHOLD_SELECTION),
+        "low_observed_threshold": low_observed_threshold,
         "screen_level": args.screen_level,
         "confirm_level": args.confirm_level,
         "screen_estimator": {
@@ -415,6 +524,15 @@ def main() -> None:
         },
         "screen": screen, "high_risk_confirmation": confirm,
         "high_risk_per_trip_output": str(confirm_output),
+        "high_risk_confirmation_numerics": {
+            "requested_confirm_level": args.confirm_level,
+            "level_counts": level_usage(confirm_used_level),
+            "escalated_contexts": int(np.sum(
+                confirm_used_level > args.confirm_level)),
+            "policy": ("use the requested confirmation rule when all signed size "
+                       "masses are nonnegative; bisect invalid batches and escalate "
+                       "only invalid contexts through two higher rules"),
+        },
         "quadrature_fidelity": {
             **fidelity,
             "screen_confirm_one_item_fidelity_gate": (
@@ -428,6 +546,7 @@ def main() -> None:
         "numerical_fidelity_status": (
             "passed" if numerical_fidelity_passed else "failed"),
         "tail_calibration": separate_calibration,
+        "unobserved_support_extension": support_extension,
         "adaptive_high_risk_confirmation": adaptive_confirmation,
         "random_confirm_tail_calibration": tail_calibration,
         "allowed_model_tail_rate": allowed_rate,

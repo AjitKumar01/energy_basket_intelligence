@@ -11,7 +11,6 @@ from __future__ import annotations
 import argparse
 import copy
 import itertools
-import json
 import math
 import time
 from pathlib import Path
@@ -20,7 +19,6 @@ import numpy as np
 from scipy import sparse
 from scipy.stats import norm
 import torch
-from torch.nn.functional import softplus
 
 from interaction_particles import differentiable_log_size_beta0
 from pipeline_support import smolyak_rule
@@ -189,7 +187,6 @@ def deterministic_audit(seed, products=10, contexts=4, nmax=5):
             else:
                 # Independent scalar and score audit of the H-S/native/Smolyak path.
                 model.quad = smolyak_rule(model, model.Kz, model.Kz + 5)
-                model.quad_a = None
                 logz = model.log_Z(ix, drop_empty=True)
                 metrics["hs_logz_max_error"] = float((logz - energy.logsumexp(-1)).detach().abs().max())
                 parameters = [model.lam, model.phi, model.rho_c, model.rho_0_free]

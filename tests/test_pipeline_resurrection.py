@@ -299,24 +299,12 @@ def test_dry_run_uses_stratified_estimator_by_default(
     assert "--category-bound 0.0" in output
     assert "--size-ridge 0.001 --size-smoothness 0.1" in output
     assert "--rebuild-bank" in output
-    assert "fit_convex_natural_interactions.py" not in output
 
 
-def test_dry_run_retains_ordinary_estimator_only_as_explicit_legacy_option(
-        tmp_path, monkeypatch, capsys):
-    monkeypatch.setattr(pipeline, "ROOT", tmp_path)
-    monkeypatch.setattr(pipeline, "ART", tmp_path / "artifacts")
-    monkeypatch.setattr(pipeline, "REPORT", tmp_path / "reports")
-    monkeypatch.setattr(pipeline, "V4", tmp_path / "scripts" / "version4")
-    monkeypatch.setattr(pipeline, "preflight", lambda **_kwargs: None)
-    monkeypatch.setattr(
-        sys, "argv", ["run_pipeline.py", "--dry-run", "--profile", "smoke",
-                      "--start-at", "interaction", "--stop-after", "interaction",
-                      "--interaction-estimator", "legacy-ordinary"])
-    pipeline.main()
-    output = capsys.readouterr().out
-    assert "fit_convex_natural_interactions.py" in output
-    assert "fit_stratified_natural_interactions.py" not in output
+def test_stratified_band_draws_follow_data_dependent_support():
+    assert pipeline.stratified_band_draws(10, full=True) == [16, 16]
+    assert pipeline.stratified_band_draws(10, full=False) == [1, 1]
+    assert pipeline.stratified_band_draws(120, full=True) == [16, 16, 12, 8, 16, 16, 16]
 
 
 def test_full_test_score_is_reporting_only_not_a_gain_gate(

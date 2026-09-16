@@ -23,7 +23,7 @@ from audit_interaction_embeddings import (
     top_pairs,
 )
 from checkpoint_io import ROOT, load_checkpoint
-from data import build
+from data import BI, build
 from provenance import file_sha256, strict_json_dumps
 
 
@@ -299,7 +299,7 @@ def write_report(*, output: Path, figures: dict[str, Path], summary: dict,
         "",
         f"![Interaction norm versus product support]({_markdown_link(output, figures['support'])})",
         "",
-        rf"The Spearman correlation between $\|\phi_j\|_2$ and training basket-lines is".replace("\\\\", "\\"),
+        r"The Spearman correlation between $\|\phi_j\|_2$ and training basket-lines is".replace("\\\\", "\\"),
         f"**{support['spearman_norm_training_lines']:.3f}**; with the number of training",
         f"households it is **{support['spearman_norm_training_households']:.3f}**. The model",
         "therefore assigns most interaction leverage where the input data can estimate it.",
@@ -355,7 +355,7 @@ def write_report(*, output: Path, figures: dict[str, Path], summary: dict,
         f"{validation['control_expected']:,.1f} | {validation['control_aggregate_lift']:.3f} | "
         f"{validation['control_fraction_above_null']:.1%} |",
         "",
-        f"Across the selected pairs, Gram score and smoothed held-out lift have Spearman",
+        "Across the selected pairs, Gram score and smoothed held-out lift have Spearman",
         f"correlation **{validation['spearman_score_lift']:.3f}**. This is positive but weak:",
         "the embedding is informative in aggregate, while individual-pair uncertainty and",
         "uncontrolled context remain substantial.",
@@ -442,7 +442,7 @@ def main(args):
         required_capabilities=("conditional_nonempty_incidence", "gram_interactions"))
     rank = int(blob["active_rank"])
     phi = model.phi[:, :rank].detach().cpu().numpy()
-    metadata = pd.read_parquet(ROOT / "basket_input" / "items.parquet").sort_values(
+    metadata = pd.read_parquet(Path(BI) / "items.parquet").sort_values(
         "item_id").reset_index(drop=True)
     if len(metadata) != len(phi):
         raise RuntimeError("product metadata and interaction embedding have different rows")
@@ -454,7 +454,8 @@ def main(args):
     stability_cosines = np.asarray(stability["split_half_subspace_cosines"])
 
     eligible = metadata.n_train_lines.to_numpy() >= args.minimum_training_lines
-    category = metadata.cat_id.to_numpy()
+    category = model.cat_of.detach().cpu().numpy().astype(np.int64)
+    metadata["cat_id"] = category
     pairs = top_pairs(phi, category, eligible, args.pairs, relation="different")
     controls = matched_controls(pairs, phi, metadata, eligible, args.seed)
     heldout = heldout_pair_statistics(data, pairs + controls, split=2)
@@ -464,7 +465,6 @@ def main(args):
     top_lift = heldout["lift"][:pair_count]
     control_observed = heldout["observed"][pair_count:]
     control_expected = heldout["expected"][pair_count:]
-    control_lift = heldout["lift"][pair_count:]
     scores = np.asarray([pair[0] for pair in pairs])
     order = np.argsort(scores)
     deciles = []

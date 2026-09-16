@@ -41,3 +41,13 @@ def test_projection_clears_only_outward_adam_momentum_at_bound():
     np.testing.assert_allclose(
         optimizer.state[model.rho_c]["exp_avg"].numpy(), [0.0, 0.0, 4.0])
     assert result["cleared_outward_moments"] == 2
+
+
+def test_model_rho_c_floor_projection_runs_on_trainable_parameters():
+    from ragged import RaggedModel
+    model = RaggedModel(J=4, N=2, C=2, K=2, Kz=1, nmax=3, R=3)
+    with torch.no_grad():
+        model.rho_c.copy_(torch.tensor([-3.0, 0.5], dtype=model.rho_c.dtype))
+    assert model.rho_c.requires_grad
+    model.project_rho_c(-1.5)
+    assert model.rho_c.detach().tolist() == [-1.5, 0.5]

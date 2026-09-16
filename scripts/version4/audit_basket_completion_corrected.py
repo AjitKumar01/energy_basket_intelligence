@@ -216,7 +216,7 @@ def evaluate(args):
     pair_weight = (actual + 2) * (actual + 1) / 2.0
 
     batcher = Batcher(
-        data, Features(int(data["n_item"]), int(data["n_store"]), 712,
+        data, Features(int(data["n_item"]), int(data["n_store"]),
                        include_recency=False), nmax, include_recency=False)
     singular = torch.linalg.svdvals(model.phi)
     active_rank = int((singular > singular[0] * 1e-10).sum())

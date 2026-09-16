@@ -1,5 +1,8 @@
 """
-Data engineering for the version-3 fit on dunnhumby.
+Ragged assortment index and trip table for any model-data bundle.
+
+The bundle is read from ``$ENERGY_MODEL_DATA_ROOT/basket_input`` (the repository root when
+unset); Dunnhumby and canonical external adapters both emit this contract.
 
 WHAT THE MODEL NEEDS THAT THE EXISTING PIPELINE DOES NOT PROVIDE.  Version 3's normaliser
 sums over every subset of the STORE'S ASSORTMENT, so a trip's cost is set by how many
@@ -39,7 +42,8 @@ import pandas as pd
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.join(HERE, "..", "..")
-BI = os.path.join(ROOT, "basket_input")
+MODEL_DATA_ROOT = os.path.abspath(os.environ.get("ENERGY_MODEL_DATA_ROOT", ROOT))
+BI = os.path.join(MODEL_DATA_ROOT, "basket_input")
 CACHE = os.path.join(BI, "v3_index.npz")
 CACHE_AFF = os.path.join(BI, "v3_index_affinity.npz")
 _P = os.environ.get("V3_PARTITION", "")
@@ -50,13 +54,13 @@ def log(m):
     print(f"[dat] {m}", flush=True)
 
 
-def build(min_lines_per_store_cat=1, force=False):
+def build(force=False):
+    """Assortment index plus the trip table.  Cached; pass force=True to rebuild."""
     global CACHE
     if CACHE_PART is not None:
         CACHE = CACHE_PART          # a partition change rebuilds the whole ragged index
     elif os.environ.get("V3_AFFINITY", "0") == "1":
         CACHE = CACHE_AFF
-    """Assortment index plus the trip table.  Cached; pass force=True to rebuild."""
     if os.path.exists(CACHE) and not force:
         z = np.load(CACHE, allow_pickle=True)
         log(f"loaded cache {CACHE}")
@@ -136,7 +140,6 @@ def build(min_lines_per_store_cat=1, force=False):
     ptr = np.zeros(S * C + 1, np.int64)
     np.cumsum(counts, out=ptr[1:])
     item_slot = np.full((S, J), -1, np.int32)
-    starts = ptr[:-1].reshape(S, C)
     for r in range(len(pair)):
         k = key[r]
         item_slot[k // C, store_items[r]] = r - ptr[k]
@@ -182,41 +185,6 @@ def build(min_lines_per_store_cat=1, force=False):
     np.savez_compressed(CACHE, **out)
     log(f"wrote {CACHE}")
     return out
-
-
-def batch_index(D, trips, nmax, R):
-    """Ragged index for one batch of trips.
-
-    Returns the arrays the model needs, with items flat and only the category axis padded:
-
-        item_id   [T]      product id of every assortment slot in the batch
-        row_of    [T]      which (trip, category) row each slot belongs to
-        row_trip  [n_rows] which trip each row belongs to
-        row_cat   [n_rows] which category
-        row_k     [n_rows] how many of that category the observed basket holds
-        sel       [T]      1 where the slot is in the observed basket
-    """
-    S_ptr = D["store_cat_ptr"]
-    C = int(D["n_cat"])
-    items, row_of, row_trip, row_cat = [], [], [], []
-    nrow = 0
-    for bi, t in enumerate(trips):
-        s = int(D["trip_store"][t])
-        base = s * C
-        for c in range(C):
-            lo, hi = int(S_ptr[base + c]), int(S_ptr[base + c + 1])
-            if hi <= lo:
-                continue
-            items.append(D["store_items"][lo:hi])
-            row_of.append(np.full(hi - lo, nrow, np.int64))
-            row_trip.append(bi)
-            row_cat.append(c)
-            nrow += 1
-    item_id = np.concatenate(items)
-    row_of = np.concatenate(row_of)
-    return dict(item_id=item_id, row_of=row_of,
-                row_trip=np.array(row_trip, np.int64),
-                row_cat=np.array(row_cat, np.int64), n_rows=nrow)
 
 
 if __name__ == "__main__":

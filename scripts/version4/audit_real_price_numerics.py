@@ -14,7 +14,7 @@ import torch
 
 os.environ.setdefault("V3_AFFINITY", "1")
 
-from checkpoint_io import ROOT, load_checkpoint
+from checkpoint_io import load_checkpoint
 from data import build
 from features import Features
 from fit import Batcher
@@ -172,8 +172,8 @@ def main():
                "catalogue_prefix_bundle_0.8"]
     budgets = [int(x) for x in spec["particle_budgets"]]
     seeds = [int(x) for x in spec["replicate_seeds"]]
-    batcher = Batcher(data, Features(int(data["n_item"]), int(data["n_store"]), 712,
-                                    include_recency=False), int(meta["nmax"]),
+    batcher = Batcher(data, Features(int(data["n_item"]), int(data["n_store"]),
+                                     include_recency=False), int(meta["nmax"]),
                       include_recency=False)
     rank = int((torch.linalg.svdvals(model.phi) >
                 torch.linalg.svdvals(model.phi)[0] * 1e-10).sum())

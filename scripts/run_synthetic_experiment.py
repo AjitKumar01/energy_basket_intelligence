@@ -17,38 +17,11 @@ import sys
 import time
 from pathlib import Path
 
+from run_manifest import Tee, source_identity, write_manifest
+
 
 ROOT = Path(__file__).resolve().parents[1]
 V4 = ROOT / "scripts" / "version4"
-
-
-class Tee:
-    def __init__(self, original, path):
-        self.original = original
-        self.stream = path.open("x", buffering=1)
-
-    def write(self, text):
-        self.original.write(text)
-        self.stream.write(text)
-        return len(text)
-
-    def flush(self):
-        self.original.flush()
-        self.stream.flush()
-
-
-def write_manifest(path, value):
-    temporary = path.with_suffix(".pending.json")
-    temporary.write_text(json.dumps(value, indent=2, allow_nan=False) + "\n")
-    temporary.replace(path)
-
-
-def source_identity():
-    paths = sorted((ROOT / "scripts").rglob("*.py"))
-    paths += sorted((ROOT / "scripts").rglob("*.cpp"))
-    paths += sorted((ROOT / "tests").glob("*.py"))
-    return {str(path.relative_to(ROOT)): hashlib.sha256(path.read_bytes()).hexdigest()
-            for path in paths}
 
 
 def run(command: list[str], log_path: Path) -> float:

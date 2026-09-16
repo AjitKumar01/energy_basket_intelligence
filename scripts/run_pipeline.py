@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import argparse
-import hashlib
 import importlib.util
 import json
 import os
@@ -14,6 +13,10 @@ import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
+
+from version4.provenance import (file_sha256, load_data_fingerprint,
+                                 model_data_root as resolve_model_data_root,
+                                 require_fingerprint)
 
 ROOT = Path(__file__).resolve().parents[1]
 PY = sys.executable
@@ -31,30 +34,60 @@ RUN_MANIFEST = None
 RUN_STATUS = None
 
 
-def file_sha256(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as stream:
-        for block in iter(lambda: stream.read(8 << 20), b""):
-            digest.update(block)
-    return digest.hexdigest()
+def stratified_band_draws(nmax: int, *, full: bool) -> list[int]:
+    """Match the interaction sampling vector to the data-dependent size support."""
+    from version4.stratified_natural import SIZE_BAND_LOWER_BOUNDS
+    if int(nmax) < 1:
+        raise ValueError("nmax must be positive")
+    band_count = sum(lower <= int(nmax) for lower in SIZE_BAND_LOWER_BOUNDS)
+    production = [16, 16, 12, 8, 16, 16, 16]
+    if len(production) != len(SIZE_BAND_LOWER_BOUNDS):
+        raise RuntimeError("production band draws do not match the declared size strata")
+    return production[:band_count] if full else [1] * band_count
+
+
+def model_data_root() -> Path:
+    """Resolve at call time so tests and embedded drivers can relocate ROOT safely."""
+    return resolve_model_data_root(ROOT)
 
 
 def current_data_fingerprint(*, dry_run: bool) -> str | None:
-    path = ROOT / "basket_input" / "model_data_fingerprint.json"
+    path = model_data_root() / "basket_input" / "model_data_fingerprint.json"
     require_files("data", (path,), dry_run=dry_run)
     if dry_run:
         return None
     try:
-        payload = json.loads(path.read_text())
-        recorded = str(payload.pop("fingerprint_sha256"))
-        canonical = json.dumps(
-            payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True,
-            allow_nan=False).encode("utf-8")
-        if hashlib.sha256(canonical).hexdigest() != recorded:
-            raise ValueError("self digest does not match")
-        return recorded
+        return load_data_fingerprint(model_data_root())["fingerprint_sha256"]
     except Exception as exc:
         raise SystemExit(f"cannot read model-data fingerprint {path}: {exc}") from exc
+
+
+def verify_data_bundle(*, dry_run: bool) -> None:
+    """Self-verify the fingerprint and re-hash every model-facing file it names."""
+    recorded = current_data_fingerprint(dry_run=dry_run)
+    if not dry_run:
+        require_fingerprint(recorded, model_data_root())
+
+
+def price_configuration_from_evidence(status: int, report_path: Path,
+                                      coefficients_path: Path) -> tuple:
+    """Map the price-evidence stage's exit status and verdict to additive-fit flags."""
+    try:
+        report = json.loads(report_path.read_text())
+    except Exception as exc:
+        raise SystemExit(
+            f"price-evidence stage exited {status} without a readable verdict "
+            f"{report_path}: {exc}") from exc
+    passed = report.get("passed") is True
+    if status not in (0, 2) or (status == 0) != passed:
+        raise SystemExit(
+            f"price-evidence stage exit status {status} is inconsistent with its verdict "
+            f"passed={report.get('passed')}")
+    if passed:
+        return ("--supported-price-coefficients", coefficients_path)
+    print("[pipeline] price evidence failed its held-out gate; fitting the basket law "
+          "with price response fixed to zero", flush=True)
+    return ("--disable-price-response",)
 
 
 def stage_index(stage: str) -> int:
@@ -167,6 +200,9 @@ def validate_completed_additive(best: Path, latest: Path, initialization: Path,
             <= float(config["min_lr"]) + 1e-15
             and int(scheduler.get("evaluations_since_best", -1))
             >= int(config["convergence_patience"])
+            and scheduler.get(
+                "convergence_patience_basis", "legacy_numerical_best")
+            in {"material_validation_gain", "legacy_numerical_best"}
         )
         if not converged:
             raise SystemExit(
@@ -323,27 +359,37 @@ def preflight(*, from_raw: bool, stop_after: str) -> None:
             "missing Python dependencies: " + ", ".join(missing_modules)
             + "; run python -m pip install -r requirements.txt")
 
-    raw = resolve_raw_directory()
-    missing_raw = [raw / name for name in (
-        "transaction_data.csv", "product.csv", "causal_data.csv")
-        if not (raw / name).is_file()]
-    if missing_raw:
-        raise SystemExit(
-            "raw dunnhumby input is incomplete; set NF_RAW_DIR to the directory "
-            "containing transaction_data.csv, product.csv and causal_data.csv; missing: "
-            + ", ".join(map(str, missing_raw)))
+    data_root = model_data_root()
+    if from_raw:
+        if data_root != ROOT.resolve():
+            raise SystemExit(
+                "--from-raw invokes the Dunnhumby builders and therefore cannot be "
+                "combined with ENERGY_MODEL_DATA_ROOT; build an external dataset with "
+                "its canonical adapter, then start this pipeline at initialize")
+        raw = resolve_raw_directory()
+        missing_raw = [raw / name for name in (
+            "transaction_data.csv", "product.csv", "causal_data.csv")
+            if not (raw / name).is_file()]
+        if missing_raw:
+            raise SystemExit(
+                "raw dunnhumby input is incomplete; set NF_RAW_DIR to the directory "
+                "containing transaction_data.csv, product.csv and causal_data.csv; missing: "
+                + ", ".join(map(str, missing_raw)))
 
     if not from_raw:
         required = (
-            ROOT / "data" / "tx.parquet",
-            ROOT / "data" / "price_week.parquet",
-            ROOT / "data" / "price_store_week.parquet",
-            ROOT / "data" / "build_meta.json",
-            ROOT / "basket_input" / "meta.json",
-            ROOT / "basket_input" / "items.parquet",
-            ROOT / "basket_input" / "baskets.parquet",
-            ROOT / "basket_input" / "promo.npz",
+            data_root / "data" / "price_week.parquet",
+            data_root / "data" / "build_meta.json",
+            data_root / "basket_input" / "meta.json",
+            data_root / "basket_input" / "items.parquet",
+            data_root / "basket_input" / "baskets.parquet",
+            data_root / "basket_input" / "promo.npz",
         )
+        if data_root == ROOT.resolve():
+            required += (
+                data_root / "data" / "tx.parquet",
+                data_root / "data" / "price_store_week.parquet",
+            )
         missing_derived = [path for path in required if not path.is_file()]
         if missing_derived:
             raise SystemExit(
@@ -382,7 +428,7 @@ class Driver:
         if self.log_dir is None:
             code = subprocess.run(command, cwd=ROOT, env=self.environment, check=False).returncode
         else:
-            from run_synthetic_experiment import write_manifest, source_identity
+            from run_manifest import write_manifest, source_identity
             if source_identity() != RUN_STATUS["source_sha256"]:
                 raise RuntimeError("source changed during original-data pipeline; freeze code and resume explicitly")
             name = f"{len(self.commands):02d}_{Path(next(x for x in command if x.endswith('.py'))).stem}"
@@ -489,16 +535,14 @@ def main() -> None:
                         help=("continue an exact-additive checkpoint with optimizer and "
                               "minibatch stream intact; downstream stages still rerun"))
     parser.add_argument(
+        "--price-coefficients", type=Path,
+        help=("certified direct joint-basket price coefficient artifact; when supplied, "
+              "skip the legacy price-change evidence stage and use this immutable input"))
+    parser.add_argument(
         "--start-at", choices=STAGES,
         help=("resurrect a partially completed pipeline from this stage; all earlier "
               "artifacts are validated and reused"))
     parser.add_argument("--stop-after", choices=STAGES, default="certification")
-    parser.add_argument(
-        "--interaction-estimator", choices=("stratified", "legacy-ordinary"),
-        default="stratified",
-        help=("stratified is the certified default and jointly refines C and rho_0 "
-              "with explicit size-band coverage; legacy-ordinary preserves the former "
-              "unstratified estimator for result reproduction only"))
     parser.add_argument(
         "--rebuild-interaction-bank", action="store_true",
         help="resample the stratified estimator's derived draw cache")
@@ -511,7 +555,7 @@ def main() -> None:
             run_dir.mkdir(parents=True, exist_ok=not fresh)
         ART, REPORT, OUT = run_dir / "artifacts", run_dir / "reports", run_dir / "out"
         if not args.dry_run:
-            from run_synthetic_experiment import Tee, write_manifest, source_identity
+            from run_manifest import Tee, write_manifest, source_identity
             stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
             log_dir = run_dir / f"invocation_{stamp}"
             log_dir.mkdir(exist_ok=False)
@@ -520,6 +564,7 @@ def main() -> None:
             RUN_MANIFEST = log_dir / "manifest.json"
             RUN_STATUS = {"status": "running", "pid": os.getpid(), "started_utc": stamp,
                           "run_dir": str(run_dir), "profile": args.profile,
+                          "model_data_root": str(model_data_root()),
                           "source_sha256": source_identity(), "stages": [],
                           "configuration": {k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()}}
             write_manifest(RUN_MANIFEST, RUN_STATUS)
@@ -530,13 +575,12 @@ def main() -> None:
         parser.error("--from-raw requires --start-at data (or no --start-at)")
     if args.resume_additive is not None and start_at != "additive":
         parser.error("--resume-additive requires --start-at additive")
+    if args.resume_additive is not None and args.price_coefficients is not None:
+        parser.error("--price-coefficients cannot change during --resume-additive")
     if stage_index(args.stop_after) < stage_index(start_at):
         parser.error("--stop-after must be the same as or later than --start-at")
     if args.threads < 0:
         parser.error("--threads cannot be negative")
-    if args.rebuild_interaction_bank and args.interaction_estimator != "stratified":
-        parser.error("--rebuild-interaction-bank requires --interaction-estimator "
-                     "stratified")
     preflight(from_raw=args.from_raw, stop_after=args.stop_after)
     from runtime_capabilities import (detect_runtime, resolve_backend,
                                       write_runtime_report)
@@ -574,6 +618,7 @@ def main() -> None:
     print(f"[pipeline] backend={selected_device}, CPU threads={cpu_threads}, "
           f"RAM={capabilities.memory_gib or 'unknown'} GiB{accelerator}", flush=True)
     print(f"[pipeline] execution window: {start_at} -> {args.stop_after}", flush=True)
+    print(f"[pipeline] model data root: {model_data_root()}", flush=True)
     print(f"[pipeline] hardware report: {ART / 'runtime_capabilities.json'}", flush=True)
     driver = Driver(args.dry_run, log_dir if args.run_dir is not None and not args.dry_run else None)
 
@@ -583,16 +628,19 @@ def main() -> None:
         driver.run([PY, "-u", "scripts/data/23_promo_data.py"])
     # Always fail closed on data integrity, including when reusing derived files.
     if start_at == "data":
-        driver.run([PY, "-u", "scripts/data/audit_preprocessing.py"])
-        driver.run(script("build_affinity_partition.py"))
-        driver.run(script("data.py", "--force"))
-        driver.run(script("provenance.py"))
+        if model_data_root() == ROOT.resolve():
+            driver.run([PY, "-u", "scripts/data/audit_preprocessing.py"])
+            driver.run(script("build_affinity_partition.py"))
+            driver.run(script("data.py", "--force"))
+            driver.run(script("provenance.py"))
+        else:
+            # External adapters own their preprocessing and immutable partition.  Running
+            # the Dunnhumby audit here would inspect ROOT rather than the selected bundle.
+            verify_data_bundle(dry_run=driver.dry_run)
+            print("[pipeline] verified canonical external model-data bundle", flush=True)
     else:
         # Reuse the audited input without overwriting shared historical artifacts.
-        current_data_fingerprint(dry_run=driver.dry_run)
-        if not driver.dry_run:
-            from version4.provenance import require_fingerprint
-            require_fingerprint(current_data_fingerprint(dry_run=False), ROOT)
+        verify_data_bundle(dry_run=driver.dry_run)
     if args.stop_after == "data":
         return
 
@@ -604,9 +652,14 @@ def main() -> None:
         driver.run(script("initialize_version4.py", "--output", initialization,
                           "--manifest", ART / "initialization.json",
                           "--household-size-rank1", "--threads", cpu_threads))
+        initialization_blob = validate_initialization(
+            initialization, dry_run=driver.dry_run)
     else:
-        validate_initialization(initialization, dry_run=driver.dry_run)
+        initialization_blob = validate_initialization(
+            initialization, dry_run=driver.dry_run)
         print(f"[pipeline] resurrected initialization: {initialization}", flush=True)
+    initialization_nmax = (120 if initialization_blob is None else
+                           int(initialization_blob["metadata"]["nmax"]))
     if args.stop_after == "initialize":
         return
 
@@ -619,11 +672,39 @@ def main() -> None:
         price_evidence_dir = ART / "supported_price_response"
         price_evidence_report = price_evidence_dir / "report.json"
         price_coefficients = price_evidence_dir / "coefficients.json"
-        driver.run(script(
-            "fit_supported_price_response.py",
-            "--output", price_evidence_report,
-            "--coefficients-output", price_coefficients,
-            "--seed", 68101))
+        supplied_price = args.price_coefficients
+        if supplied_price is not None:
+            supplied_price = (supplied_price if supplied_price.is_absolute()
+                              else ROOT / supplied_price).resolve()
+            require_files("additive", (supplied_price,), dry_run=driver.dry_run)
+            if not driver.dry_run:
+                try:
+                    supplied_payload = json.loads(supplied_price.read_text())
+                except Exception as exc:
+                    raise SystemExit(
+                        f"cannot read supplied price coefficients {supplied_price}: {exc}") from exc
+                if supplied_payload.get("status") != "certified_observational_predictor":
+                    raise SystemExit("--price-coefficients is not a certified artifact")
+                if supplied_payload.get("price_feature_contract") != "chain_product_week_only":
+                    raise SystemExit(
+                        "direct current-price coefficients must declare the chain-only feature contract")
+            price_configuration = ("--supported-price-coefficients", supplied_price)
+            print(f"[pipeline] using supplied direct joint-basket price coefficients: "
+                  f"{supplied_price}", flush=True)
+        else:
+            # The evidence stage exits 2 when no price component is certified.  That is
+            # a verdict, not a crash: fit the basket law with price fixed to zero.
+            evidence_status = driver.run(script(
+                "fit_supported_price_response.py",
+                "--output", price_evidence_report,
+                "--coefficients-output", price_coefficients,
+                "--seed", 68101), allow_failure=True)
+            if driver.dry_run:
+                price_configuration = ("--supported-price-coefficients",
+                                       price_coefficients)
+            else:
+                price_configuration = price_configuration_from_evidence(
+                    evidence_status, price_evidence_report, price_coefficients)
         if args.resume_additive is not None:
             resume_path = (args.resume_additive if args.resume_additive.is_absolute()
                            else ROOT / args.resume_additive)
@@ -643,7 +724,7 @@ def main() -> None:
             "--convergence-min-updates", 4000 if full else 10,
             "--validation-min-delta", 0.001,
             "--rkl-w", 10.0, "--elast-w", 0.0,
-            "--supported-price-coefficients", price_coefficients,
+            *price_configuration,
             "--pool-prod", 1.45, "--lam-centre", 1, "--seed", 29001,
             "--threads", cpu_threads,
             "--rho-c-max-category-reward", 1.5,
@@ -651,7 +732,9 @@ def main() -> None:
             *(('--resume', args.resume_additive)
               if args.resume_additive is not None else ()))
         driver.run(additive_command)
-    elif start_at != "certification":
+    else:
+        # Certification also reads the additive parent (size-phase diagnostic), so its
+        # lineage is validated on every resumed invocation.
         additive_blob = validate_completed_additive(
             additive, additive_latest, initialization,
             profile=args.profile, dry_run=driver.dry_run)
@@ -681,36 +764,22 @@ def main() -> None:
     interaction_candidate = ART / "candidate.pt"
     candidate = ART / "candidate_rank1.pt"
     if runs_stage(start_at, "interaction"):
-        if args.interaction_estimator == "stratified":
-            driver.run(script(
-                "fit_stratified_natural_interactions.py", "--parent", additive,
-                "--spectral", basis, "--contexts", 12000 if full else 64,
-                "--band-draws", *( [16, 16, 12, 8, 16, 16, 16] if full
-                                   else [1, 1, 1, 1, 1, 1, 1]),
-                "--batch", 96 if full else 8, "--rank", rank,
-                "--score-mass", 1.0, "--spectral-max", 1.0,
-                "--category-bound", 0.0,
-                "--size-ridge", 1e-3, "--size-smoothness", 1e-1,
-                *(("--rebuild-bank",) if args.rebuild_interaction_bank else ()),
-                "--threads", cpu_threads,
-                "--minimum-crossfit-gain", 0.005 if full else -1.0,
-                "--minimum-half-gain", 0.0 if full else -1e9,
-                "--minimum-within-band-ess-fraction", 0.20 if full else 0.0,
-                "--minimum-within-band-ess", 2.0 if full else 0.0,
-                "--output", interaction_candidate))
-        else:
-            driver.run(script(
-                "fit_convex_natural_interactions.py", "--parent", additive,
-                "--spectral", basis, "--contexts", 12000 if full else 64,
-                "--draws", 64 if full else 4, "--batch", 96 if full else 8,
-                "--rank", rank, "--score-mass", 1.0, "--spectral-max", 1.0,
-                "--joint-additive-polish", "--additive-polish-ridge", 1e-3,
-                "--threads", cpu_threads,
-                "--minimum-crossfit-gain", 0.005 if full else -1.0,
-                "--minimum-half-gain", 0.0 if full else -1e9,
-                "--minimum-ess-fraction", 0.20 if full else 0.0,
-                "--minimum-ess-p01", 2.0 if full else 0.0,
-                "--output", interaction_candidate))
+        driver.run(script(
+            "fit_stratified_natural_interactions.py", "--parent", additive,
+            "--spectral", basis, "--contexts", 12000 if full else 64,
+            "--band-draws", *stratified_band_draws(
+                initialization_nmax, full=full),
+            "--batch", 96 if full else 8, "--rank", rank,
+            "--score-mass", 1.0, "--spectral-max", 1.0,
+            "--category-bound", 0.0,
+            "--size-ridge", 1e-3, "--size-smoothness", 1e-1,
+            *(("--rebuild-bank",) if args.rebuild_interaction_bank else ()),
+            "--threads", cpu_threads,
+            "--minimum-crossfit-gain", 0.005 if full else -1.0,
+            "--minimum-half-gain", 0.0 if full else -1e9,
+            "--minimum-within-band-ess-fraction", 0.20 if full else 0.0,
+            "--minimum-within-band-ess", 2.0 if full else 0.0,
+            "--output", interaction_candidate))
         if not driver.dry_run:
             interaction_report = json.loads(
                 interaction_candidate.with_suffix(".json").read_text())
@@ -721,8 +790,8 @@ def main() -> None:
                 raise SystemExit(
                     "natural-parameter solve produced no positive interaction rank")
             if fitted_rank != rank:
-                print(f"[pipeline] convex solve reduced certified basis rank {rank} "
-                      f"to active rank {fitted_rank}")
+                print(f"[pipeline] natural-parameter solve reduced certified basis rank "
+                      f"{rank} to active rank {fitted_rank}")
             rank = fitted_rank
         print("[pipeline] post-interaction size block: retain the additive kappa_h and "
               "test only a cross-fitted residual household increment", flush=True)
@@ -829,7 +898,7 @@ def main() -> None:
         "--contexts-per-panel", 64 if full else 2,
         "--threads", cpu_threads,
         "--output", REPORT / "size_phase_diagnostic.json"))
-    driver.run(script(
+    pricing_command = script(
         "run_segment_pricing_mdp.py", "--checkpoint", candidate,
         "--assignments", ART / "customer_segments.npz",
         "--segment-report", REPORT / "customer_segments.json",
@@ -842,8 +911,32 @@ def main() -> None:
         "--products-per-bundle", 5 if full else 3,
         "--horizon-days", 28 if full else 7,
         "--budget-bins", 4000 if full else 200,
-            "--minimum-budget-utilization", 0.0,
-        "--output", REPORT / "segment_promotion_mdp.json"))
+        "--minimum-budget-utilization", 0.0,
+        "--output", REPORT / "segment_promotion_mdp.json")
+    if driver.dry_run:
+        print("[pipeline] pricing policy is conditional on a nonzero, held-out-supported "
+              "price component", flush=True)
+        driver.run(pricing_command)
+    else:
+        price_estimator = load_checkpoint_blob(
+            candidate, "final candidate").get("price_response_estimator")
+        if price_estimator == "fixed_zero_after_failed_heldout_support":
+            skipped = {
+                "status": "not_assessed",
+                "reason": ("held-out price evidence failed and the fitted price "
+                           "response is fixed to zero; policy computation would be "
+                           "uninformative"),
+                "checkpoint": str(candidate),
+                "checkpoint_sha256": file_sha256(candidate),
+                "price_response_estimator": price_estimator,
+            }
+            destination = REPORT / "segment_promotion_mdp.json"
+            destination.write_text(
+                json.dumps(skipped, indent=2, sort_keys=True) + "\n")
+            print(f"[pipeline] skipped pricing policy; verdict written to {destination}",
+                  flush=True)
+        else:
+            driver.run(pricing_command)
     if args.dry_run:
         print("[pipeline] dry run complete; no stage was executed")
     elif full:
@@ -861,12 +954,12 @@ if __name__ == "__main__":
         main()
     except BaseException as exc:
         if RUN_STATUS is not None:
-            from run_synthetic_experiment import write_manifest
+            from run_manifest import write_manifest
             RUN_STATUS.update(status="failed", error=repr(exc))
             write_manifest(RUN_MANIFEST, RUN_STATUS)
         raise
     else:
         if RUN_STATUS is not None:
-            from run_synthetic_experiment import write_manifest
+            from run_manifest import write_manifest
             RUN_STATUS.update(status="completed", current_stage=None)
             write_manifest(RUN_MANIFEST, RUN_STATUS)

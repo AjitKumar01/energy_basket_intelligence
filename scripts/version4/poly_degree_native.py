@@ -49,31 +49,6 @@ def poly_tree_degree_native(coefficients, degree, nmax):
     return _DegreeProduct.apply(coefficients, degree, int(nmax))
 
 
-class _BlockedESP(torch.autograd.Function):
-    @staticmethod
-    def forward(ctx, weights, lengths, nmax, block_size):
-        value, boundary = _native().esp_forward(
-            weights.contiguous(), lengths.contiguous(), int(nmax), int(block_size))
-        ctx.save_for_backward(weights, lengths, boundary)
-        ctx.nmax = int(nmax)
-        ctx.block_size = int(block_size)
-        return value
-
-    @staticmethod
-    @torch.autograd.function.once_differentiable
-    def backward(ctx, grad_output):
-        weights, lengths, boundary = ctx.saved_tensors
-        gradient = _native().esp_backward(
-            grad_output.contiguous(), weights, lengths, boundary,
-            ctx.nmax, ctx.block_size)
-        return gradient, None, None, None
-
-
-def esp_blocked_native(weights, lengths, nmax, block_size=32):
-    """Exact subtraction-free ESP recursion with a blocked native adjoint."""
-    return _BlockedESP.apply(weights, lengths, int(nmax), int(block_size))
-
-
 class _BlockedLogESP(torch.autograd.Function):
     @staticmethod
     def forward(ctx, log_weights, lengths, nmax, block_size):

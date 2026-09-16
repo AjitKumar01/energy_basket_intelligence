@@ -24,7 +24,6 @@ from checkpoint_io import ROOT, load_checkpoint
 from data import build
 from features import Features
 from fit import Batcher
-from fit_convex_natural_interactions import atomic_save, pair_statistic, spectral_basis
 from pipeline_support import supported_trips
 from provenance import file_sha256, strict_json_dumps
 from stratified_natural import (
@@ -39,6 +38,37 @@ from tempered_block_gibbs import conditional_slots_stratified, default_size_band
 
 
 torch.set_default_dtype(torch.float64)
+
+
+def spectral_basis(path: Path, rank: int, score_mass: float) -> tuple[np.ndarray, int]:
+    """Orthonormal product basis U of the certified rank, restricted to its score mass."""
+    spectral = np.load(path)
+    raw = np.asarray(spectral["eigenvectors"][:, :rank], dtype=np.float64)
+    values = np.asarray(spectral["eigenvalues"][:rank], dtype=np.float64)
+    row_mass = (np.square(raw) * np.clip(values, 0.0, None)[None, :]).sum(1)
+    if not np.isfinite(row_mass).all() or row_mass.sum() <= 0:
+        raise RuntimeError("spectral basis has no finite positive score mass")
+    order = np.argsort(row_mass)[::-1]
+    cumulative = np.cumsum(row_mass[order]) / row_mass.sum()
+    keep_count = min(len(row_mass), int(np.searchsorted(cumulative, score_mass) + 1))
+    keep = np.zeros(len(row_mass), dtype=bool)
+    keep[order[:keep_count]] = True
+    raw[~keep] = 0.0
+    basis, _ = np.linalg.qr(raw)
+    return basis, keep_count
+
+
+def pair_statistic(items: torch.Tensor, basis: torch.Tensor) -> np.ndarray:
+    """F(S) such that tr(C F(S)) is the Version-4 pair energy for K = U C U'."""
+    rows = basis[torch.unique(items)]
+    total = rows.sum(0)
+    return (0.5 * (torch.outer(total, total) - rows.T @ rows)).cpu().numpy()
+
+
+def atomic_save(path: Path, payload: dict) -> None:
+    temporary = Path(str(path) + ".tmp")
+    torch.save(payload, temporary)
+    os.replace(temporary, path)
 
 
 def candidate_gate_failures(row: dict, *, minimum_gain: float,
@@ -208,13 +238,19 @@ def build_bank(model, batcher, trips: np.ndarray, basis: torch.Tensor,
     return bank, band_of_draw
 
 
+def default_size_knots(nmax: int) -> list[int]:
+    """Use the production knot grid clipped to the checkpoint's support."""
+    base = (1, 2, 3, 4, 5, 7, 10, 15, 25, 40, 70, 120)
+    return list(dict.fromkeys([value for value in base if value < nmax] + [int(nmax)]))
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--parent", type=Path, required=True)
     parser.add_argument("--spectral", type=Path, required=True)
     parser.add_argument("--contexts", type=int, default=12000)
     parser.add_argument("--band-draws", type=int, nargs="+",
-                        default=[16, 16, 12, 8, 8, 8, 8])
+                        default=None)
     parser.add_argument("--batch", type=int, default=96)
     parser.add_argument("--rank", type=int, required=True)
     parser.add_argument("--score-mass", type=float, default=1.0)
@@ -226,7 +262,7 @@ def main() -> None:
     parser.add_argument("--size-ridge", type=float, default=1e-3)
     parser.add_argument("--size-smoothness", type=float, default=1e-1)
     parser.add_argument("--size-knots", type=int, nargs="+",
-                        default=[1, 2, 3, 4, 5, 7, 10, 15, 25, 40, 70, 120])
+                        default=None)
     parser.add_argument(
         "--category-bound", type=float, default=0.0,
         help=("0 freezes the already fitted category penalty and omits its 300 "
@@ -279,6 +315,11 @@ def main() -> None:
         raise RuntimeError("spectral basis and additive parent do not share lineage")
     basis = torch.as_tensor(basis_np, dtype=model.phi.dtype)
     bands = default_size_bands(model.nmax)
+    if args.size_knots is None:
+        args.size_knots = default_size_knots(model.nmax)
+    if args.band_draws is None:
+        production_draws = [16, 16, 12, 8, 8, 8, 8]
+        args.band_draws = production_draws[:len(bands)]
     if args.size_knots[-1] != model.nmax:
         raise ValueError("the last --size-knots value must equal model nmax")
     size_basis = linear_size_basis(model.nmax, args.size_knots)
@@ -319,7 +360,7 @@ def main() -> None:
         raise FileNotFoundError(f"required stratified bank does not exist: {cache}")
     if bank is None:
         batcher = Batcher(
-            data, Features(int(data["n_item"]), int(data["n_store"]), 712,
+            data, Features(int(data["n_item"]), int(data["n_store"]),
                            include_recency=False), model.nmax, include_recency=False)
         bank, band_of_draw = build_bank(
             model, batcher, trips, basis, bands, args.band_draws, args.batch,

@@ -92,11 +92,23 @@ def test_concave_household_solve_matches_observed_mean_and_cap_is_monotone():
     padded -= np.logaddexp.reduce(padded, axis=1)[:, None]
     unsafe = np.asarray([0.2, 0.2])
     safe, upper = cap_households(
-        padded, household, unsafe, n_household=2, screen_tail_cap=0.35)
+        padded, household, unsafe, n_household=2, screen_tail_cap=0.35,
+        tail_threshold=60)
     probability = np.exp(normalized_tilt(padded, safe, household))
     assert probability[:, 59:].sum(1).max() <= 0.35 + 1e-10
     assert np.all(safe <= unsafe)
     assert np.isfinite(upper).any()
+
+    # A short support (as in ERIM, 1..10) must still be capped at its own threshold;
+    # a fixed size-60 tail would be empty and silently disable the projection.
+    unsafe = np.asarray([2.0, 2.0])
+    safe, upper = cap_households(
+        base, household, unsafe, n_household=2, screen_tail_cap=0.35,
+        tail_threshold=4)
+    probability = np.exp(normalized_tilt(base, safe, household))
+    assert np.exp(normalized_tilt(base, unsafe, household))[:, 3:].sum(1).max() > 0.35
+    assert probability[:, 3:].sum(1).max() <= 0.35 + 1e-10
+    assert np.all(safe < unsafe)
 
 
 def test_crossfit_keeps_same_household_day_in_one_fold():

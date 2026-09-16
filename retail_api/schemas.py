@@ -19,8 +19,10 @@ class RetailContext(StrictModel):
     kind: Literal["retail_context"] = "retail_context"
     household_index: Annotated[int, Field(ge=0)]
     store_index: Annotated[int, Field(ge=0)]
-    day: Annotated[int, Field(ge=0, le=711)]
-    week: Annotated[int, Field(ge=9, le=101)]
+    # Ranges depend on the fitted dataset; the service checks them against the loaded
+    # price panel and promotion coverage.
+    day: Annotated[int, Field(ge=0)]
+    week: Annotated[int, Field(ge=1)]
 
 
 Context = Annotated[HistoricalContext | RetailContext, Field(discriminator="kind")]

@@ -25,11 +25,18 @@ from scipy.optimize import minimize
 from scipy.special import expit
 
 from checkpoint_io import ROOT
-from provenance import file_sha256, strict_json_dumps
+from provenance import file_sha256, model_data_root, strict_json_dumps
+
+
+DATA_ROOT = model_data_root(ROOT)
+BI = DATA_ROOT / "basket_input"
+DATA = DATA_ROOT / "data"
 
 
 def _sparse_lookup(keys: np.ndarray, values: np.ndarray,
                    query: np.ndarray) -> np.ndarray:
+    if len(keys) == 0:
+        return np.zeros(len(query), dtype=values.dtype)
     position = np.searchsorted(keys, query)
     safe = np.minimum(position, len(keys) - 1)
     found = (position < len(keys)) & (keys[safe] == query)
@@ -47,13 +54,13 @@ def build_complete_exposure_events() -> tuple[pd.DataFrame, dict]:
     covariates, while counts include explicit zeros.
     """
     baskets = pd.read_parquet(
-        ROOT / "basket_input/baskets.parquet",
+        BI / "baskets.parquet",
         columns=["BASKET_ID", "WEEK_NO", "item_id", "store_id"])
     items = pd.read_parquet(
-        ROOT / "basket_input/items.parquet",
+        BI / "items.parquet",
         columns=["PRODUCT_ID", "item_id", "n_train_lines", "cat_id"])
     products = int(items.item_id.max()) + 1
-    with np.load(ROOT / "basket_input/store_price.npz") as store_price:
+    with np.load(BI / "store_price.npz") as store_price:
         carried = store_price["carried"].astype(bool)
         stores = int(store_price["n_stores"])
     if carried.shape != (products, stores):
@@ -76,36 +83,66 @@ def build_complete_exposure_events() -> tuple[pd.DataFrame, dict]:
     bought_key = bought_key[bought_order]
     bought_value = bought.to_numpy(np.int64)[bought_order]
 
-    weekly = pd.read_parquet(
-        ROOT / "data/price_week.parquet",
-        columns=["PRODUCT_ID", "WEEK_NO", "price", "base_price"])
-    weekly = weekly.merge(
-        items[["PRODUCT_ID", "item_id"]], on="PRODUCT_ID", how="inner",
-        validate="many_to_one")
-    price = np.full((products, 128), np.nan, dtype=np.float64)
+    meta = json.loads((BI / "meta.json").read_text())
+    n_periods = int(meta["analysis_last_week"])
+    weekly_path = DATA / "price_week.parquet"
+    if weekly_path.is_file():
+        weekly = pd.read_parquet(
+            weekly_path,
+            columns=["PRODUCT_ID", "WEEK_NO", "price", "base_price"])
+        weekly = weekly.merge(
+            items[["PRODUCT_ID", "item_id"]], on="PRODUCT_ID", how="inner",
+            validate="many_to_one")
+        weekly_price_source = "declared price_week.parquet"
+    else:
+        daily_price = np.exp(np.load(BI / "log_price.npy").astype(np.float64))
+        if daily_price.shape[0] != products or daily_price.shape[1] < n_periods * 7:
+            raise RuntimeError("model log-price panel does not cover declared periods")
+        period = np.arange(1, n_periods + 1, dtype=np.int64)
+        weekly = pd.DataFrame({
+            "item_id": np.repeat(np.arange(products), n_periods),
+            "WEEK_NO": np.tile(period, products),
+            "price": daily_price[:, ::7][:, :n_periods].reshape(-1),
+        })
+        weekly["base_price"] = weekly.price
+        weekly_price_source = "audited canonical log_price.npy period panel"
+    price = np.full((products, n_periods + 1), np.nan, dtype=np.float64)
     base = np.full_like(price, np.nan)
     price[weekly.item_id.to_numpy(np.int64), weekly.WEEK_NO.to_numpy(np.int64)] = \
         weekly.price.to_numpy(np.float64)
     base[weekly.item_id.to_numpy(np.int64), weekly.WEEK_NO.to_numpy(np.int64)] = \
         weekly.base_price.to_numpy(np.float64)
-    price = pd.DataFrame(price).ffill(axis=1).bfill(axis=1).to_numpy()
-    base = pd.DataFrame(base).ffill(axis=1).bfill(axis=1).to_numpy()
-    if not np.isfinite(price).all() or not np.isfinite(base).all() \
-            or (price <= 0).any() or (base <= 0).any():
+    reliable_product = np.isfinite(price).any(axis=1) & np.isfinite(base).any(axis=1)
+    price[reliable_product] = (pd.DataFrame(price[reliable_product])
+                               .ffill(axis=1).bfill(axis=1).to_numpy())
+    base[reliable_product] = (pd.DataFrame(base[reliable_product])
+                              .ffill(axis=1).bfill(axis=1).to_numpy())
+    if (not np.isfinite(price[reliable_product]).all()
+            or not np.isfinite(base[reliable_product]).all()
+            or (price[reliable_product] <= 0).any()
+            or (base[reliable_product] <= 0).any()):
         raise RuntimeError("carried chain price exposure has invalid cells")
 
-    with np.load(ROOT / "basket_input/promo.npz") as promotion:
+    observed_promotion_path = BI / "promo_observed.npz"
+    with np.load(observed_promotion_path if observed_promotion_path.is_file()
+                 else BI / "promo.npz") as promotion:
         promo_keys = promotion["keys"].astype(np.int64)
         display_values = promotion["disp"]
         mailer_values = promotion["mail"]
 
     item_details = items.set_index("item_id")
+    canonical = meta.get("dataset") == "canonical_external_basket"
+    first_event_week = max(
+        2, int(meta.get("analysis_first_week", 1)), 2 if canonical else 10)
+    last_event_week = min(n_periods, n_periods if canonical else 101)
+    validation_from = int(meta["val_from_week"])
+    test_from = int(meta["test_from_week"])
     rows = []
-    for item in range(products):
+    for item in np.flatnonzero(reliable_product):
         log_change = np.log(price[item, 1:]) - np.log(price[item, :-1])
         candidate_weeks = np.flatnonzero(
-            (np.arange(1, 128) >= 10)
-            & (np.arange(1, 128) <= 101)
+            (np.arange(1, n_periods + 1) >= first_event_week)
+            & (np.arange(1, n_periods + 1) <= last_event_week)
             & (np.abs(log_change) >= math.log(1.01))) + 1
         for week in candidate_weeks:
             previous_week = week - 1
@@ -163,9 +200,12 @@ def build_complete_exposure_events() -> tuple[pd.DataFrame, dict]:
         events.promotion_depth - events.previous_promotion_depth)
     events["display_changed"] = events.display != events.previous_display
     events["mailer_changed"] = events.mailer != events.previous_mailer
+    events["promotion_clean"] = (
+        (events.display == 0) & (events.previous_display == 0)
+        & (events.mailer == 0) & (events.previous_mailer == 0))
     events["split"] = np.where(
-        events.WEEK_NO >= 91, "test",
-        np.where(events.WEEK_NO >= 83, "validation", "train"))
+        events.WEEK_NO >= test_from, "test",
+        np.where(events.WEEK_NO >= validation_from, "validation", "train"))
     events["observed_before_incidence"] = (
         events.previous_purchases / events.previous_trips)
     events["observed_after_incidence"] = events.purchases / events.trips
@@ -173,35 +213,49 @@ def build_complete_exposure_events() -> tuple[pd.DataFrame, dict]:
         events.observed_after_incidence - events.observed_before_incidence)
     return events, {
         "construction": "complete_training_assortment_x_store_x_chain_price_change",
-        "price_exposure": "carried chain-week modal loyalty price",
+        "price_exposure": str(meta.get("price_basis", "declared modeled price")),
+        "weekly_price_source": weekly_price_source,
+        "event_week_range": [first_event_week, last_event_week],
+        "validation_from_week": validation_from,
+        "test_from_week": test_from,
         "store_price_deviation_used": False,
         "reason_store_price_excluded": (
             "store price cells exist only following a product sale"),
         "zero_purchase_store_week_cells_retained": True,
         "raw_events": int(len(events)),
         "raw_products": int(events.item_id.nunique()),
+        "products_without_reliable_price_exposure": int((~reliable_product).sum()),
+        "promotion_event_policy": (
+            "exclude any before/after event with recorded display, advertising, or "
+            "special-price activity"),
         "raw_stores": int(events.store_id.nunique()),
     }
 
 
-def base_eligible_events(events: pd.DataFrame) -> pd.Series:
+def base_eligible_events(events: pd.DataFrame,
+                         minimum_product_training_lines: int = 500) -> pd.Series:
     """Eligibility rules that do not depend on the fitted training support."""
+    promotion_clean = (events.promotion_clean if "promotion_clean" in events
+                       else pd.Series(True, index=events.index))
     return (
         (events.promotion_depth_change.abs() < .01)
+        & promotion_clean
         & (~events.display_changed)
         & (~events.mailer_changed)
         & (events.log_price_change.abs() >= math.log(1.05))
         & (events.log_price_change.abs() <= .70)
-        & (events.n_train_lines >= 500)
+        & (events.n_train_lines >= minimum_product_training_lines)
         & (events.trips >= 16)
         & (events.previous_trips >= 16)
     )
 
 
 def restrict_to_training_price_support(
-        events: pd.DataFrame) -> tuple[pd.DataFrame, dict]:
+        events: pd.DataFrame, minimum_product_training_lines: int = 500
+        ) -> tuple[pd.DataFrame, dict]:
     """Learn each product's price-change range from eligible training rows only."""
-    eligible = events[base_eligible_events(events)].copy()
+    eligible = events[base_eligible_events(
+        events, minimum_product_training_lines)].copy()
     support = (eligible[eligible.split == "train"]
                .groupby("item_id").log_price_change
                .agg(training_change_low="min", training_change_high="max",
@@ -224,9 +278,19 @@ def restrict_to_training_price_support(
     }
 
 
-def prepare_events() -> tuple[pd.DataFrame, dict]:
+def prepare_events(minimum_product_training_lines: int | None = None
+                   ) -> tuple[pd.DataFrame, dict]:
     events, source_summary = build_complete_exposure_events()
-    events, support_audit = restrict_to_training_price_support(events)
+    if minimum_product_training_lines is None:
+        meta = json.loads((BI / "meta.json").read_text())
+        if meta.get("dataset") == "canonical_external_basket":
+            preprocessing = json.loads((BI / "preprocessing_manifest.json").read_text())
+            minimum_product_training_lines = int(
+                preprocessing["cohort"]["minimum_selected_item_training_lines"])
+        else:
+            minimum_product_training_lines = 500
+    events, support_audit = restrict_to_training_price_support(
+        events, minimum_product_training_lines)
     events["total_purchases"] = events.previous_purchases + events.purchases
     supported_counts = {
         str(key): int(value) for key, value in events.split.value_counts().items()}
@@ -239,7 +303,7 @@ def prepare_events() -> tuple[pd.DataFrame, dict]:
     final_counts = {
         str(key): int(value) for key, value in events.split.value_counts().items()}
     category = pd.read_parquet(
-        ROOT / "basket_input/items.parquet", columns=["item_id", "cat_id"])
+        BI / "items.parquet", columns=["item_id", "cat_id"])
     if events.cat_id.isna().any():
         raise RuntimeError("a supported product has no category")
     events["offset"] = np.log(events.trips / events.previous_trips)
@@ -284,6 +348,7 @@ def prepare_events() -> tuple[pd.DataFrame, dict]:
         },
         "training_product_support_rule": (
             "at least one eligible training store-event with a purchase in either week"),
+        "minimum_product_training_lines": int(minimum_product_training_lines),
     }
     return events, design
 
@@ -675,6 +740,9 @@ def main() -> None:
             "selected_product_penalty": selected["product_penalty"],
             "rule": "penalties and hierarchy selected only by validation conditional log loss",
             "data_support_audit": {
+                "source_summary": design["source_summary"],
+                "minimum_product_training_lines":
+                    design["minimum_product_training_lines"],
                 "eligible_event_counts_before_training_price_support":
                     design["eligible_event_counts_before_training_price_support"],
                 "event_counts_after_training_price_support":
@@ -786,7 +854,8 @@ def main() -> None:
             "individual_coefficient_interpretation_supported": False,
             "validation_selected_complexity_supported": complexity_supported,
             "training_product_count": products,
-            "unsupported_catalogue_products_use_global_sensitivity": True,
+            "supported_item_ids": [int(value) for value in design["product_values"]],
+            "unsupported_catalogue_products_use_global_sensitivity": False,
         })
         coefficient_path.write_text(strict_json_dumps(coefficient_payload))
     report["coefficients_output"] = str(coefficient_path)

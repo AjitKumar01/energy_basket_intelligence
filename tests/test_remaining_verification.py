@@ -11,7 +11,9 @@ from audit_probability_foundations import exact_energy, make_world
 from audit_real_price_numerics import action_change, replicate_fidelity
 from audit_price_data_provenance import build_events
 from evaluate_observational_price_response import exact_parent_incidence
-from audit_population_size import screen_signature
+import audit_population_size as population_audit
+from audit_population_size import (collect_resilient_size_law,
+                                   screen_signature)
 from audit_size_drift_decomposition import (
     household_balanced_panel as drift_household_panel,
     load_stage_cache,
@@ -25,11 +27,13 @@ from interaction_particles import (direct_interaction_particles,
                                    rao_blackwell_selected_incidence)
 from run_segment_pricing_mdp import (representative_context_panel, solve_budget_mdp,
                                      independent_policy_evaluation)
+from initialize_version4 import resolve_basket_support
 from tempered_block_gibbs import conditional_slots_repeated
 
 
 def action(name, cost, reward):
     return {"action_id": name, "daily_expected_markdown_spend": cost,
+            "daily_reward_mean": reward, "daily_reward_lcb95": reward,
             "daily_incremental_list_value_mean": reward,
             "daily_incremental_list_value_lcb95": reward,
             "daily_incremental_post_discount_sales": reward-cost,
@@ -82,7 +86,12 @@ def test_independent_policy_evaluation_uses_frozen_counts_and_cluster_se():
 
 
 def test_frozen_protocol_has_separate_noncausal_capabilities():
-    protocol=json.load(open("artifacts/remaining_verification_20260914/verification_protocol.json"))
+    from pathlib import Path
+    path = (Path(__file__).resolve().parents[1] / "artifacts" /
+            "remaining_verification_20260914" / "verification_protocol.json")
+    if not path.is_file():
+        pytest.skip("frozen verification protocol artifact is not present in this checkout")
+    protocol=json.load(path.open())
     assert protocol["policy"]["profit_capability"] is False
     assert "not_identifiable" in protocol["allowed_statuses"]
 
@@ -143,6 +152,33 @@ def test_tail_cache_signature_binds_data_identity(tmp_path):
     first = screen_signature(checkpoint, population, 5, [6, 7, 8], "data-a")
     second = screen_signature(checkpoint, population, 5, [6, 7, 8], "data-b")
     assert first != second
+
+
+def test_confirmation_panel_escalates_only_invalid_context_and_preserves_order(
+        monkeypatch):
+    def fake_panel(_model, _batcher, trips, rule):
+        trips = np.asarray(trips)
+        if rule == "q10" and 2 in trips:
+            raise FloatingPointError("negative signed size mass")
+        observed = trips.astype(np.int64) + 1
+        log_probability = np.column_stack((trips, -trips)).astype(np.float64)
+        return observed, log_probability
+
+    monkeypatch.setattr(population_audit, "one_size_panel", fake_panel)
+    observed, log_probability, used_level = collect_resilient_size_law(
+        None, None, np.arange(4), ["q10", "q11"], [10, 11], 4, "test")
+    assert observed.tolist() == [1, 2, 3, 4]
+    assert log_probability[:, 0].tolist() == [0, 1, 2, 3]
+    assert used_level.tolist() == [10, 10, 11, 10]
+
+
+def test_initialization_support_defaults_to_training_maximum():
+    data = {
+        "trip_nlines": np.asarray([1, 7, 4, 11, 9]),
+        "n_item": 100,
+    }
+    assert resolve_basket_support(data, np.asarray([0, 1, 2]), None, 120) == (7, 7)
+    assert resolve_basket_support(data, np.asarray([0, 1, 2]), 12, 120) == (12, 12)
 
 
 def test_selected_item_rao_blackwell_matches_full_statistics():
@@ -210,3 +246,28 @@ def test_drift_quadrature_chunk_caps_context_node_product():
     chunk = quadrature_chunk(rule, requested=48, node_context_cap=16_000)
     assert chunk == 11
     assert chunk * len(rule[1]) <= 16_000
+
+
+def test_size_tail_threshold_follows_training_support_not_a_fixed_size():
+    from pipeline_support import size_tail_threshold
+
+    sizes = np.concatenate((np.full(90, 2), np.full(8, 4), np.full(2, 10)))
+    data = {
+        "trip_split": np.concatenate((np.zeros(100, dtype=int), np.ones(5, dtype=int))),
+        "trip_nlines": np.concatenate((sizes, np.full(5, 10))),
+    }
+    # The 97.5th training percentile is 4, so the tail starts at 5 inside support 1..10.
+    assert size_tail_threshold(data, 10) == 5
+    # Validation baskets never move the threshold; the support clips it.
+    assert size_tail_threshold(data, 4) == 4
+    assert size_tail_threshold(data, 10, override=8) == 8
+    with pytest.raises(ValueError):
+        size_tail_threshold(data, 10, override=60)
+
+
+def test_heldout_baskets_outside_training_support_are_counted():
+    from initialize_version4 import heldout_trips_outside_support
+    data = {"trip_nlines": np.array([3, 10, 11, 4, 12]),
+            "trip_split": np.array([0, 0, 1, 2, 2])}
+    assert heldout_trips_outside_support(data, 10) == {"validation": 1, "test": 1}
+    assert heldout_trips_outside_support(data, 12) == {"validation": 0, "test": 0}

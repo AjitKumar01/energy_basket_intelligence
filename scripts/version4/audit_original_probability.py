@@ -114,7 +114,7 @@ def child_replay(model, batcher, trips, saved, level):
     """Replay locked validation scores; no new model or quadrature selection."""
     singular = torch.linalg.svdvals(model.phi)
     rank = int((singular > singular[0] * 1e-10).sum())
-    model.quad, model.quad_a = smolyak_rule(model, rank, level), None
+    model.quad = smolyak_rule(model, rank, level)
     values = []
     for trip in trips:
         ix, ctx, line_ctx, house, li, lt, lc, _ = batcher.make(np.array([trip]))
@@ -206,8 +206,8 @@ def main():
             report["support"] = f"nonempty incidence baskets of size 1..{parent.nmax}"
             report["trained_capabilities"] = child_blob["trained_capabilities"]
             report["parent_price_response_estimator"] = blob.get("price_response_estimator", "legacy_unlabelled")
-            batcher = Batcher(data, Features(int(data["n_item"]), int(data["n_store"]), 712,
-                include_recency=False), parent.nmax, include_recency=False)
+            batcher = Batcher(data, Features(int(data["n_item"]), int(data["n_store"]),
+                                             include_recency=False), parent.nmax, include_recency=False)
             with np.load(reports_dir / "likelihood_validation_per_trip.npz") as z:
                 trips = z["trips"][:args.contexts].copy()
                 replay_trips = z["trips"][:args.replay_contexts].copy()

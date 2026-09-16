@@ -8,7 +8,6 @@ the model's stopping event.
 """
 from __future__ import annotations
 
-import math
 from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Sequence
@@ -195,10 +194,8 @@ def conditional_completion_quadrature(model, ix, slot_b: torch.Tensor,
         model, ix, slot_b, revealed_items)
     adjusted_b = adjusted_b.detach().requires_grad_(True)
     old_quad = getattr(model, "quad", None)
-    old_quad_a = getattr(model, "quad_a", None)
     model.quad = (nodes.to(dtype=model.phi.dtype, device=model.phi.device),
                   weights.to(dtype=model.phi.dtype, device=model.phi.device))
-    model.quad_a = None
     try:
         with conditional_model_state(model, adjusted_b, fixed_cat, fixed_size):
             with torch.enable_grad():
@@ -225,7 +222,6 @@ def conditional_completion_quadrature(model, ix, slot_b: torch.Tensor,
                     log_normalizer.sum(), adjusted_b)[0]
     finally:
         model.quad = old_quad
-        model.quad_a = old_quad_a
     incidence = torch.zeros(ix.B, model.J, dtype=model.phi.dtype,
                             device=model.phi.device)
     flat = reduced.item_trip * model.J + reduced.item

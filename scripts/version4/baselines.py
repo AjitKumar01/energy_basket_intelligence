@@ -78,7 +78,7 @@ class Batches:
             self.store_layout.append((items, row_of, row_cat))
 
     def make(self, trips):
-        D, C = self.D, self.C
+        D = self.D
         it_l, slot_trip, row_of, row_trip, row_cat = [], [], [], [], []
         nrow = 0
         stores = np.asarray(D["trip_store"][trips], dtype=np.int64)

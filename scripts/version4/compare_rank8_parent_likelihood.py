@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import argparse
-import math
 import os
 from pathlib import Path
 
@@ -39,7 +38,7 @@ def exact_parent(model, batcher, trips, chunk):
 
 @torch.no_grad()
 def interaction_values(model, batcher, trips, quadrature, chunk):
-    model.quad = quadrature; model.quad_a = None
+    model.quad = quadrature
     result, cancellation = [], 0.0
     for start in range(0, len(trips), chunk):
         ix, ctx, line_ctx, house, li, lt, lc, _ = batcher.make(
@@ -100,8 +99,7 @@ def main():
             f"child active rank is {active_rank}, not {args.rank}")
     if int(meta["nmax"]) != int(child_meta["nmax"]):
         raise RuntimeError("parent and child supports differ")
-    features = Features(int(data["n_item"]), int(data["n_store"]), 712,
-                        include_recency=False)
+    features = Features(int(data["n_item"]), int(data["n_store"]), include_recency=False)
     batcher = Batcher(data, features, int(meta["nmax"]), include_recency=False)
     split = {"validation": 1, "test": 2}[args.split]
     population = np.flatnonzero((data["trip_split"] == split)

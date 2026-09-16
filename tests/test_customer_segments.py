@@ -33,3 +33,12 @@ class CustomerSegmentAuditTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def test_segment_price_label_is_not_ranked_when_households_share_one_response():
+    from audit_customer_segments import price_sensitivity_label
+    assert price_sensitivity_label(True, None) == "; household-invariant price response"
+    assert price_sensitivity_label(True, 0.9) == "; high price sensitivity"
+    assert price_sensitivity_label(True, 0.1) == "; low price sensitivity"
+    assert price_sensitivity_label(True, 0.5) == "; medium price sensitivity"
+    assert price_sensitivity_label(False, None) == ""

@@ -344,7 +344,6 @@ def main(a):
     assert (np.diff(keys) > 0).all(), "state keys must be strictly increasing"
     # group -> first index, so a query can tell "no earlier purchase in this group"
     # from "the previous key belongs to a different group".
-    gstart = {}
     uniq, first = np.unique(ev.group.to_numpy(), return_index=True)
     gstart_keys, gstart_vals = uniq.astype(np.int64), first.astype(np.int64)
     log(f"state: {len(ev):,} (household, sub-commodity, day) purchase events across "

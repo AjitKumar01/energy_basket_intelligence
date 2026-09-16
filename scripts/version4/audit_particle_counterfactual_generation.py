@@ -22,7 +22,7 @@ import pandas as pd
 import torch
 
 from checkpoint_io import ROOT, load_checkpoint
-from data import build
+from data import BI, build
 from features import Features
 from fit import Batcher
 from interaction_particles import (blocked_rejuvenation,
@@ -78,8 +78,7 @@ def main():
     model, blob, meta = load_checkpoint(
         ckpt, data,
         required_capabilities=("conditional_nonempty_incidence", "gram_interactions"))
-    features = Features(int(data["n_item"]), int(data["n_store"]), 712,
-                        include_recency=False)
+    features = Features(int(data["n_item"]), int(data["n_store"]), include_recency=False)
     batcher = Batcher(data, features, int(meta["nmax"]), include_recency=False)
     split_code = {"validation": 1, "test": 2}[args.split]
     if args.panel_input:
@@ -177,8 +176,11 @@ def main():
     generated_states = blocked_rejuvenation(
         model, ix, smc.states, beta=1.0, steps=args.rejuvenation,
         generator=torch.Generator().manual_seed(args.seed + 3))
-    metadata = pd.read_parquet(ROOT / "basket_input" / "items.parquet").sort_values("item_id")
-    item_category = metadata.cat_id.to_numpy(dtype=np.int64)
+    metadata = pd.read_parquet(Path(BI) / "items.parquet").sort_values("item_id")
+    item_category = model.cat_of.detach().cpu().numpy().astype(np.int64)
+    if (len(item_category) != model.J or (item_category < 0).any()
+            or (item_category >= int(data["n_cat"])).any()):
+        raise RuntimeError("fitted item-category mapping is incompatible with model dimensions")
     generated_sizes, invalid, duplicates = [], 0, 0
     generated_categories = np.zeros(int(data["n_cat"]), dtype=np.float64)
     observed_categories = np.zeros_like(generated_categories)
@@ -216,6 +218,12 @@ def main():
             own_incidence=np.stack([x["own_incidence"] for x in per_action]),
             own_ess_fraction=np.stack([x["own_ess"] for x in per_action]),
             generated_size=generated_sizes.reshape(ix.B, len(generated_states)))
+    price_component = blob.get("supported_price_component")
+    price_disabled = (
+        blob.get("price_response_estimator")
+        == "fixed_zero_after_failed_heldout_support"
+        or (isinstance(price_component, dict)
+            and price_component.get("level") == "disabled"))
     output = {
         "checkpoint": str(ckpt),
         "checkpoint_sha256": file_sha256(ckpt),
@@ -232,6 +240,15 @@ def main():
         "smc_ess_median": float(smc.min_ess_fraction.median()),
         "factual_expected_size": float(factual_size.mean()),
         "observed_size_mean": float(observed_sizes.mean()),
+        "price_counterfactual_capability": {
+            "status": "not_available" if price_disabled else "model_scenario_only",
+            "reason": (
+                "held-out price evidence failed; price coefficients are fixed to zero"
+                if price_disabled else
+                "the fitted response supports model scenarios, not a causal price claim"),
+            "price_response_estimator": blob.get("price_response_estimator"),
+            "supported_price_component": price_component,
+        },
         "counterfactuals": rows,
         "generation": {
             "baskets": int(generated_sizes.size),

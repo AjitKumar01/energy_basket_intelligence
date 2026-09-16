@@ -225,7 +225,7 @@ def main(args):
     expected_split = {"validation": 1, "test": 2}[args.split]
     require(bool(np.all(data["trip_split"][trips] == expected_split)),
             f"stored manifest is not entirely from the {args.split} split")
-    batcher = Batches(data, Features(int(data["n_item"]), int(data["n_store"]), 712))
+    batcher = Batches(data, Features(int(data["n_item"]), int(data["n_store"])))
 
     result = dict(schema=2, created_unix=time.time(), iteration=args.iteration,
                   data_fingerprint_sha256=data_fingerprint,

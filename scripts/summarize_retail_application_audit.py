@@ -54,8 +54,6 @@ def main():
 
     rec_model = recommendation["recommendation"]["full_interaction"]
     rec_pop = recommendation["recommendation"]["popularity"]
-    interaction = recommendation["recommendation"]["comparison"][
-        "mrr_full_minus_fitted_parent"]
     masked = completion_audit["shopper_uniform_random_pair_mask_target"]
     masked_model = masked["model"]
     masked_baseline = masked["training_only_empirical_size_baseline"]

@@ -10,7 +10,6 @@ consolidated separately from the existing locked reports.
 from __future__ import annotations
 
 import argparse
-import json
 import math
 import os
 import time
@@ -22,12 +21,12 @@ import torch
 
 os.environ.setdefault("V3_AFFINITY", "1")
 
-from checkpoint_io import ROOT, load_checkpoint
+from checkpoint_io import load_checkpoint
 from conditional_basket import (
     completion_log_score,
     conditional_completion_smc,
 )
-from data import build
+from data import BI, build
 from features import Features
 from fit import Batcher, popularity_logits
 from provenance import file_sha256, strict_json_dumps
@@ -128,8 +127,7 @@ def evaluate(args):
         required_capabilities=("conditional_nonempty_incidence", "gram_interactions"))
     for parameter in model.parameters():
         parameter.requires_grad_(False)
-    features = Features(int(data["n_item"]), int(data["n_store"]), 712,
-                        include_recency=False)
+    features = Features(int(data["n_item"]), int(data["n_store"]), include_recency=False)
     batcher = Batcher(data, features, int(meta["nmax"]), include_recency=False)
     population = np.flatnonzero(
         (data["trip_split"] == 1) & (data["trip_nlines"] <= int(meta["nmax"])))
@@ -146,10 +144,17 @@ def evaluate(args):
         hidden.append([int(item) for item in observed if item not in set(anchor)])
         stop_label.append(int(len(observed) == 2))
 
-    metadata = pd.read_parquet(ROOT / "basket_input/items.parquet").sort_values("item_id")
+    metadata = pd.read_parquet(Path(BI) / "items.parquet").sort_values("item_id")
     metadata = metadata.set_index("item_id", drop=False)
     popularity = popularity_logits(
         data, np.flatnonzero(data["trip_split"] == 0)).numpy()
+    training_sizes = np.asarray(data["trip_nlines"])[data["trip_split"] == 0]
+    training_sizes = training_sizes[
+        (training_sizes >= 2) & (training_sizes <= int(meta["nmax"]))]
+    if not len(training_sizes):
+        raise RuntimeError("no training baskets support a two-item cart baseline")
+    baseline_stop_probability = float(np.mean(training_sizes == 2))
+    baseline_expected_additional = float(np.mean(training_sizes - 2))
     schedule_axis = torch.linspace(0.0, 1.0, args.levels)
     schedule = (1.0 - (1.0 - schedule_axis).pow(args.power)).tolist()
 
@@ -160,7 +165,9 @@ def evaluate(args):
     all_logz = []
     all_ess = []
     cross_ranks = []
+    cross_popularity_ranks = []
     cross_recall = {5: [], 10: [], 20: [], 100: []}
+    cross_popularity_recall = {5: [], 10: [], 20: [], 100: []}
     bundle_rank, bundle_pop_rank, bundle_candidates = [], [], []
     substitution_rank, substitution_pop_rank, substitution_candidates = [], [], []
 
@@ -204,11 +211,21 @@ def evaluate(args):
             hidden_position = np.flatnonzero(np.isin(candidates, withheld))
             if len(hidden_position):
                 ranks = [midrank(candidate_score, int(position)) for position in hidden_position]
+                popularity_score = popularity[candidates]
+                popularity_ranks = [
+                    midrank(popularity_score, int(position))
+                    for position in hidden_position]
                 cross_ranks.append(min(ranks))
+                cross_popularity_ranks.append(min(popularity_ranks))
                 order = candidates[np.argsort(-candidate_score, kind="stable")]
+                popularity_order = candidates[
+                    np.argsort(-popularity_score, kind="stable")]
                 for cutoff in cross_recall:
                     cross_recall[cutoff].append(
                         len(set(withheld) & set(order[:cutoff])) / len(withheld))
+                    cross_popularity_recall[cutoff].append(
+                        len(set(withheld) & set(popularity_order[:cutoff]))
+                        / len(withheld))
 
             observed = anchor + withheld
             if len(withheld) >= 2:
@@ -273,6 +290,8 @@ def evaluate(args):
     partial = np.asarray(stop_label) == 0
     actual_additional = np.asarray([len(value) for value in hidden], dtype=float)
     completion_error = expected_additional[partial] - actual_additional[partial]
+    baseline_completion_error = (
+        baseline_expected_additional - actual_additional[partial])
     result = {
         "status": "completed",
         "claim_level": "heldout_predictive_and_model_conditional_not_causal",
@@ -293,22 +312,45 @@ def evaluate(args):
             "all_context_replicate_mean_ess_fraction": float(ess.mean()),
         },
         "real_time_cross_sell": {
-            **retrieval_metrics(cross_ranks),
-            **{f"mean_hidden_set_recall_at_{k}": float(np.mean(value))
-               for k, value in cross_recall.items()},
+            "model": {
+                **retrieval_metrics(cross_ranks),
+                **{f"mean_hidden_set_recall_at_{k}": float(np.mean(value))
+                   for k, value in cross_recall.items()},
+            },
+            "training_popularity_baseline": {
+                **retrieval_metrics(cross_popularity_ranks),
+                **{f"mean_hidden_set_recall_at_{k}": float(np.mean(value))
+                   for k, value in cross_popularity_recall.items()},
+            },
             "estimand": "P(item in eventual completion | revealed cart, context)",
         },
         "basket_completion": {
-            "partial_cases": int(partial.sum()),
-            "observed_additional_items_mean": float(actual_additional[partial].mean()),
-            "predicted_additional_items_mean": float(expected_additional[partial].mean()),
-            "mean_error_items": float(completion_error.mean()),
-            "mae_items": float(np.abs(completion_error).mean()),
-            "rmse_items": float(np.sqrt(np.mean(completion_error ** 2))),
+            "model": {
+                "partial_cases": int(partial.sum()),
+                "observed_additional_items_mean": float(actual_additional[partial].mean()),
+                "predicted_additional_items_mean": float(expected_additional[partial].mean()),
+                "mean_error_items": float(completion_error.mean()),
+                "mae_items": float(np.abs(completion_error).mean()),
+                "rmse_items": float(np.sqrt(np.mean(completion_error ** 2))),
+            },
+            "training_size_baseline": {
+                "training_baskets_with_at_least_two_items": int(len(training_sizes)),
+                "predicted_additional_items_mean": baseline_expected_additional,
+                "mean_error_items": float(baseline_completion_error.mean()),
+                "mae_items": float(np.abs(baseline_completion_error).mean()),
+                "rmse_items": float(np.sqrt(
+                    np.mean(baseline_completion_error ** 2))),
+            },
             "mean_actual_completion_log_probability": float(np.mean([
                 row["actual_completion_log_probability"] for row in per_context if not row["stop_label"]])),
         },
-        "stopping_probability": binary_metrics(stop_label, stop_probability),
+        "stopping_probability": {
+            "model": binary_metrics(stop_label, stop_probability),
+            "training_size_baseline": binary_metrics(
+                stop_label,
+                np.full(len(stop_label), baseline_stop_probability)),
+            "training_stop_probability": baseline_stop_probability,
+        },
         "personalized_bundle_retrieval": {
             "model": retrieval_metrics(bundle_rank, cutoffs=(1, 5, 10)),
             "popularity": retrieval_metrics(bundle_pop_rank, cutoffs=(1, 5, 10)),

@@ -346,16 +346,9 @@ cross-fit split, bands, allocation, size knots, rank, and seed. A mismatch is re
 rebuilt rather than silently reused. To deliberately replace even a compatible derived
 bank, add `--rebuild-interaction-bank`.
 
-The former ordinary additive-parent draw estimator is retained only to reproduce earlier
-results:
-
-```bash
-python scripts/run_pipeline.py --profile full \
-  --interaction-estimator legacy-ordinary \
-  2>&1 | tee artifacts/legacy_ordinary_full.log
-```
-
-It is not selected automatically and should not be used for new model certification.
+The former ordinary additive-parent draw estimator (`--interaction-estimator
+legacy-ordinary`) was removed in the 16 September 2026 codebase audit. Results that used
+it can be reproduced from git history.
 
 ## Recovering a partial pipeline
 

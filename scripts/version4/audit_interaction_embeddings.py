@@ -24,7 +24,7 @@ import numpy as np
 import pandas as pd
 from scipy.spatial import cKDTree
 
-from data import build
+from data import BI, build
 from checkpoint_io import load_checkpoint
 from provenance import file_sha256, strict_json_dumps
 
@@ -283,12 +283,13 @@ def main(args):
     if inactive_max != 0.0:
         raise RuntimeError("checkpoint has nonzero interaction columns outside active rank")
     rho = state["rho_c"].double().numpy()
-    metadata = pd.read_parquet(ROOT / "basket_input/items.parquet").sort_values(
+    metadata = pd.read_parquet(Path(BI) / "items.parquet").sort_values(
         "item_id").reset_index(drop=True)
     if len(metadata) != len(phi) or not np.array_equal(metadata.item_id, np.arange(len(phi))):
         raise RuntimeError("product metadata does not match checkpoint row order")
     eligible = metadata.n_train_lines.to_numpy() >= args.minimum_training_lines
-    category = metadata.cat_id.to_numpy()
+    category = model.cat_of.detach().cpu().numpy().astype(np.int64)
+    metadata["cat_id"] = category
     pairs = top_pairs(phi, category, eligible, args.pairs, relation="different")
     controls = matched_controls(pairs, phi, metadata, eligible, args.seed)
     heldout = heldout_pair_statistics(data, pairs + controls, split=2)

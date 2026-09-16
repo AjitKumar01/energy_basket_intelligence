@@ -9,7 +9,6 @@ preflight audit.  No optimizer state or learned checkpoint is stored.
 from __future__ import annotations
 
 import hashlib
-import json
 from collections.abc import Iterable, Mapping
 from pathlib import Path
 
@@ -78,51 +77,6 @@ def initialize_nested_trace_class_phi(model, *, active_rank: int,
     }
 
 
-def select_calibration_trips(data, training: np.ndarray, count: int,
-                             *, seed: int = 2718) -> np.ndarray:
-    """Deterministic coverage sample over assortment and observed basket-size tails.
-
-    Half the slots cover the joint two-dimensional rank of assortment and basket size;
-    one quarter explicitly covers the largest assortments and one quarter the largest
-    observed baskets.  Duplicates are filled by a fixed random permutation.  Selection
-    uses training data only.
-    """
-    training = np.asarray(training, dtype=np.int64)
-    if count <= 0 or count > len(training):
-        raise ValueError("calibration count must lie in 1..number of training trips")
-    C, S = int(data["n_cat"]), int(data["n_store"])
-    ptr = data["store_cat_ptr"]
-    stocked = np.asarray([ptr[(store + 1) * C] - ptr[store * C]
-                          for store in range(S)])
-    assortment = stocked[data["trip_store"][training]]
-    basket = data["trip_nlines"][training]
-    n_assort = count // 4
-    n_basket = count // 4
-    n_joint = count - n_assort - n_basket
-    chosen: list[int] = []
-
-    def extend(candidates: Iterable[int]):
-        seen = set(chosen)
-        for index in candidates:
-            value = int(index)
-            if value not in seen:
-                chosen.append(value)
-                seen.add(value)
-
-    extend(np.argsort(assortment, kind="stable")[::-1][:n_assort])
-    extend(np.argsort(basket, kind="stable")[::-1][:n_basket])
-    # Equal-weight empirical ranks avoid arbitrary unit scaling between the two axes.
-    arank = np.empty(len(training), dtype=np.float64)
-    brank = np.empty(len(training), dtype=np.float64)
-    arank[np.argsort(assortment, kind="stable")] = np.linspace(0, 1, len(training))
-    brank[np.argsort(basket, kind="stable")] = np.linspace(0, 1, len(training))
-    joint_order = np.argsort(arank + brank, kind="stable")
-    positions = np.linspace(0, len(joint_order) - 1, max(n_joint, 1)).astype(int)
-    extend(joint_order[positions])
-    extend(np.random.default_rng(seed).permutation(len(training)))
-    return training[np.asarray(chosen[:count], dtype=np.int64)]
-
-
 def save_sparse_initialization_artifact(path: str | Path, model: torch.nn.Module, *,
                                         metadata: Mapping, sequence: Iterable,
                                         calibration_trips: Iterable[int]) -> dict:
@@ -171,6 +125,3 @@ def load_sparse_initialization_artifact(path: str | Path, model: torch.nn.Module
         raise RuntimeError("restored sparse initialization differs from certified state")
     return {key: value for key, value in payload.items() if key != "model_state"}
 
-
-def write_artifact_manifest(path: str | Path, summary: Mapping):
-    Path(path).write_text(json.dumps(dict(summary), indent=2, sort_keys=True) + "\n")

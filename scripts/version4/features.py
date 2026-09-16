@@ -1,44 +1,35 @@
 """
-Conditioning features for the dunnhumby fit, gathered at assortment slots.
+Conditioning features gathered at assortment slots for any model-data bundle.
 
 The model scores every product a store carries, not just the purchased ones, so every
-feature has to be available at ~5,420 slots per trip rather than at ~8 purchase lines.  That
-is the whole difficulty: these are lookups into (product x day), (product x store x week)
-and (household x product) panels, and they have to be gathered, not joined.
+feature is gathered at every offered slot of a trip rather than joined at purchase lines.
+Panels are read from ``$ENERGY_MODEL_DATA_ROOT/basket_input`` (the repository root when
+unset), so Dunnhumby and canonical external bundles share one implementation.
 
-WHAT IS WIRED HERE, and what each costs to evaluate:
-
-    price        Delta log p_jst = Delta log p_jt + Delta^s_jsw
-                 dense (5455 x 712) plus a sparse store deviation, 244,880 non-zero cells
+    price        Delta log p_jst = Delta log p_jt + Delta^s_jsw: a dense (product x day)
+                 deviation from each product's training-mean log price plus an optional
+                 sparse (product, store, week) deviation
     promotion    display and mailer indicators, sparse over (product, store, week)
     seasonality  mu_j' delta_w
     store        zeta_j' xi_s
+    recency      optional strictly-before purchase-history features from state.npz
 
-WHAT IS NOT WIRED YET, and why it is a separate job rather than an oversight:
-
-    recency      needs the strictly-before lookup in state.npz, which is a searchsorted into
-                 a 1.2M-element key array per (household, sub-commodity).  Version 2 pays
-                 this per purchase line; at assortment scale it is per slot, ~700x more, and
-                 wants a different data structure.
-    coupon       the eligibility panel of section 21 is built from campaign_table x coupon x
-                 window and does not exist as an array yet.
-    days-of-supply  needs the recency machinery above.
-
-The first fit is therefore on price, promotion, seasonality and store.  That is stated
-plainly rather than left to be inferred from the parameter list: any elasticity it produces
-is missing the persistence terms that version 2 measures as its largest single ablation, and
-is not comparable to one that has them.
+Sparse keys pack (product, store, week) as (item * n_store + store) * 128 + week, and
+recency keys pack (household-group, day) as group * 1024 + day, so a bundle must satisfy
+week < 128 and day < 1024.  The constructor checks both rather than letting a collision
+silently return another cell's value.
 """
-import os
 import json
-
 import math
+import os
 
 import numpy as np
 import torch
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-BI = os.path.join(HERE, "..", "..", "basket_input")
+DEFAULT_ROOT = os.path.join(HERE, "..", "..")
+MODEL_DATA_ROOT = os.path.abspath(os.environ.get("ENERGY_MODEL_DATA_ROOT", DEFAULT_ROOT))
+BI = os.path.join(MODEL_DATA_ROOT, "basket_input")
 
 
 def log(m):
@@ -48,11 +39,26 @@ def log(m):
 class Features:
     """Panels held once, gathered per batch."""
 
-    def __init__(self, n_item, n_store, n_day, device=None, include_recency=True):
-        self.J, self.S, self.D = n_item, n_store, n_day
+    WEEK_KEY_STRIDE = 128
+    DAY_KEY_STRIDE = 1024
+
+    def __init__(self, n_item, n_store, include_recency=True, include_store_price=None):
+        self.S = n_store
         self.include_recency = bool(include_recency)
+        if include_store_price is None:
+            contract = os.environ.get(
+                "ENERGY_PRICE_FEATURE_CONTRACT", "chain_and_store")
+            if contract not in {"chain_and_store", "chain_product_week_only"}:
+                raise ValueError(f"unknown price feature contract {contract!r}")
+            include_store_price = contract == "chain_and_store"
+        self.include_store_price = bool(include_store_price)
         self.dev = torch.from_numpy(
             np.load(os.path.join(BI, "log_price_dev.npy")).astype(np.float32))
+        if self.dev.shape[0] != n_item:
+            raise RuntimeError(f"price panel covers {self.dev.shape[0]} products, "
+                               f"not the {n_item}-product catalogue")
+        if self.dev.shape[1] > self.DAY_KEY_STRIDE:
+            raise RuntimeError("price panel has more days than the recency key stride")
         log(f"price deviation panel {tuple(self.dev.shape)}, "
             f"|mean| {float(self.dev.abs().mean()):.4f}")
 
@@ -61,14 +67,26 @@ class Features:
         # RAW week, and store_price.npz stores item/store/week directly over weeks 1..102.
         # An earlier draft of this file guessed a different multiplier and a modulo; the
         # lookup would have silently returned zeros for almost every cell.
-        sp = np.load(os.path.join(BI, "store_price.npz"))
-        key = ((sp["item"].astype(np.int64) * self.S + sp["store"].astype(np.int64)) * 128
-               + sp["week"].astype(np.int64))
-        o = np.argsort(key)
-        self.sp_key = torch.from_numpy(key[o])
-        self.sp_val = torch.from_numpy(sp["dev"][o].astype(np.float32))
-        log(f"store price deviations: {len(key):,} cells "
-            f"({len(key) / (n_item * n_store * 52):.2%} of the grid)")
+        if self.include_store_price:
+            sp = np.load(os.path.join(BI, "store_price.npz"))
+            if len(sp["week"]) and int(sp["week"].max()) >= self.WEEK_KEY_STRIDE:
+                raise RuntimeError("store price weeks exceed the sparse key stride")
+            key = ((sp["item"].astype(np.int64) * self.S
+                    + sp["store"].astype(np.int64)) * self.WEEK_KEY_STRIDE
+                   + sp["week"].astype(np.int64))
+            o = np.argsort(key)
+            self.sp_key = torch.from_numpy(key[o])
+            self.sp_val = torch.from_numpy(sp["dev"][o].astype(np.float32))
+            log(f"store price deviations: {len(key):,} cells "
+                f"({len(key) / (n_item * n_store * 52):.2%} of the grid)")
+        else:
+            # ERIM store/product/week rows exist only when the product sold.  Using that
+            # sparse deviation would make the feature itself outcome-selected.  The
+            # direct-price experiment therefore uses the complete, carried-forward chain
+            # product/week panel and explicitly disables this lookup.
+            self.sp_key = torch.empty(0, dtype=torch.int64)
+            self.sp_val = torch.empty(0, dtype=torch.float32)
+            log("store price deviations disabled; using chain product/week price only")
 
         if self.include_recency:
             st = np.load(os.path.join(BI, "state.npz"))
@@ -87,6 +105,10 @@ class Features:
         self.promo_week_min = int(pr["coverage_min_week"])
         self.promo_week_max = int(pr["coverage_max_week"])
         meta = json.load(open(os.path.join(BI, "meta.json")))
+        self.promotion_enabled = bool(
+            meta.get("promotion_contract", {}).get("enabled", True))
+        if not 1 <= self.promo_week_min <= self.promo_week_max < self.WEEK_KEY_STRIDE:
+            raise RuntimeError("promotion weeks must lie in 1..127 for the sparse key stride")
         required = meta.get("promotion_coverage_required")
         if required != [self.promo_week_min, self.promo_week_max]:
             raise RuntimeError(f"promotion coverage {self.promo_week_min}-"
@@ -96,9 +118,12 @@ class Features:
         self.pk = torch.from_numpy(pr["keys"][o])
         self.pd_ = torch.from_numpy(pr["disp"][o].astype(np.float32))
         self.pm = torch.from_numpy(pr["mail"][o].astype(np.float32))
+        display_rate = float(self.pd_.mean()) if len(self.pd_) else 0.0
+        mail_rate = float(self.pm.mean()) if len(self.pm) else 0.0
         log(f"promotion cells: {len(self.pk):,}, coverage weeks "
             f"{self.promo_week_min}-{self.promo_week_max}; "
-            f"display rate {float(self.pd_.mean()):.3f}, mailer {float(self.pm.mean()):.3f}")
+            f"display rate {display_rate:.3f}, mailer {mail_rate:.3f}; "
+            f"enabled={self.promotion_enabled}")
 
     def recency(self, item, user, day):
         """The four recency functions of the specification, at every assortment slot.
@@ -115,12 +140,12 @@ class Features:
             raise RuntimeError("recency was not loaded for this feature contract")
         sub = self.item_sub[item]
         group = user.to(torch.int64) * self.n_sub + sub
-        key = group * 1024 + day
+        key = group * self.DAY_KEY_STRIDE + day
         idx = torch.searchsorted(self.st_keys, key)
         prev = (idx - 1).clamp(0, len(self.st_keys) - 1)
         pk = self.st_keys[prev]
-        same = (idx > 0) & (torch.div(pk, 1024, rounding_mode="floor") == group)
-        since = torch.where(same, (day - pk % 1024).double(),
+        same = (idx > 0) & (torch.div(pk, self.DAY_KEY_STRIDE, rounding_mode="floor") == group)
+        since = torch.where(same, (day - pk % self.DAY_KEY_STRIDE).double(),
                             torch.zeros(1, dtype=torch.float64))
         gap = self.sub_gap[sub].double().clamp_min(1.0)
         z = torch.zeros(1, dtype=torch.float64)
@@ -133,6 +158,8 @@ class Features:
     @staticmethod
     def _lookup(keys, vals, q):
         """Sparse gather: value where the key exists, zero where it does not."""
+        if len(keys) == 0:
+            return torch.zeros_like(q, dtype=vals.dtype)
         i = torch.searchsorted(keys, q)
         i = i.clamp(max=len(keys) - 1)
         hit = keys[i] == q
@@ -140,30 +167,9 @@ class Features:
 
     def gather(self, item, store, day, week):
         """Features at every assortment slot.  item/store/day/week are [T] longs."""
-        q = (item * self.S + store) * 128 + week          # one convention for both panels
+        q = (item * self.S + store) * self.WEEK_KEY_STRIDE + week          # one convention for both panels
         dlp = self.dev[item, day] + self._lookup(self.sp_key, self.sp_val, q)
         disp = self._lookup(self.pk, self.pd_, q)
         mail = self._lookup(self.pk, self.pm, q)
         return dlp, disp, mail
 
-
-def selftest(F, n_item, n_store):
-    """Check the lookups hit, rather than trusting that they do.  A sparse gather that
-    misses returns zero, which is indistinguishable from a real zero unless the hit rate is
-    measured -- so it is measured."""
-    pr = np.load(os.path.join(BI, "promo.npz"))
-    k = torch.from_numpy(pr["keys"][:20000])
-    item = torch.div(torch.div(k, 128, rounding_mode="floor"), n_store,
-                     rounding_mode="floor")
-    store = torch.div(k, 128, rounding_mode="floor") % n_store
-    week = k % 128
-    d, m = F._lookup(F.pk, F.pd_, k), F._lookup(F.pk, F.pm, k)
-    exact = (d + m > 0).double().mean()
-    log(f"promotion lookup on known-promoted cells: hit rate {float(exact):.4f} "
-        f"(must be 1.0000)")
-    day = (week.clamp(1, 102) - 1) * 7
-    dlp, dd, mm = F.gather(item.long(), store.long(), day.long(), week.long())
-    log(f"gather at those cells: display {float((dd > 0).double().mean()):.4f}, "
-        f"mailer {float((mm > 0).double().mean()):.4f}, "
-        f"|Delta log p| mean {float(dlp.abs().mean()):.4f}")
-    return float(exact)

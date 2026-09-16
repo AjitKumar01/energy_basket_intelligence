@@ -1,0 +1,88 @@
+{
+  "schema_version": 1,
+  "source_manifest": "../data/erim_basket/source_manifest.json",
+  "output_dir": "../data/erim_basket/canonical",
+  "policy": {
+    "train_fraction": 0.6,
+    "validation_fraction": 0.2,
+    "minimum_product_training_lines": 20,
+    "minimum_customer_training_baskets": 10,
+    "maximum_customer_training_baskets": 300
+  },
+  "categories": [
+    {
+      "name": "brownie",
+      "sources": {
+        "purchase": "../data/erim_basket/raw/brownie/brownie_f1.dat",
+        "shopping": "../data/erim_basket/raw/brownie/brownie_f2.dat",
+        "products": "../data/erim_basket/raw/brownie/brownie_f6.dat",
+        "retail": "../data/erim_basket/raw/brownie/brownie_f10.dat"
+      }
+    },
+    {
+      "name": "ddinner",
+      "sources": {
+        "purchase": "../data/erim_basket/raw/ddinner/ddinner_f1.dat",
+        "shopping": "../data/erim_basket/raw/ddinner/ddinner_f2.dat",
+        "products": "../data/erim_basket/raw/ddinner/ddinner_f6.dat"
+      }
+    },
+    {
+      "name": "ketchup",
+      "sources": {
+        "purchase": "../data/erim_basket/raw/ketchup/ketchup_f1.dat",
+        "shopping": "../data/erim_basket/raw/ketchup/ketchup_f2.dat",
+        "products": "../data/erim_basket/raw/ketchup/ketchup_f6.dat",
+        "retail": "../data/erim_basket/raw/ketchup/ketchup_f10.dat"
+      }
+    },
+    {
+      "name": "marg",
+      "sources": {
+        "purchase": "../data/erim_basket/raw/marg/marg_f1.dat",
+        "shopping": "../data/erim_basket/raw/marg/marg_f2.dat",
+        "products": "../data/erim_basket/raw/marg/marg_f6.dat",
+        "retail": "../data/erim_basket/raw/marg/marg_f10.dat"
+      }
+    },
+    {
+      "name": "pbutter",
+      "sources": {
+        "purchase": "../data/erim_basket/raw/pbutter/pbut_f1.dat",
+        "shopping": "../data/erim_basket/raw/pbutter/pbut_f2.dat",
+        "products": "../data/erim_basket/raw/pbutter/pbut_f7.dat",
+        "retail": "../data/erim_basket/raw/pbutter/pbut_f10.dat"
+      }
+    },
+    {
+      "name": "sugar",
+      "sources": {
+        "purchase": "../data/erim_basket/raw/sugar/sugar_f1.dat",
+        "shopping": "../data/erim_basket/raw/sugar/sugar_f2.dat",
+        "products": "../data/erim_basket/raw/sugar/sugar_f6.dat",
+        "retail": "../data/erim_basket/raw/sugar/sugar_f10.dat"
+      }
+    },
+    {
+      "name": "tissue",
+      "sources": {
+        "purchase": "../data/erim_basket/raw/tissue/tissue_f1.dat",
+        "shopping": [
+          "../data/erim_basket/raw/tissue/tissue_f2a.dat",
+          "../data/erim_basket/raw/tissue/tissue_f2b.dat"
+        ],
+        "products": "../data/erim_basket/raw/tissue/tissue_f6.dat",
+        "retail": "../data/erim_basket/raw/tissue/tissue_f10.dat"
+      }
+    },
+    {
+      "name": "tuna",
+      "sources": {
+        "purchase": "../data/erim_basket/raw/tuna/tuna_f1.dat",
+        "shopping": "../data/erim_basket/raw/tuna/tuna_f2.dat",
+        "products": "../data/erim_basket/raw/tuna/tuna_f6.dat",
+        "retail": "../data/erim_basket/raw/tuna/tuna_f10.dat"
+      }
+    }
+  ]
+}

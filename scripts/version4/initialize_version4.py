@@ -33,6 +33,32 @@ from sparse_artifact import (initialize_nested_trace_class_phi,
 torch.set_default_dtype(torch.float64)
 
 
+def resolve_basket_support(data, training: np.ndarray,
+                           requested_nmax: int | None, requested_R: int) -> tuple[int, int]:
+    """Choose an identified support, unless an explicit truncation is requested."""
+    training_sizes = np.asarray(data["trip_nlines"])[training]
+    if not len(training_sizes) or int(training_sizes.min()) < 1:
+        raise ValueError("training data must contain positive basket sizes")
+    observed_maximum = int(training_sizes.max())
+    nmax = observed_maximum if requested_nmax is None else int(requested_nmax)
+    if nmax < 1:
+        raise ValueError("nmax must be positive")
+    if nmax > int(data["n_item"]):
+        raise ValueError("nmax cannot exceed the number of catalogue products")
+    category_cap = min(int(requested_R), nmax)
+    if category_cap < 1:
+        raise ValueError("R must be positive")
+    return nmax, category_cap
+
+
+def heldout_trips_outside_support(data, nmax: int) -> dict[str, int]:
+    """Count validation/test baskets the declared support would exclude from evaluation."""
+    sizes = np.asarray(data["trip_nlines"])
+    split = np.asarray(data["trip_split"])
+    return {name: int(((split == code) & (sizes > int(nmax))).sum())
+            for code, name in ((1, "validation"), (2, "test"))}
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--output", type=Path,
@@ -45,7 +71,10 @@ def main() -> None:
     parser.add_argument("--Kz", type=int, default=32)
     parser.add_argument("--Kp", type=int, default=8)
     parser.add_argument("--active-rank", type=int, default=8)
-    parser.add_argument("--nmax", type=int, default=120)
+    parser.add_argument(
+        "--nmax", type=int,
+        help=("maximum basket size; omitted means the maximum observed training "
+              "basket size, avoiding unidentified support beyond the training data"))
     parser.add_argument("--R", type=int, default=120)
     parser.add_argument("--ipf-trips", type=int, default=96)
     parser.add_argument("--ipf-steps", type=int, default=0,
@@ -76,8 +105,17 @@ def main() -> None:
             hashlib.sha256(affinity_path.read_bytes()).hexdigest()):
         raise RuntimeError("affinity partition does not match its training-only manifest")
     training = np.flatnonzero(data["trip_split"] == 0)
+    nmax, category_cap = resolve_basket_support(
+        data, training, args.nmax, args.R)
+    outside_support = heldout_trips_outside_support(data, nmax)
+    if any(outside_support.values()) and args.nmax is None:
+        # Theory requires every evaluated basket to lie in the declared support; the
+        # evaluation stages would otherwise drop these trips silently.
+        raise SystemExit(
+            f"held-out baskets exceed the training-derived support 1..{nmax}: "
+            f"{outside_support}; pass an explicit --nmax to declare the support")
     model = RaggedModel(products, households, categories, K=args.K, Kz=args.Kz,
-                        nmax=args.nmax, R=args.R, seed=args.seed, S=stores,
+                        nmax=nmax, R=category_cap, seed=args.seed, S=stores,
                         Kp=args.Kp, phi_init=0.0, taste_init=0.03,
                         household_size_rank1=args.household_size_rank1)
     category = torch.zeros(products, dtype=torch.long)
@@ -93,18 +131,25 @@ def main() -> None:
     # explicitly zeros Phi before its first objective evaluation.
     initialize_nested_trace_class_phi(model, active_rank=args.active_rank,
                                       row_rms=0.03, decay=0.84, seed=823)
-    features = Features(products, stores, 712, include_recency=False)
-    batcher = Batcher(data, features, args.nmax, include_recency=False)
-    initialize_size_potential(model, data, training, batcher, args.nmax)
+    features = Features(products, stores, include_recency=False)
+    batcher = Batcher(data, features, nmax, include_recency=False)
+    initialize_size_potential(model, data, training, batcher, nmax)
     if args.ipf_steps:
-        calibrate_size_ipf(model, data, training, batcher, args.nmax,
+        calibrate_size_ipf(model, data, training, batcher, nmax,
                            steps=args.ipf_steps, n_trips=args.ipf_trips,
                            chunk=24, damp=0.7)
 
     metadata = {
         "J": products, "N": households, "C": categories, "S": stores,
         "K": args.K, "Kz": args.Kz, "Kp": args.Kp,
-        "nmax": args.nmax, "R": args.R, "seed": args.seed,
+        "nmax": nmax, "R": category_cap, "seed": args.seed,
+        "support_selection": {
+            "policy": ("explicit_command_line" if args.nmax is not None
+                       else "maximum_observed_training_basket_size"),
+            "observed_training_maximum": int(
+                np.asarray(data["trip_nlines"])[training].max()),
+            "heldout_trips_outside_support": outside_support,
+        },
         "active_rank": args.active_rank, "affinity_partition": True,
         "initialization_only": True, "no_rec": True,
         "household_size_rank1": bool(args.household_size_rank1),

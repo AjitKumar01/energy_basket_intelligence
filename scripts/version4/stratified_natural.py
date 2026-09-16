@@ -20,6 +20,12 @@ from scipy.optimize import minimize
 from scipy.special import logsumexp
 
 
+# Lower edges of the declared size strata.  N>=60 is its own stratum so a broad 41:80 band
+# cannot spend all of its draws below the extreme-basket boundary.  Strata above nmax are
+# dropped; the last retained stratum is clipped to nmax.
+SIZE_BAND_LOWER_BOUNDS = (1, 5, 11, 21, 41, 60, 81)
+
+
 @dataclass(frozen=True)
 class StratifiedNaturalBank:
     observed_pair: np.ndarray

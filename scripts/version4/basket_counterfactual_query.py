@@ -26,7 +26,7 @@ import torch
 os.environ.setdefault("V3_AFFINITY", "1")
 
 from checkpoint_io import ROOT, load_checkpoint
-from data import build
+from data import BI, build
 from features import Features
 from fit import Batcher
 from price_response import changed_price_context
@@ -418,8 +418,7 @@ def main() -> None:
         required_capabilities=("conditional_nonempty_incidence", "gram_interactions"))
     if trip < 0 or trip >= len(data["trip_split"]):
         raise ValueError("query trip is outside the data universe")
-    features = Features(int(data["n_item"]), int(data["n_store"]), 712,
-                        include_recency=False)
+    features = Features(int(data["n_item"]), int(data["n_store"]), include_recency=False)
     batcher = Batcher(data, features, int(meta["nmax"]), include_recency=False)
     ix, context, _line_context, house, *_ = batcher.make(
         np.asarray([trip], dtype=np.int64))
@@ -432,7 +431,7 @@ def main() -> None:
         minimum_reweight_ess_fraction=args.minimum_reweight_ess_fraction,
         minimum_condition_ess=args.minimum_condition_ess,
         minimum_tail_ess=args.minimum_tail_ess)
-    metadata = pd.read_parquet(ROOT / "basket_input/items.parquet") \
+    metadata = pd.read_parquet(Path(BI) / "items.parquet") \
         .sort_values("item_id").set_index("item_id")
     declared_items = {int(answer["action"]["item_id"])}
     for row in specification.get("candidate_baskets", []):

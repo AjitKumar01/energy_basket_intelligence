@@ -1535,8 +1535,8 @@ The main shared statistical objects are:
 - `checkpoint_io.py` and `provenance.py`: lineage and capability validation; and
 - `poly_degree_native.cpp`: the differentiable native polynomial kernel.
 
-The older `fit_convex_natural_interactions.py` is retained only behind
-`--interaction-estimator legacy-ordinary` for reproduction. It is not the default path.
+The older ordinary-draw estimator `fit_convex_natural_interactions.py` was removed in the
+16 September 2026 codebase audit and remains available from git history.
 Research scripts in the same directory do not become part of the selected pipeline merely
 because they are tracked.
 

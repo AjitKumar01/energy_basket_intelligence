@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import os
 
 import torch
 
@@ -72,6 +73,14 @@ def load_checkpoint(path: Path, data, *, required_capabilities=()):
     if blob.get("data_fingerprint_sha256") != fingerprint:
         raise ValueError("checkpoint and initialization data fingerprints differ")
     require_capabilities(blob, *required_capabilities)
+    price_component = blob.get("supported_price_component") or {}
+    price_contract = price_component.get("price_feature_contract", "chain_and_store")
+    if price_contract not in {"chain_and_store", "chain_product_week_only"}:
+        raise ValueError(f"checkpoint has unknown price feature contract {price_contract!r}")
+    # Feature objects are normally constructed immediately after checkpoint loading.
+    # Carry the checkpoint's contract through that existing interface so every training,
+    # evaluation and API process scores exactly the price panel used during fitting.
+    os.environ["ENERGY_PRICE_FEATURE_CONTRACT"] = price_contract
     model = RaggedModel(
         int(data["n_item"]), int(data["n_user"]), int(data["n_cat"]),
         K=int(meta["K"]), Kz=int(meta["Kz"]), nmax=int(meta["nmax"]),

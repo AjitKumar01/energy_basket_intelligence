@@ -429,8 +429,8 @@ PSD matrix is factored back into active columns of `phi`.
 This stage is Monte Carlo maximum likelihood, but it does not repeatedly estimate a noisy
 high-dimensional `log Z` during ordinary gradient training. Its common random draws make
 the finite-sample optimization target deterministic. The draw bank is cached and reused
-after interruption. `fit_convex_natural_interactions.py` is retained only as the legacy
-ordinary-draw reproduction path.
+after interruption. The former ordinary-draw estimator was removed in the 16 September
+2026 audit; it remains in git history.
 
 ### 8.4 Household-size post-calibration
 
@@ -622,14 +622,18 @@ policy. With 20 products it enumerates every supported basket, so normalizer err
 absent. This workflow tests identifiability and decision logic under known truth; it does
 not certify real-world causal performance.
 
-## 13. Active and non-selected Version-4 files
+## 13. Active Version-4 files
 
-The following classification is important because all files sit in one directory.
+The following classification is important because all files sit in one directory. It was
+refreshed by the 16 September 2026 codebase audit, which removed superseded trainers and
+experiments (Section 13.6) after moving the helpers that selected stages still used.
 
 ### 13.1 Selected stage executables
 
 - `build_affinity_partition.py`
 - `initialize_version4.py`
+- `fit_supported_price_response.py` (skipped when certified joint price coefficients are
+  supplied with `--price-coefficients`)
 - `fit_exact_additive.py`
 - `build_spectral_phi_initialization.py`
 - `fit_stratified_natural_interactions.py`
@@ -640,45 +644,66 @@ The following classification is important because all files sit in one directory
 - `audit_customer_segments.py`
 - `audit_interaction_embeddings.py`
 - `audit_population_size.py`
+- `diagnose_size_phase.py`
 - `run_segment_pricing_mdp.py`
 
 ### 13.2 Selected shared implementation
 
-- `data.py`, `features.py`, `ragged.py`, `fit.py`
+- `data.py`, `features.py`, `ragged.py`, `fit.py` (batching, initialization helpers and
+  incidence ranking only; the historical Version-3 trainer was removed)
 - `interaction_particles.py`, `tempered_ais.py`, `tempered_block_gibbs.py`
-- `stratified_natural.py`
-- `category_safety.py`, `sparse_artifact.py`
-- `checkpoint_io.py`, `pipeline_support.py`, `provenance.py`
+- `stratified_natural.py` (also owns the declared size-band edges), `basket_incidence.py`
+- `category_safety.py`, `price_response.py`, `sparse_artifact.py`
+- `adaptive_sparse.py` (signed sparse-grid integration used by `ragged._log_Z_quad`)
+- `checkpoint_io.py`, `pipeline_support.py`, `provenance.py`, `uncertainty.py`
 - `poly_degree_native.py`, `poly_degree_native.cpp`, `setup_poly_degree_native.py`
-- optional non-locked recommendation diagnostics still use helpers from `fit.py` and
-  `eval_mrr_cutoffs.py`; the selected locked add-one path does not
+- driver support: `scripts/run_manifest.py`, `scripts/runtime_capabilities.py`
 
 ### 13.3 Baseline and synthetic programs
 
 - `baselines.py`, `baselines2.py`, `train_baseline_verified.py`,
   `audit_other_baselines_fair.py`
-- `audit_synthetic_interactions.py`, `audit_synthetic_retailer.py`
+- `audit_probability_foundations.py`, `audit_synthetic_interactions.py`,
+  `audit_synthetic_retailer.py` (driven by `scripts/run_synthetic_experiment.py`)
 
-### 13.4 Research or superseded entry points
+### 13.4 External data and retailer interfaces
 
-These are not called by the canonical `scripts/run_pipeline.py` invocation:
+- canonical basket contract: `external_basket.py` (ERIM multi-category adapter),
+  `canonical_basket_input.py`, `scripts/build_erim_basket_dataset.py`,
+  `scripts/build_canonical_basket_input.py`
+- external single-category choice validation: `external_choice*.py`,
+  `scripts/run_external_price_validation.py`
+- joint current-price coefficients consumed by the pipeline: `fit_joint_price_utility.py`
+- retailer queries and API: `conditional_basket.py`, `basket_counterfactual_query.py`,
+  `retail_api/`, `scripts/run_retail_api.py`
 
-- `adaptive_sparse.py`
-- `calibrate_projected_fisher_size.py`
-- `constrain_category_interactions.py`
-- `diagnose_bucket_coverage.py`
-- `fit_convex_natural_interactions.py` except through `--interaction-estimator legacy-ordinary`
-- `fit_interaction_particles.py` as a trainer
-- `fit_multifidelity_rank8.py` as a trainer
-- `fit_projected_fisher_interactions.py`
-- `profile_rho0_size_likelihood.py` as a standalone experiment
-- `sparse_training.py`
-- `evalall.py` and `eval_mrr_cutoffs.py` as standalone evaluators
+### 13.5 Verification and research evidence
 
-The selected rank, interaction, checkpoint, quadrature, size-law, generation and
-certification paths no longer import helpers from the superseded trainer executables.
-Research files remain tracked for reproducibility but do not own selected-pipeline
-interfaces.
+These reproduce results cited in `paper/` and the API evidence gates; they are not part of
+the canonical pipeline invocation:
+
+- `scripts/run_remaining_verification.py` stages: `audit_original_probability.py`,
+  `audit_price_data_provenance.py`, `audit_real_price_numerics.py`,
+  `audit_real_generation_calibration.py`, `evaluate_observational_price_response.py`
+- retail application evidence: `evaluate_retail_applications.py`,
+  `audit_basket_completion_corrected.py`, `audit_cart_conditionals_quadrature.py`,
+  `audit_counterfactual_query_synthetic.py`
+- completed research: `research_real_price_evidence.py`, `eda_typebc_coupon_campaigns.py`,
+  `audit_size_drift_decomposition.py`, `audit_joint_price_alignment.py`,
+  `report_learned_interaction_embeddings.py`
+
+### 13.6 Removed superseded code
+
+Removed on 16 September 2026 and recoverable from git history: the Version-3 trainer in
+`fit.py`, `fit_convex_natural_interactions.py` (the `legacy-ordinary` interaction
+estimator), `fit_multifidelity_rank8.py`, `fit_interaction_particles.py`,
+`fit_projected_fisher_interactions.py`, `calibrate_projected_fisher_size.py`,
+`constrain_category_interactions.py`, `profile_rho0_size_likelihood.py`,
+`sparse_training.py`, `evalall.py`, `eval_mrr_cutoffs.py`, `diagnose_bucket_coverage.py`,
+`embedding_refinement.py`, `pilot_embedding_refinement.py` and
+`scripts/run_interaction_recovery.py`, together with the unreachable adaptive, multimode,
+Sobol and Gauss-Hermite normalizer paths and the unused sampling/diagnostic methods of
+`RaggedModel`. No selected stage, API route or verification suite used them.
 
 ## 14. Test architecture and present verification
 

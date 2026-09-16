@@ -1,14 +1,6 @@
 import unittest
 
 import numpy as np
-import torch
-
-from fit_multifidelity_rank8 import project_rho_c_trust_region
-
-
-class _Model:
-    def __init__(self, value):
-        self.rho_c = torch.nn.Parameter(torch.as_tensor(value, dtype=torch.float64))
 
 
 class CategorySizeOrthogonalTests(unittest.TestCase):
@@ -41,14 +33,6 @@ class CategorySizeOrthogonalTests(unittest.TestCase):
         new = -(rho + delta) @ statistic - new_rho0[n - 1]
         expected_change = -delta @ (statistic - reference[:, n - 1])
         self.assertAlmostEqual(new - old, expected_change, places=13)
-
-    def test_trust_projection(self):
-        model = _Model([3.0, 4.0])
-        norm, changed = project_rho_c_trust_region(
-            model, torch.zeros(2, dtype=torch.float64), 2.0)
-        self.assertTrue(changed)
-        self.assertAlmostEqual(norm, 2.0)
-        self.assertLess(abs(float(model.rho_c.detach().norm()) - 2.0), 1e-14)
 
 
 if __name__ == "__main__":

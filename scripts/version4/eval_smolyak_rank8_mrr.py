@@ -20,9 +20,8 @@ import torch
 
 from checkpoint_io import ROOT, load_checkpoint
 from data import build
-from eval_mrr_cutoffs import popularity_ranks
 from features import Features
-from fit import Batcher, popularity_logits, rec_eval
+from fit import Batcher, midrank, popularity_logits, rec_eval
 from ragged import smolyak_grid
 from provenance import file_sha256, strict_json_dumps
 from uncertainty import household_cluster_se, paired_score_summary
@@ -51,11 +50,31 @@ def metrics(ranks, household=None):
     return result
 
 
-def midrank(score, position):
-    target = score[position]
-    greater = np.count_nonzero(score > target)
-    tied = np.count_nonzero(score == target)
-    return 1.0 + greater + 0.5 * (tied - 1)
+def popularity_ranks(data, trips, seed=0):
+    """Exposure-corrected popularity ranks on the same holdouts as :func:`fit.rec_eval`."""
+    score = popularity_logits(data, np.flatnonzero(data["trip_split"] == 0)).numpy()
+    rng = np.random.default_rng(seed)
+    ranks = []
+    categories = int(data["n_cat"])
+    for trip in trips:
+        lo, hi = int(data["line_ptr"][trip]), int(data["line_ptr"][trip + 1])
+        basket = data["line_item"][lo:hi]
+        if len(basket) < 2:
+            continue
+        hidden = int(basket[int(rng.integers(len(basket)))])
+        rest = basket[basket != hidden]
+        if len(rest) == 0:
+            continue
+        store = int(data["trip_store"][trip])
+        candidates = data["store_items"][
+            int(data["store_cat_ptr"][store * categories]):
+            int(data["store_cat_ptr"][(store + 1) * categories])]
+        candidates = candidates[~np.isin(candidates, rest)]
+        position = np.flatnonzero(candidates == hidden)
+        if len(position) == 0:
+            continue
+        ranks.append(midrank(score[candidates], int(position[0])))
+    return np.asarray(ranks, dtype=float)
 
 
 @torch.no_grad()
@@ -189,8 +208,7 @@ def main():
         raise RuntimeError(
             f"checkpoint active interaction rank is {active_rank}, not {args.rank}")
     model.eval()
-    features = Features(int(data["n_item"]), int(data["n_store"]), 712,
-                        include_recency=False)
+    features = Features(int(data["n_item"]), int(data["n_store"]), include_recency=False)
     batcher = Batcher(data, features, int(meta["nmax"]), include_recency=False)
     split = {"validation": 1, "test": 2}[args.split]
     population = np.flatnonzero((data["trip_split"] == split) &
@@ -235,7 +253,6 @@ def main():
         nodes = torch.zeros(len(weights), model.Kz, dtype=model.phi.dtype)
         nodes[:, :active_rank] = active_nodes
         model.quad = (nodes, weights)
-        model.quad_a = None
         conditioned = protocol == "conditioned-incidence"
         ranks = rec_eval(model, batcher, trips, seed=args.seed + 17,
                          chunk=args.chunk, return_ranks=True,

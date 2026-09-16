@@ -24,7 +24,7 @@ from sklearn.preprocessing import StandardScaler
 from torch.nn.functional import softplus
 
 from checkpoint_io import ROOT, load_checkpoint
-from data import build
+from data import BI, build
 from features import Features
 from fit import Batcher
 from interaction_particles import (blocked_rejuvenation,
@@ -46,6 +46,26 @@ def induced_representation(left, right):
     return (left @ vector[:, keep]) * np.sqrt(value[keep])[None, :]
 
 
+def price_sensitivity_label(price_identified: bool, global_quantile: float | None) -> str:
+    """Relative price-sensitivity label; none is ranked when households share one response."""
+    if not price_identified:
+        return ""
+    if global_quantile is None:
+        return "; household-invariant price response"
+    if global_quantile >= .67:
+        return "; high price sensitivity"
+    if global_quantile <= .33:
+        return "; low price sensitivity"
+    return "; medium price sensitivity"
+
+
+def standardized_block(values):
+    """Standardize a present identified surface; preserve an absent one."""
+    if values.shape[1] == 0:
+        return values.copy()
+    return StandardScaler().fit_transform(values) / math.sqrt(values.shape[1])
+
+
 def household_representation(model):
     taste = induced_representation(
         model.theta_c().detach().numpy(), model.alpha.detach().numpy())
@@ -54,8 +74,8 @@ def household_representation(model):
     price = induced_representation(gamma, beta)
     # Standardize the two identified surfaces separately, then give each block equal
     # aggregate Euclidean weight rather than letting its raw dimension choose the result.
-    taste = StandardScaler().fit_transform(taste) / math.sqrt(taste.shape[1])
-    price = StandardScaler().fit_transform(price) / math.sqrt(price.shape[1])
+    taste = standardized_block(taste)
+    price = standardized_block(price)
     return np.concatenate([taste, price], axis=1), taste, price
 
 
@@ -400,9 +420,12 @@ def main():
         f"stability_ari={selected['stability_ari']:.6f}",
         flush=True,
     )
-    metadata = pd.read_parquet(ROOT / "basket_input" / "items.parquet").sort_values(
+    metadata = pd.read_parquet(Path(BI) / "items.parquet").sort_values(
         "item_id")
-    item_category = metadata.cat_id.to_numpy(dtype=np.int64)
+    item_category = model.cat_of.detach().cpu().numpy().astype(np.int64)
+    metadata["cat_id"] = item_category
+    metadata["COMMODITY_DESC"] = [
+        f"affinity_group_{value}" for value in item_category]
     names = category_names(metadata, model.C)
     test_by_segment = segment_trips(data, labels, 2, model.nmax)
     validation_by_segment = segment_trips(data, labels, 1, model.nmax)
@@ -420,23 +443,27 @@ def main():
         minlength=int(data["n_user"]))
     mean_beta = beta.mean(0)
     price_coefficient = gamma @ mean_beta * float(softplus(model.price_kappa.detach()))
-    features = Features(int(data["n_item"]), int(data["n_store"]), 712,
-                        include_recency=False)
+    features = Features(int(data["n_item"]), int(data["n_store"]), include_recency=False)
     batcher = Batcher(data, features, model.nmax, include_recency=False)
     rng = np.random.default_rng(args.seed + 1)
     segments = []
+    price_identified = price.shape[1] > 0
+    # A frozen supported price component is identical for every household; ranking a
+    # segment within that constant surface would only rank floating-point rounding.
+    price_varies = price_identified and bool(
+        np.ptp(price_coefficient) > 1e-9 * max(1.0, float(np.abs(price_coefficient).max())))
     for segment in range(count):
         households = np.flatnonzero(labels == segment)
         trips = test_by_segment[segment]
         selected = trips[rng.permutation(len(trips))[:args.contexts_per_segment]]
         overindex = top_overindex(
             data, trips, item_category, global_category, names)
-        sensitivity = float(np.mean(price_coefficient[households]))
-        global_quantile = float(np.mean(price_coefficient <= sensitivity))
-        label = (" / ".join(row["name"] for row in overindex[:2])
-                 + ("; high price sensitivity" if global_quantile >= .67 else
-                    "; low price sensitivity" if global_quantile <= .33 else
-                    "; medium price sensitivity"))
+        sensitivity = (float(np.mean(price_coefficient[households]))
+                       if price_identified else 0.0)
+        global_quantile = (float(np.mean(price_coefficient <= sensitivity))
+                           if price_varies else None)
+        price_label = price_sensitivity_label(price_identified, global_quantile)
+        label = " / ".join(row["name"] for row in overindex[:2]) + price_label
         print(
             f"[segments] starting segment={segment} "
             f"households={len(households)} real_test_baskets={len(trips)} "
@@ -469,7 +496,9 @@ def main():
         "data_fingerprint_sha256": blob["data_fingerprint_sha256"],
         "trained_capabilities": blob["trained_capabilities"],
         "method": ("KMeans on separately standardized, equal-block-weighted, "
-                   "rotation-invariant household taste and price surfaces"),
+                   "rotation-invariant identified household taste and price surfaces; "
+                   "an unidentified or disabled block contributes no coordinates"),
+        "price_surface_identified": price_identified,
         "test_leakage": False,
         "chosen_segments": count, "candidate_selection": selection,
         "assignments": str(assignments),

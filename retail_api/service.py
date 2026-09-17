@@ -37,6 +37,7 @@ os.environ.setdefault("V3_AFFINITY", "1")
 
 from checkpoint_io import load_checkpoint  # noqa: E402
 from conditional_basket import conditional_completion_quadrature  # noqa: E402
+from price_response import changed_price_context  # noqa: E402
 from data import build  # noqa: E402
 from features import Features  # noqa: E402
 from fit import Batcher  # noqa: E402
@@ -500,6 +501,138 @@ class RetailModelService:
             self.product_search_text.str.contains(query, regex=False)].head(limit)
         return [ProductSearchResult(**self._product(int(row.item_id)))
                 for row in rows.itertuples()]
+
+    def _expectations(self, ix, context, revealed, rule):
+        """Exact E[1_j] per slot and expected item count under one price context.
+
+        With no revealed cart this is the marginal nonempty-basket law (the gradient of
+        log Z_+ in the slot utilities); with a cart it is the conditional completion.
+        """
+        self.model.ctx = context
+        slot_b = self.model.b_flat(ix).detach()
+        if revealed:
+            result = conditional_completion_quadrature(self.model, ix, slot_b, [revealed], *rule)
+            return (result.item_incidence[0].detach().numpy(),
+                    float(result.expected_additional_items[0]))
+        slot_b = slot_b.clone().requires_grad_(True)
+        old_quad, old_override = getattr(self.model, "quad", None), getattr(self.model, "_b_override", None)
+        self.model.quad = (rule[0].to(self.model.phi.dtype), rule[1].to(self.model.phi.dtype))
+        self.model._b_override = slot_b
+        try:
+            with torch.enable_grad():
+                log_normalizer, size = self.model.log_Z(ix, drop_empty=True, return_size=True)
+                gradient, = torch.autograd.grad(log_normalizer.sum(), slot_b)
+        finally:
+            self.model.quad, self.model._b_override = old_quad, old_override
+        axis = torch.arange(1, self.model.nmax + 1, dtype=self.model.phi.dtype)
+        return gradient.detach().numpy(), float(size.detach() @ axis)
+
+    def price_scenario(self, request):
+        """Model-conditional price scenario, served only where a verdict claims it."""
+        verdict = self.capability_verdicts.get("causal_price_optimization", {})
+        if verdict.get("status") not in ("supported", "limited"):
+            raise RetailAPIError(
+                "this deployment does not claim causal_price_optimization; see "
+                "GET /v1/capabilities", status_code=403, code="capability_not_claimed")
+        changed = {}
+        missing = []
+        for change in request.price_changes:
+            item = self.external_to_internal.get(int(change.product_id))
+            (missing.append(int(change.product_id)) if item is None
+             else changed.__setitem__(item, float(change.multiplier)))
+        revealed = []
+        for product_id in request.revealed_product_ids:
+            item = self.external_to_internal.get(int(product_id))
+            (missing.append(int(product_id)) if item is None else revealed.append(item))
+        if missing:
+            raise RetailAPIError(f"products are outside the fitted catalogue: {missing}",
+                                 code="unknown_product")
+        if len(revealed) > self.model.nmax:
+            raise RetailAPIError("revealed cart exceeds model size support")
+        with self._lock:
+            ix, ctx, house = self._resolve_context(request.context)
+            self.model.house = house
+            slot_item = ix.item.detach().numpy()
+            offered = set(slot_item.tolist())
+            absent = sorted(self.internal_to_external[item] for item in changed if item not in offered)
+            if absent:
+                raise RetailAPIError(
+                    f"products are not offered in this store and week: {absent}",
+                    code="product_not_offered")
+            log_change = torch.zeros(len(slot_item), dtype=self.model.phi.dtype)
+            for item, multiplier in changed.items():
+                log_change[torch.as_tensor(slot_item == item)] = math.log(multiplier)
+            scenario_ctx = changed_price_context(ctx, ix.item_trip, log_change)
+            try:
+                results = {}
+                for level, rule in enumerate(self.rules):
+                    results[level] = (self._expectations(ix, ctx, revealed, rule),
+                                      self._expectations(ix, scenario_ctx, revealed, rule))
+                    if level == 0:
+                        continue
+                    (low_base, low_size), (low_scen, low_scen_size) = results[level - 1]
+                    (base, size), (scen, scen_size) = results[level]
+                    items_gap = max(abs(size - low_size), abs(scen_size - low_scen_size))
+                    probability_gap = float(max(np.abs(base - low_base).max(),
+                                                np.abs(scen - low_scen).max()))
+                    if (items_gap <= self.EXPECTED_SIZE_TOLERANCE
+                            and probability_gap <= self.ITEM_INCIDENCE_TOLERANCE):
+                        break
+                else:
+                    raise RetailAPIError(
+                        f"adjacent quadrature precision gate failed: expected items "
+                        f"{items_gap}, item probability {probability_gap}",
+                        status_code=503, code="numerical_gate_failed")
+            finally:
+                self.model.ctx = ctx
+        (base, base_size), (scenario, scenario_size) = results[level]
+        delta = scenario - base
+        per_item_base, per_item_scenario = {}, {}
+        for slot, item in enumerate(slot_item):
+            per_item_base[int(item)] = per_item_base.get(int(item), 0.0) + float(base[slot])
+            per_item_scenario[int(item)] = per_item_scenario.get(int(item), 0.0) + float(scenario[slot])
+
+        def effect(item):
+            product = self._product(int(item))
+            return {"product_id": product["product_id"], "internal_item_index": int(item),
+                    "commodity": product["commodity"], "brand": product["brand"],
+                    "baseline_probability": per_item_base[int(item)],
+                    "scenario_probability": per_item_scenario[int(item)],
+                    "change": per_item_scenario[int(item)] - per_item_base[int(item)]}
+
+        others = sorted((item for item in per_item_base if item not in changed),
+                        key=lambda item: -abs(per_item_scenario[item] - per_item_base[item]))
+        categories = {}
+        for item in per_item_base:
+            commodity = self._product(int(item))["commodity"]
+            row = categories.setdefault(commodity, [0.0, 0.0])
+            row[0] += per_item_base[item]
+            row[1] += per_item_scenario[item]
+        category_effects = [
+            {"commodity": commodity, "baseline_expected_items": row[0],
+             "scenario_expected_items": row[1], "change": row[1] - row[0]}
+            for commodity, row in sorted(categories.items(), key=lambda kv: -abs(kv[1][1] - kv[1][0]))]
+        return {
+            "estimand": ("E[1_j | context, prices] under the fitted law, with and without the "
+                         "declared price change" + (" and the revealed cart" if revealed else "")),
+            "capability_status": verdict["status"],
+            "evidence_source": verdict.get("source", ""),
+            "checkpoint_sha256": self.checkpoint_sha256,
+            "conditioned_on_products": [int(self.internal_to_external[item]) for item in revealed],
+            "price_changes": request.price_changes,
+            "baseline_expected_items": base_size, "scenario_expected_items": scenario_size,
+            "changed_products": [effect(item) for item in changed],
+            "largest_other_changes": [effect(item) for item in others[:request.top_k]],
+            "category_effects": category_effects,
+            "numerical_certificate": {
+                "selected_level": self.levels[level], "selected_nodes": len(self.rules[level][1]),
+                "used_followup": level > 1,
+                "adjacent_expected_items_gap": float(items_gap),
+                "adjacent_item_probability_gap": float(probability_gap)},
+            "limitation": (verdict.get("limitation") or
+                           "a model-conditional scenario under the fitted law; it is an identified "
+                           "causal claim only where the deployment's evidence says so"),
+        }
 
     def model_data_contract(self):
         """The served bundle's identity, substitution groups and availability contract."""

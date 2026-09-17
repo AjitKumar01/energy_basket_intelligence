@@ -81,6 +81,72 @@ class BasketCompletionResponse(StrictModel):
     limitation: str
 
 
+class PriceChange(StrictModel):
+    product_id: int
+    # A multiplier on the product's price: 0.8 is a 20% cut. The range is the declared
+    # scenario window; the model was never fitted or checked outside it.
+    multiplier: Annotated[float, Field(gt=0.2, le=3.0)]
+
+
+class PriceScenarioRequest(StrictModel):
+    context: Context
+    price_changes: Annotated[list[PriceChange], Field(min_length=1, max_length=50)]
+    revealed_product_ids: list[int] = []
+    top_k: Annotated[int, Field(ge=1, le=100)] = 10
+
+    @model_validator(mode="after")
+    def unique_products(self):
+        changed = [change.product_id for change in self.price_changes]
+        if len(changed) != len(set(changed)):
+            raise ValueError("price_changes must name each product once")
+        if len(self.revealed_product_ids) != len(set(self.revealed_product_ids)):
+            raise ValueError("revealed_product_ids must be unique")
+        if set(changed) & set(self.revealed_product_ids):
+            raise ValueError("a revealed product is already in the cart; its price cannot change")
+        return self
+
+
+class ProductEffect(StrictModel):
+    product_id: int
+    internal_item_index: int
+    commodity: str
+    brand: str
+    baseline_probability: float
+    scenario_probability: float
+    change: float
+
+
+class CategoryEffect(StrictModel):
+    commodity: str
+    baseline_expected_items: float
+    scenario_expected_items: float
+    change: float
+
+
+class PriceCertificate(StrictModel):
+    selected_level: int
+    selected_nodes: int
+    used_followup: bool
+    adjacent_expected_items_gap: float
+    adjacent_item_probability_gap: float
+
+
+class PriceScenarioResponse(StrictModel):
+    estimand: str
+    capability_status: str
+    evidence_source: str
+    checkpoint_sha256: str
+    conditioned_on_products: list[int]
+    price_changes: list[PriceChange]
+    baseline_expected_items: float
+    scenario_expected_items: float
+    changed_products: list[ProductEffect]
+    largest_other_changes: list[ProductEffect]
+    category_effects: list[CategoryEffect]
+    numerical_certificate: PriceCertificate
+    limitation: str
+
+
 class SegmentResponse(StrictModel):
     household_index: int
     segment: int

@@ -65,7 +65,7 @@ evidence and match the checkpoint and dataset (`capability_verdicts.json`, writt
 | Basket completion | validated for masked-pair evaluation | the run's completion audit |
 | Cross-sell | promising offline | MRR 0.45 against 0.26 for popularity |
 | Customer segmentation | descriptive only | 3 segments |
-| **Causal price optimization** | **supported** | own-product response within 3.0% of the truth; prices are randomized by design in this world |
+| **Causal price optimization** | **supported** | own-product response within 3.0% of the truth; prices are randomized by design in this world. Served by `POST /v1/baskets/price_scenario` (see I) |
 | **Promotion policy** | **supported** | action values correlate 0.979 with the truth over 18 actions; the best action matches; totals are conservative |
 | **Stockout substitution** | **limited** | stocked-cell precision 0.998 and recall 0.9999, substitution effects correlate 0.95, but no stockout decision was scored |
 | Assortment optimization, personalized bundle policy | untested | nothing was scored against the truth |
@@ -79,6 +79,42 @@ On ERIM there is no verdict file, so every decision capability stays refused, wh
 that dataset's evidence: its prices are observational and the pipeline's own policy
 evaluation reports the value as `not_identifiable`. The refusals travel with the evidence,
 not with the code.
+
+### I. Price scenario: what if we cut a price? (`POST /v1/baskets/price_scenario`)
+
+**Use.** "Cut product 79 by 20%: what happens to it, to the rest of its category, and to the
+basket?" The endpoint is served only where the verdict file claims causal price
+optimization, so ERIM refuses it with HTTP 403 and this deployment answers.
+
+**One call.**
+
+```
+POST /v1/baskets/price_scenario
+{"context": {"kind": "historical_trip", "trip_index": 61234},
+ "price_changes": [{"product_id": 79, "multiplier": 0.8}], "top_k": 3}
+→ product 79: 0.165 → 0.231 (+0.066)
+  its category, pantry, net +0.045 expected items; peers 77, 75, 89 each fall 0.002–0.005
+  expected basket size 3.499 → 3.541
+  certificate: level 10, 2,381 nodes, largest adjacent gap 2e-05
+```
+
+The peers falling while the discounted product rises is substitution, which is exactly what
+the category groups represent.
+
+**Scored against the truth** over 40 contexts, each cutting one randomly chosen stocked
+product by 20%:
+
+| Measure | Model | Truth |
+|---|---:|---:|
+| Own-product probability change | +0.0097 | +0.0105 |
+| Correlation with the truth, own product | 0.83 | — |
+| Mean absolute error, own product | 0.0052 | — |
+| Same-category peers, total change | −0.0020 | −0.0022 |
+| Correlation with the truth, peers | 0.83 | — |
+| Both signs correct (own up, peers down) | **100%** of cases | — |
+
+The direction and the size of both effects track the truth, with per-context error of about
+half a percentage point of purchase probability.
 
 ### C. Catalogue: turn a cart into product ids (`GET /v1/products/search`)
 

@@ -17,6 +17,30 @@ class FakeService:
             "unavailable": {"causal_price_optimization": "not validated"},
         }
 
+    def price_scenario(self, request):
+        return {
+            "estimand": "test price scenario",
+            "capability_status": "supported",
+            "evidence_source": "test evidence",
+            "checkpoint_sha256": self.checkpoint_sha256,
+            "conditioned_on_products": request.revealed_product_ids,
+            "price_changes": request.price_changes,
+            "baseline_expected_items": 3.0,
+            "scenario_expected_items": 3.1,
+            "changed_products": [{
+                "product_id": request.price_changes[0].product_id, "internal_item_index": 3,
+                "commodity": "BREAD", "brand": "National",
+                "baseline_probability": .10, "scenario_probability": .15, "change": .05}],
+            "largest_other_changes": [],
+            "category_effects": [{"commodity": "BREAD", "baseline_expected_items": .5,
+                                  "scenario_expected_items": .52, "change": .02}],
+            "numerical_certificate": {"selected_level": 8, "selected_nodes": 341,
+                                      "used_followup": False,
+                                      "adjacent_expected_items_gap": 1e-6,
+                                      "adjacent_item_probability_gap": 1e-7},
+            "limitation": "test limitation",
+        }
+
     def complete(self, request):
         return {
             "estimand": "test conditional law",
@@ -226,3 +250,40 @@ def test_bad_verdict_files_are_rejected(tmp_path, capabilities, overrides, messa
     service, _ = verdict_loader(tmp_path, capabilities, **overrides)
     with pytest.raises(RetailAPIError, match=message):
         service._load_capability_verdicts()
+
+
+def test_price_scenario_endpoint_returns_effects(client):
+    response = client.post("/v1/baskets/price_scenario", json={
+        "context": {"kind": "historical_trip", "trip_index": 4},
+        "price_changes": [{"product_id": 22, "multiplier": 0.8}]})
+    body = response.json()
+    assert response.status_code == 200
+    assert body["changed_products"][0]["change"] == pytest.approx(0.05)
+    assert body["capability_status"] == "supported" and body["evidence_source"]
+
+
+@pytest.mark.parametrize("payload", [
+    {"price_changes": [{"product_id": 22, "multiplier": 0.0}]},                 # out of range
+    {"price_changes": [{"product_id": 22, "multiplier": 9.0}]},                 # out of range
+    {"price_changes": []},                                                      # nothing to price
+    {"price_changes": [{"product_id": 22, "multiplier": 0.8},
+                       {"product_id": 22, "multiplier": 0.9}]},                  # duplicate product
+    {"price_changes": [{"product_id": 22, "multiplier": 0.8}],
+     "revealed_product_ids": [22]},                                              # already in the cart
+    {"price_changes": [{"product_id": 22, "multiplier": 0.8}], "budget": 100},   # unknown field
+])
+def test_price_scenario_rejects_malformed_requests(client, payload):
+    response = client.post("/v1/baskets/price_scenario", json={
+        "context": {"kind": "historical_trip", "trip_index": 4}, **payload})
+    assert response.status_code == 422
+
+
+def test_price_scenario_is_refused_without_a_capability_verdict(tmp_path):
+    service, module = verdict_loader(tmp_path, {
+        "causal_price_optimization": {"status": "untested", "reason": "nothing was scored"}})
+    service._load_capability_verdicts()
+    with pytest.raises(RetailAPIError, match="does not claim causal_price_optimization"):
+        module.RetailModelService.price_scenario(service, object())
+    service.capability_verdicts = {}
+    with pytest.raises(RetailAPIError, match="does not claim"):
+        module.RetailModelService.price_scenario(service, object())

@@ -12,6 +12,8 @@ from .errors import RetailAPIError
 from .schemas import (
     BasketCompletionRequest,
     BasketCompletionResponse,
+    PriceScenarioRequest,
+    PriceScenarioResponse,
     ProductSearchResult,
     SegmentResponse,
 )
@@ -75,6 +77,19 @@ def complete_basket(
         body: BasketCompletionRequest,
         service: Annotated[RetailModelService, Depends(get_service)]):
     return service.complete(body)
+
+
+@app.post("/v1/baskets/price_scenario", response_model=PriceScenarioResponse,
+          tags=["basket"])
+def price_scenario(
+        body: PriceScenarioRequest,
+        service: Annotated[RetailModelService, Depends(get_service)]):
+    """Purchase probabilities with and without a declared price change.
+
+    Served only where the deployment's capability verdict claims causal price optimization;
+    otherwise the request is refused with HTTP 403.
+    """
+    return service.price_scenario(body)
 
 
 @app.get("/v1/households/{household_index}/segment",

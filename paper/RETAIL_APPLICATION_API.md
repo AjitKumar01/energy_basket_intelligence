@@ -56,8 +56,13 @@ retailer manual's example use that Dunnhumby checkpoint.
 The API exposes only applications supported by the current audits:
 
 1. masking-aware basket-size and stopping probabilities;
-2. cross-sell ranking from masking-aware conditional item incidence; and
-3. descriptive customer-segment lookup.
+2. cross-sell ranking from masking-aware conditional item incidence;
+3. descriptive customer-segment lookup; and
+4. price scenarios, **only** where the deployment's verdict file claims causal price
+   optimization (`POST /v1/baskets/price_scenario`; HTTP 403 otherwise). The response gives
+   each product's purchase probability with and without the declared price change, the
+   change per category, the change in expected basket size, and an adjacent-rule numerical
+   certificate. Price multipliers are limited to the declared scenario window (0.2, 3.0].
 
 The basket and cross-sell outputs are two views of one normalized conditional joint law,
 not separate models. Every response is computed with adjacent deterministic quadrature

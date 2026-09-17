@@ -29,6 +29,8 @@ import sys
 import time
 from pathlib import Path
 
+import math
+
 import numpy as np
 import pandas as pd
 
@@ -299,6 +301,56 @@ def main() -> None:
             "expected_additional_gap": abs(live_body["expected_additional_items"]
                                            - historical_body["expected_additional_items"]),
             "example_recommendations": live_body["recommendations"][:3],
+        }
+
+        # ---- I. price scenario, scored against the truth --------------------------------
+        from evaluate_capabilities import Oracle
+        oracle = Oracle(args.world / "truth.npz", 16)
+        category = t["category"]
+        price_rows = []
+        for trip in chosen[:40]:
+            basket = basket_of_trip[trip]
+            offered = np.flatnonzero(t["first_stocked"][:, t["trip_store"][basket]] <= t["trip_period"][basket])
+            target = int(rng.choice(offered))
+            body = client.post("/v1/baskets/price_scenario", json={
+                "context": {"kind": "historical_trip", "trip_index": int(trip)},
+                "price_changes": [{"product_id": int(external[target]), "multiplier": 0.8}],
+                "top_k": 5}).json()
+            effect = body["changed_products"][0]
+            peers = np.zeros(len(external))
+            peers[(category == category[target])] = 1.0
+            peers[target] = 0.0
+            own = np.zeros(len(external))
+            own[target] = 1.0
+            change = np.zeros((1, len(external)))
+            change[0, target] = math.log(0.8)
+            base_b = oracle.b(np.array([basket]))
+            scenario_b = oracle.b(np.array([basket]), price_change=change)
+            oracle_own = (float(oracle.expectation(scenario_b, own[None])[0])
+                          - float(oracle.expectation(base_b, own[None])[0]))
+            oracle_peers = (float(oracle.expectation(scenario_b, peers[None])[0])
+                            - float(oracle.expectation(base_b, peers[None])[0]))
+            model_peers = sum(row["change"] for row in body["category_effects"]
+                              if row["commodity"] == effect["commodity"]) - effect["change"]
+            price_rows.append({"model_own": effect["change"], "oracle_own": oracle_own,
+                               "model_category_peers": model_peers, "oracle_category_peers": oracle_peers,
+                               "model_basket_size_change": body["scenario_expected_items"] - body["baseline_expected_items"]})
+        model_own = np.array([r["model_own"] for r in price_rows])
+        oracle_own = np.array([r["oracle_own"] for r in price_rows])
+        model_peers = np.array([r["model_category_peers"] for r in price_rows])
+        oracle_peers = np.array([r["oracle_category_peers"] for r in price_rows])
+        report["I_price_scenario"] = {
+            "question": "if we cut one product's price by 20%, what happens to it, its category and the basket?",
+            "cases": len(price_rows), "capability_status": body["capability_status"],
+            "own_product_change": {"model_mean": float(model_own.mean()), "truth_mean": float(oracle_own.mean()),
+                                   "correlation": float(np.corrcoef(model_own, oracle_own)[0, 1]),
+                                   "mean_absolute_error": float(np.abs(model_own - oracle_own).mean())},
+            "same_category_peers_change": {"model_mean": float(model_peers.mean()),
+                                           "truth_mean": float(oracle_peers.mean()),
+                                           "correlation": float(np.corrcoef(model_peers, oracle_peers)[0, 1])},
+            "both_signs_agree": float(np.mean((np.sign(model_own) == np.sign(oracle_own))
+                                              & (np.sign(model_peers) == np.sign(oracle_peers)))),
+            "mean_basket_size_change": float(np.mean([r["model_basket_size_change"] for r in price_rows])),
         }
 
     args.output.parent.mkdir(parents=True, exist_ok=True)

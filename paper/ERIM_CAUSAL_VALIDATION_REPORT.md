@@ -201,7 +201,9 @@ Source: [ERIM_TISSUE_TRANSPORT_TEST.md](ERIM_TISSUE_TRANSPORT_TEST.md)
 
 **For the pipeline**
 - Add a product availability or assortment input (first store sale per product) wherever
-  new products occur. Test 1's error shows its absence silently biases baselines.
+  new products occur. Test 1's error shows its absence silently biases baselines. **Done:**
+  see [ERIM_AVAILABILITY_REFIT.md](ERIM_AVAILABILITY_REFIT.md). It improves held-out ERIM
+  log-likelihood by +0.32 nats per basket.
 - Keep promotion effects separate from price effects. A promotion should have its own
   calibrated response, not a price-equivalent, as the retailer guide already recommends.
 - Use a randomized trial to calibrate promotion reach and redemption before the pricing

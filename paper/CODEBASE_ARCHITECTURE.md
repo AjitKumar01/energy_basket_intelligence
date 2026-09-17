@@ -250,6 +250,9 @@ Because there is no stock feed, every retained store receives the complete decla
 “available product” in the model is declared chain support rather than observed
 store-specific inventory.
 
+A bundle may add a store availability panel (section 6.1). The ragged support is unchanged,
+so no purchase can fall outside it; availability instead reweights each offered product.
+
 ## 6. Batch and feature layer
 
 ### 6.1 `Features`
@@ -259,8 +262,28 @@ assortment slots:
 
 - dense chain price deviations;
 - sparse store price deviations;
-- sparse display and mailer indicators; and
-- recency state via vectorized `searchsorted`.
+- sparse display and mailer indicators;
+- recency state via vectorized `searchsorted`; and
+- optional store availability, `log_availability(item, store, week)`.
+
+**Availability.** When `meta.json` has an enabled `availability_contract`, `availability.npz`
+holds `first_period[item, store]` and a scalar `log_floor`. A product's utility gains
+log a = 0 from its first available period and log a = log ε before that. `Batcher`, the
+baselines and the retail API add this value to the context as `log_avail`, and
+`RaggedModel.b_at` adds it to utility. The energy and the normalizer therefore scale the
+product's weight identically. Bundles without the contract (Dunnhumby) behave exactly as
+before.
+
+`CanonicalBasketModelInputBuilder(availability="retail_first_sale")` derives the panel:
+- **Source.** Retail-aggregate store-period units, net of the modeled cohort's own units,
+  so a purchase cannot confirm itself.
+- **Launch.** A product is confirmed at a store from its first such sale. A first sale
+  within 13 periods of the store's feed start counts as available from the start.
+- **ε.** The training purchase rate of unconfirmed cells relative to confirmed cells,
+  clipped to [1e-4, 1].
+- **No feed.** Products or stores without a feed are always available.
+
+The panel is part of the data fingerprint (`availability_panel`).
 
 ### 6.2 `Batcher`
 

@@ -73,6 +73,8 @@ python -u scripts/build_canonical_basket_input.py \
   --output-root data/erim_basket/model_input \
   --price-basis erim_chain_week_retail_aggregate_unit_price_carried_forward_constant_training_reference_without_retail_price \
   --promotion-feature disabled --model-price-sources retail_aggregate
+# add --availability retail_first_sale (and a separate --output-root) for the store
+# availability contract; see paper/ERIM_AVAILABILITY_REFIT.md
 
 ENERGY_MODEL_DATA_ROOT="$PWD/data/erim_basket/model_input" V3_AFFINITY=1 \
   python -u scripts/version4/build_affinity_partition.py \

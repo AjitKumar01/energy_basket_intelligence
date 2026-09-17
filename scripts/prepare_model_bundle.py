@@ -13,7 +13,8 @@ ragged index and data fingerprint. Everything dataset-specific lives in the JSON
       "promotion_feature": "disabled | advertised | special_price",
       "model_price_sources": ["retail_aggregate"],
       "availability": {"rule": "disabled | retail_first_sale", "left_censor_periods": 13},
-      "affinity": {"minimum_pair_count": 8, "maximum_group_size": 128},
+      "affinity": {"partition": "affinity | category",
+                   "minimum_pair_count": 8, "maximum_group_size": 128},
       "metadata_defaults": {"MANUFACTURER": "UNKNOWN", "DEPARTMENT": "UNKNOWN"},
       "promotion_coverage_note": "..."
     }
@@ -62,6 +63,32 @@ def load_config(path: Path) -> dict:
     return config
 
 
+def write_category_partition(basket_input: Path) -> None:
+    """Use the declared merchandise categories as the exact within-group partition.
+
+    Co-purchase affinity groups place complements together, so substitutes (rarely bought
+    together) fall in different groups and rho_c cannot express within-category
+    substitution. Categories are catalogue metadata, not outcomes, so this partition is
+    also training-only in the sense the initializer requires.
+    """
+    import numpy as np
+    import pandas as pd
+    items = pd.read_parquet(basket_input / "items.parquet", columns=["item_id", "cat_id"])
+    items = items.sort_values("item_id")
+    output = basket_input / "items_affinity.parquet"
+    items[["item_id", "cat_id"]].to_parquet(output, index=False)
+    sizes = np.bincount(items.cat_id.to_numpy())
+    manifest = {
+        "schema_version": 1, "training_only": True, "partition": "merchandise_category",
+        "n_items": int(len(items)), "n_groups": int(len(sizes)),
+        "maximum_group_size_observed": int(sizes.max()),
+        "partition_sha256": hashlib.sha256(output.read_bytes()).hexdigest(),
+    }
+    (basket_input / "affinity_manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
+    print(f"[prepare] category partition: {len(sizes)} groups, largest {int(sizes.max())}",
+          flush=True)
+
+
 def run(command: list[str], root: Path) -> None:
     env = {**os.environ, "ENERGY_MODEL_DATA_ROOT": str(root), "V3_AFFINITY": "1"}
     print("[prepare] " + " ".join(map(str, command)), flush=True)
@@ -95,10 +122,16 @@ def main() -> None:
     result = builder.build()
     print(f"[prepare] canonical contract passed: {json.dumps(builder.contract_summary)}",
           flush=True)
-    run([sys.executable, "-u", V4 / "build_affinity_partition.py",
-         "--minimum-pair-count", int(affinity.get("minimum_pair_count", 8)),
-         "--maximum-group-size", int(affinity.get("maximum_group_size", 128)),
-         "--output", root / "basket_input" / "items_affinity.parquet"], root)
+    partition = affinity.get("partition", "affinity")
+    if partition == "affinity":
+        run([sys.executable, "-u", V4 / "build_affinity_partition.py",
+             "--minimum-pair-count", int(affinity.get("minimum_pair_count", 8)),
+             "--maximum-group-size", int(affinity.get("maximum_group_size", 128)),
+             "--output", root / "basket_input" / "items_affinity.parquet"], root)
+    elif partition == "category":
+        write_category_partition(root / "basket_input")
+    else:
+        raise SystemExit("affinity.partition must be 'affinity' or 'category'")
     run([sys.executable, "-u", V4 / "data.py", "--force"], root)
     run([sys.executable, "-u", V4 / "provenance.py"], root)
     fingerprint = json.loads((root / "basket_input" / "model_data_fingerprint.json").read_text())

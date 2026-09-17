@@ -113,3 +113,19 @@ def test_shipped_dataset_configs_are_valid():
     assert configs
     for path in configs:
         module.load_config(path)
+
+
+def test_category_partition_writes_a_manifest_the_initializer_accepts(tmp_path):
+    spec = importlib.util.spec_from_file_location(
+        "prepare_bundle_partition", ROOT / "scripts" / "prepare_model_bundle.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    pd.DataFrame({"item_id": [2, 0, 1], "cat_id": [1, 0, 1]}).to_parquet(tmp_path / "items.parquet")
+    module.write_category_partition(tmp_path)
+    partition = pd.read_parquet(tmp_path / "items_affinity.parquet")
+    manifest = json.loads((tmp_path / "affinity_manifest.json").read_text())
+    assert partition.item_id.tolist() == [0, 1, 2] and partition.cat_id.tolist() == [0, 1, 1]
+    assert manifest["training_only"] and manifest["n_groups"] == 2 and manifest["n_items"] == 3
+    import hashlib
+    assert manifest["partition_sha256"] == hashlib.sha256(
+        (tmp_path / "items_affinity.parquet").read_bytes()).hexdigest()

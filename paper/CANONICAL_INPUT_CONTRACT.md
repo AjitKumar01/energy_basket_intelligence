@@ -126,6 +126,18 @@ Verification:
 
 ## 4. Choosing the partition
 
+The partition is an **input** to the frozen model. It changes which products share a
+penalty, never the model's form. There are three options:
+
+| Option | Groups | Settings | Use when | Measured |
+|---|---|---|---|---|
+| `affinity` (default) | products frequently bought together, one large residual group | `minimum_pair_count`, `maximum_group_size` | there is no usable catalogue, or categories are too large for the exact program | cannot represent substitution. Synthetic pair correlation 0.09; ERIM −0.029 nats per basket against `category` |
+| `category` | one group per merchandise category | none | categories hold competing products (typical branded grocery) | synthetic correlation 0.95; **ERIM standard** (+0.029 over `affinity`, significant MRR gain) |
+| `catalogue_hierarchy` | category × declared subcategory meeting floors; the rest pooled per category | `minimum_group_products`, `minimum_group_training_lines`, optional `product_metadata` | subcategories are distinct substitute sets that do **not** substitute across each other | equals `category` without subcategories; ERIM category × type tied with `category` (−0.001) because types there also substitute weakly across each other |
+
+The ERIM `affinity` figure is from the availability refit against the category refit on
+the same test trips.
+
 The partition sets which product groups share the exact within-group penalty ρ_c. Co-purchase
 affinity groups put complements together, so substitutes land in different groups and
 **within-category substitution cannot be represented**. On the known-truth synthetic

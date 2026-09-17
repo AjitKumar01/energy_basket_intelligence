@@ -1,6 +1,9 @@
 # Nested substitution groups: learning the partition during training
 
-Status: design, verified on small exact worlds. Not yet implemented in the pipeline.
+Status: design, verified on small exact worlds. **Deferred, 2026-09-17: the flat baseline
+model is frozen.** A nested tree changes the model's energy and every computation that uses
+it, so it would be a separate model variant, not an input option. ERIM evidence for a
+category → type tree is in [ERIM_CATALOGUE_PARTITION_REFIT.md](ERIM_CATALOGUE_PARTITION_REFIT.md).
 Date: 2026-09-17.
 
 ## 0. Summary

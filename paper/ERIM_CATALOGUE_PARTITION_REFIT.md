@@ -103,9 +103,12 @@ granulated sugar is at 2.06, where the whole sugar category was fitted at −0.0
 - **Keep the category partition** as the ERIM standard and API checkpoint.
 - **Keep `catalogue_hierarchy` as a generic option.** It is correct and dataset-agnostic,
   but for ERIM a flat finer partition is not an improvement.
-- **The next modelling step, if pursued, is the two-level nested tree** with declared
-  catalogue levels: a category node and type nodes, all with ρ ≥ 0. The tree comes from the
-  catalogue, so the rare-product coverage problem of the data-built tree does not arise.
+- **Nested tree deferred: the baseline model is frozen (decision of 2026-09-17).**
+  - A two-level tree (category and type nodes) is what the ERIM evidence points to.
+  - It would change the model itself, so it is not pursued now.
+  - Known limitation of the frozen model: it cannot represent "strong substitution within a
+    type and weaker substitution across types in one category" at the same time.
+  - Within the frozen model, the category partition is the best measured choice for ERIM.
 
 ## Reproduce
 

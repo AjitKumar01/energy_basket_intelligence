@@ -1,7 +1,7 @@
 """Do ERIM categories split into product types that substitute across brands?
 
 Follow-up to promotion_check.py. Product types are declared from catalogue labels before
-looking at co-purchase (rules in TYPE_RULES). Pairs within a category fall into four classes
+looking at co-purchase (rules in scripts/version4/erim_catalogue.py). Pairs within a category fall into four classes
 by (same type?, same manufacturer?). Each class's shortfall is compared with the reference
 class "different type, different manufacturer", using the leave-one-trip-out household
 expectation and household bootstrap of promotion_check.py. A negative value means the class
@@ -15,44 +15,21 @@ Run from the repository root:
 from __future__ import annotations
 
 import json
-import re
+import sys
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 
-from promotion_check import MIN_LINES, OUT, ROOT, pair_sums
+from promotion_check import MIN_LINES, OUT, ROOT, pair_sums  # noqa: E402
 
 BOOT = 300
 
 
-def sugar_type(label):
-    if re.search(r"SGR SUB|SWTNR|EQUAL|SWT LW", label):
-        return "substitute"
-    if " PW " in f" {label} ":
-        return "powdered"
-    if "BRN" in label:
-        return "brown"
-    return "granulated" if "SGR" in label else None
+# Declared type rules live in the ERIM adapter layer (scripts/version4/erim_catalogue.py).
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "version4"))
+from erim_catalogue import TYPE_RULES  # noqa: E402
 
-
-def marg_type(label):
-    if re.search(r"SQZ|LIQ", label):
-        return "squeeze"
-    if re.search(r"\b\d?TB\b", label):
-        return "tub"
-    if re.search(r"\b\d?ST\b", label):
-        return "stick"
-    return None
-
-
-TYPE_RULES = {
-    "tuna": lambda s: "oil" if " OIL " in f" {s} " else ("water" if "WTR" in s else None),
-    "pbutter": lambda s: "creamy" if " CRM " in f" {s} " else ("chunky" if " CHK " in f" {s} " else None),
-    "sugar": sugar_type,
-    "marg": marg_type,
-    "tissue": lambda s: "1ply" if " 1P " in f" {s} " else ("2ply" if " 2P " in f" {s} " else None),
-}
 CLASSES = ("same_type_same_manufacturer", "same_type_different_manufacturer",
            "different_type_same_manufacturer")
 

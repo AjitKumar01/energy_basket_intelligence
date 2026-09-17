@@ -129,3 +129,68 @@ def test_category_partition_writes_a_manifest_the_initializer_accepts(tmp_path):
     import hashlib
     assert manifest["partition_sha256"] == hashlib.sha256(
         (tmp_path / "items_affinity.parquet").read_bytes()).hexdigest()
+
+
+def load_prepare_module(name):
+    spec = importlib.util.spec_from_file_location(name, ROOT / "scripts" / "prepare_model_bundle.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def hierarchy_items():
+    # category a: subcategories x (3 products, enough lines), y (3 products, too few lines),
+    # one undeclared product; category b: two products, no declared subcategory
+    return pd.DataFrame({
+        "item_id": list(range(9)),
+        "cat_id": [0] * 7 + [1] * 2,
+        "COMMODITY_DESC": ["a"] * 7 + ["b"] * 2,
+        "SUB_COMMODITY_DESC": ["x", "x", "x", "y", "y", "y", "a", "b", "b"],
+        "n_train_lines": [200, 200, 200, 10, 10, 10, 50, 40, 40],
+    })
+
+
+def test_catalogue_hierarchy_splits_only_qualifying_subcategories():
+    module = load_prepare_module("prepare_bundle_hierarchy")
+    groups, decisions = module.catalogue_hierarchy_groups(hierarchy_items(), 3, 300)
+    # remainder of a (y products + undeclared) = 0, subcategory x = 1, category b = 2
+    assert groups.tolist() == [1, 1, 1, 0, 0, 0, 0, 2, 2]
+    assert decisions["a"]["groups"] == ["(category remainder)", "x"]
+    assert decisions["a"]["declared_subcategories"]["y"]["own_group"] is False
+    assert decisions["b"]["groups"] == ["(category remainder)"]
+
+
+def test_catalogue_hierarchy_without_subcategories_equals_category_partition():
+    module = load_prepare_module("prepare_bundle_hierarchy_noop")
+    items = hierarchy_items().assign(SUB_COMMODITY_DESC=lambda f: f.COMMODITY_DESC)
+    groups, _ = module.catalogue_hierarchy_groups(items, 3, 300)
+    assert groups.tolist() == items.cat_id.tolist()
+
+
+def test_catalogue_hierarchy_floors_are_declared_not_inferred(tmp_path):
+    module = load_prepare_module("prepare_bundle_hierarchy_floors")
+    loose, _ = module.catalogue_hierarchy_groups(hierarchy_items(), 2, 20)
+    assert len(set(loose.tolist())) == 4          # y now qualifies as well
+    config = json.loads((ROOT / "configs" / "datasets" / "erim_availability_catalogue.json").read_text())
+    config["affinity"]["minimum_pair_count"] = 8   # an affinity-partition key
+    path = tmp_path / "config.json"
+    path.write_text(json.dumps(config))
+    with pytest.raises(SystemExit, match="do not apply"):
+        module.load_config(path)
+
+
+def test_product_metadata_adds_declared_columns_and_validates(tmp_path):
+    products = tiny_tables()["products"]
+    path = tmp_path / "meta.parquet"
+    pd.DataFrame({"product_id": ["p0"], "subcategory": ["fine"]}).to_parquet(path)
+    merged, audit = CanonicalBasketModelInputBuilder._apply_product_metadata(products, path)
+    assert merged.subcategory.tolist() == ["fine", "a", "b"]      # others fall back to category
+    assert audit["columns"] == ["subcategory"] and audit["products_covered"] == 1
+    for bad, message in (
+            (pd.DataFrame({"product_id": ["p9"], "subcategory": ["s"]}), "unknown products"),
+            (pd.DataFrame({"product_id": ["p0", "p0"], "subcategory": ["s", "t"]}), "more than once"),
+            (pd.DataFrame({"product_id": ["p0"], "category": ["z"]}), "subset"),
+            (pd.DataFrame({"product_id": ["p0"], "brand": ["B"]}), "cover every product")):
+        bad.to_parquet(path)
+        with pytest.raises(ValueError, match=message):
+            CanonicalBasketModelInputBuilder._apply_product_metadata(products, path)

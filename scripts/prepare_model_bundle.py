@@ -13,8 +13,10 @@ ragged index and data fingerprint. Everything dataset-specific lives in the JSON
       "promotion_feature": "disabled | advertised | special_price",
       "model_price_sources": ["retail_aggregate"],
       "availability": {"rule": "disabled | retail_first_sale", "left_censor_periods": 13},
-      "affinity": {"partition": "affinity | category",
-                   "minimum_pair_count": 8, "maximum_group_size": 128},
+      "affinity": {"partition": "affinity | category | catalogue_hierarchy",
+                   "minimum_pair_count": 8, "maximum_group_size": 128,
+                   "minimum_group_products": 3, "minimum_group_training_lines": 300},
+      "product_metadata": "optional parquet: product_id + subcategory/brand/manufacturer/department",
       "metadata_defaults": {"MANUFACTURER": "UNKNOWN", "DEPARTMENT": "UNKNOWN"},
       "promotion_coverage_note": "..."
     }
@@ -41,8 +43,14 @@ from canonical_basket_input import CanonicalBasketModelInputBuilder  # noqa: E40
 CONFIG_KEYS = {
     "schema_version", "dataset_name", "canonical_dir", "model_data_root", "price_basis",
     "promotion_feature", "model_price_sources", "availability", "affinity",
-    "metadata_defaults", "promotion_coverage_note", "description",
+    "metadata_defaults", "promotion_coverage_note", "description", "product_metadata",
 }
+AFFINITY_KEYS = {
+    "affinity": {"partition", "minimum_pair_count", "maximum_group_size"},
+    "category": {"partition"},
+    "catalogue_hierarchy": {"partition", "minimum_group_products", "minimum_group_training_lines"},
+}
+HIERARCHY_DEFAULTS = {"minimum_group_products": 3, "minimum_group_training_lines": 300}
 
 
 def resolve(value: str) -> Path:
@@ -60,6 +68,13 @@ def load_config(path: Path) -> dict:
     for key in ("dataset_name", "canonical_dir", "model_data_root", "price_basis"):
         if not config.get(key):
             raise SystemExit(f"dataset config requires {key}")
+    affinity = config.get("affinity", {})
+    partition = affinity.get("partition", "affinity")
+    if partition not in AFFINITY_KEYS:
+        raise SystemExit(f"affinity.partition must be one of {sorted(AFFINITY_KEYS)}")
+    unknown_affinity = set(affinity).difference(AFFINITY_KEYS[partition])
+    if unknown_affinity:
+        raise SystemExit(f"affinity keys {sorted(unknown_affinity)} do not apply to partition {partition!r}")
     return config
 
 
@@ -89,6 +104,75 @@ def write_category_partition(basket_input: Path) -> None:
           flush=True)
 
 
+def catalogue_hierarchy_groups(items, minimum_products: int, minimum_training_lines: int):
+    """Finest declared catalogue level that meets fixed evidence floors (model-free).
+
+    Within each category, every declared subcategory with at least ``minimum_products``
+    products and ``minimum_training_lines`` training purchase lines becomes its own group.
+    Products without a declared subcategory (subcategory equal to the category) and those in
+    subcategories below either floor stay together in one category remainder group. A
+    category without any qualifying subcategory therefore keeps exactly its category group.
+    Groups are numbered by (category, subcategory label), with the remainder first.
+    """
+    import numpy as np
+    items = items.sort_values("item_id").reset_index(drop=True)
+    category = items.COMMODITY_DESC.astype(str)
+    sub = items.SUB_COMMODITY_DESC.astype(str)
+    declared = sub != category
+    key = category + "\x1f" + sub
+    stats = items[declared].groupby(key[declared]).agg(
+        products=("item_id", "size"), training_lines=("n_train_lines", "sum"))
+    qualifying = set(stats[(stats.products >= minimum_products)
+                           & (stats.training_lines >= minimum_training_lines)].index)
+    own = key.isin(qualifying)
+    group_label = np.where(own, key, category + "\x1f")      # "" subcategory = remainder
+    order = sorted(set(group_label), key=lambda g: (items.cat_id[group_label == g].iloc[0],
+                                                     g.split("\x1f", 1)[1]))
+    group_id = pd_map(group_label, {g: i for i, g in enumerate(order)})
+    decisions = {}
+    for cat in sorted(category.unique()):
+        cat_stats = stats[stats.index.str.startswith(cat + "\x1f")]
+        decisions[cat] = {
+            "groups": [g.split("\x1f", 1)[1] or "(category remainder)"
+                       for g in order if g.startswith(cat + "\x1f")],
+            "declared_subcategories": {
+                name.split("\x1f", 1)[1]: {"products": int(row.products),
+                                            "training_lines": int(row.training_lines),
+                                            "own_group": name in qualifying}
+                for name, row in cat_stats.iterrows()},
+        }
+    return group_id, decisions
+
+
+def pd_map(values, mapping):
+    import numpy as np
+    return np.array([mapping[v] for v in values], dtype=np.int32)
+
+
+def write_catalogue_hierarchy_partition(basket_input: Path, settings: dict) -> None:
+    import numpy as np
+    import pandas as pd
+    floors = {**HIERARCHY_DEFAULTS, **{k: v for k, v in settings.items() if k in HIERARCHY_DEFAULTS}}
+    items = pd.read_parquet(basket_input / "items.parquet").sort_values("item_id")
+    group_id, decisions = catalogue_hierarchy_groups(
+        items, int(floors["minimum_group_products"]), int(floors["minimum_group_training_lines"]))
+    output = basket_input / "items_affinity.parquet"
+    pd.DataFrame({"item_id": items.item_id.to_numpy(), "cat_id": group_id}).to_parquet(output, index=False)
+    sizes = np.bincount(group_id)
+    manifest = {
+        "schema_version": 1, "training_only": True, "partition": "catalogue_hierarchy",
+        "rule": "finest declared catalogue level meeting fixed floors; others pooled per category",
+        "floors": {k: int(v) for k, v in floors.items()},
+        "n_items": int(len(items)), "n_groups": int(len(sizes)),
+        "maximum_group_size_observed": int(sizes.max()),
+        "categories": decisions,
+        "partition_sha256": hashlib.sha256(output.read_bytes()).hexdigest(),
+    }
+    (basket_input / "affinity_manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
+    print(f"[prepare] catalogue-hierarchy partition: {len(sizes)} groups, largest {int(sizes.max())}",
+          flush=True)
+
+
 def run(command: list[str], root: Path) -> None:
     env = {**os.environ, "ENERGY_MODEL_DATA_ROOT": str(root), "V3_AFFINITY": "1"}
     print("[prepare] " + " ".join(map(str, command)), flush=True)
@@ -109,6 +193,7 @@ def main() -> None:
         raise SystemExit(f"{root} already holds a bundle; pass --force to rebuild it")
     availability = config.get("availability", {"rule": "disabled"})
     affinity = config.get("affinity", {})
+    partition = affinity.get("partition", "affinity")
     builder = CanonicalBasketModelInputBuilder(
         canonical, root, price_basis=config["price_basis"],
         promotion_feature_name=config.get("promotion_feature", "disabled"),
@@ -118,11 +203,11 @@ def main() -> None:
         dataset_name=config["dataset_name"],
         metadata_defaults=config.get("metadata_defaults"),
         promotion_coverage_note=config.get(
-            "promotion_coverage_note", "declared by the canonical adapter"))
+            "promotion_coverage_note", "declared by the canonical adapter"),
+        product_metadata=(resolve(config["product_metadata"]) if config.get("product_metadata") else None))
     result = builder.build()
     print(f"[prepare] canonical contract passed: {json.dumps(builder.contract_summary)}",
           flush=True)
-    partition = affinity.get("partition", "affinity")
     if partition == "affinity":
         run([sys.executable, "-u", V4 / "build_affinity_partition.py",
              "--minimum-pair-count", int(affinity.get("minimum_pair_count", 8)),
@@ -131,7 +216,7 @@ def main() -> None:
     elif partition == "category":
         write_category_partition(root / "basket_input")
     else:
-        raise SystemExit("affinity.partition must be 'affinity' or 'category'")
+        write_catalogue_hierarchy_partition(root / "basket_input", affinity)
     run([sys.executable, "-u", V4 / "data.py", "--force"], root)
     run([sys.executable, "-u", V4 / "provenance.py"], root)
     fingerprint = json.loads((root / "basket_input" / "model_data_fingerprint.json").read_text())

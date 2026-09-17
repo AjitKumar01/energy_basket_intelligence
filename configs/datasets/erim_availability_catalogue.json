@@ -1,0 +1,27 @@
+{
+  "schema_version": 1,
+  "dataset_name": "erim_multi_category_catalogue_hierarchy_partition",
+  "description": "ERIM eight-category tracked baskets, retail-only chain prices, store availability, catalogue-hierarchy partition (category x adapter-declared product type)",
+  "canonical_dir": "data/erim_basket/canonical",
+  "model_data_root": "data/erim_basket/model_input_availability_catalogue",
+  "product_metadata": "data/erim_basket/catalogue/product_types.parquet",
+  "price_basis": "erim_chain_week_retail_aggregate_unit_price_carried_forward_constant_training_reference_without_retail_price",
+  "promotion_feature": "disabled",
+  "model_price_sources": [
+    "retail_aggregate"
+  ],
+  "availability": {
+    "rule": "retail_first_sale",
+    "left_censor_periods": 13
+  },
+  "affinity": {
+    "partition": "catalogue_hierarchy",
+    "minimum_group_products": 3,
+    "minimum_group_training_lines": 300
+  },
+  "metadata_defaults": {
+    "MANUFACTURER": "ERIM_UNKNOWN",
+    "DEPARTMENT": "ERIM_TRACKED_CATEGORIES"
+  },
+  "promotion_coverage_note": "partial: frozen dinner has no retail aggregate file"
+}

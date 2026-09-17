@@ -45,7 +45,8 @@ class CanonicalBasketModelInputBuilder:
                  availability_left_censor_periods: int = 13,
                  dataset_name: str = "canonical_external_basket",
                  metadata_defaults: dict[str, str] | None = None,
-                 promotion_coverage_note: str = "declared by the canonical adapter"):
+                 promotion_coverage_note: str = "declared by the canonical adapter",
+                 product_metadata: Path | None = None):
         self.canonical_directory = canonical_directory.resolve()
         self.output_root = output_root.resolve()
         self.price_basis = str(price_basis)
@@ -72,6 +73,7 @@ class CanonicalBasketModelInputBuilder:
             raise ValueError(f"unknown metadata defaults: {sorted(unknown)}")
         self.metadata_defaults = {**DEFAULT_METADATA, **(metadata_defaults or {})}
         self.promotion_coverage_note = str(promotion_coverage_note)
+        self.product_metadata = None if product_metadata is None else Path(product_metadata).resolve()
 
     def build(self) -> ModelInputBuildResult:
         canonical = self.canonical_directory
@@ -87,6 +89,9 @@ class CanonicalBasketModelInputBuilder:
             raise FileNotFoundError("canonical basket bundle is incomplete: " + ", ".join(missing))
         tx = pd.read_parquet(required["transactions"])
         products = pd.read_parquet(required["products"]).sort_values("item_id")
+        metadata_audit = None
+        if self.product_metadata is not None:
+            products, metadata_audit = self._apply_product_metadata(products, self.product_metadata)
         prices = pd.read_parquet(required["store_week_prices"])
         promotions = pd.read_parquet(required["promotions"])
         source_audit = json.loads(required["build_audit"].read_text())
@@ -133,6 +138,7 @@ class CanonicalBasketModelInputBuilder:
             "schema_version": 1,
             "dataset": "canonical_external_basket",
             "dataset_name": self.dataset_name,
+            **({"product_metadata": metadata_audit} if metadata_audit is not None else {}),
             "n_users": n_users,
             "n_items": n_items,
             "n_subs": int(items.sub_id.max()) + 1,
@@ -230,6 +236,51 @@ class CanonicalBasketModelInputBuilder:
             values = np.sort(tx[column].unique())
             if not np.array_equal(values, np.arange(len(values))):
                 raise ValueError(f"{column} values must be contiguous")
+
+    METADATA_COLUMNS = ("subcategory", "brand", "manufacturer", "department")
+
+    @classmethod
+    def _apply_product_metadata(cls, products: pd.DataFrame, path: Path):
+        """Add declared catalogue columns from a separate file keyed by product_id.
+
+        Catalogue attributes often come from a source other than the transaction adapter.
+        The file supplies optional product columns of the canonical contract; it may not
+        change identifiers or categories, and it must cover every product it names exactly
+        once. Products it omits keep their canonical values (or the contract defaults).
+        """
+        import hashlib
+        if not path.is_file():
+            raise FileNotFoundError(f"product metadata file is missing: {path}")
+        extra = pd.read_parquet(path)
+        if "product_id" not in extra:
+            raise ValueError("product metadata requires a product_id column")
+        columns = [c for c in extra.columns if c != "product_id"]
+        unknown = set(columns).difference(cls.METADATA_COLUMNS)
+        if not columns or unknown:
+            raise ValueError(f"product metadata columns must be a nonempty subset of "
+                             f"{cls.METADATA_COLUMNS}; got {sorted(columns)}")
+        if extra.product_id.duplicated().any():
+            raise ValueError("product metadata lists a product_id more than once")
+        missing = set(extra.product_id).difference(products.product_id)
+        if missing:
+            raise ValueError(f"product metadata names {len(missing)} unknown products")
+        if extra[columns].isna().any().any():
+            raise ValueError("product metadata values must be non-null")
+        products = products.copy()
+        lookup = extra.set_index("product_id")
+        for column in columns:
+            fallback = (products[column].astype(str) if column in products
+                        else products.category.astype(str) if column == "subcategory" else None)
+            mapped = products.product_id.map(lookup[column].astype(str))
+            if fallback is None:
+                if mapped.isna().any():
+                    raise ValueError(f"product metadata must cover every product for {column}")
+                products[column] = mapped
+            else:
+                products[column] = mapped.fillna(fallback)
+        audit = {"path": str(path), "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+                 "columns": columns, "products_covered": int(len(extra))}
+        return products, audit
 
     @staticmethod
     def _items(products: pd.DataFrame, tx: pd.DataFrame,

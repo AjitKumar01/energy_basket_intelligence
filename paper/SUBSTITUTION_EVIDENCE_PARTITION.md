@@ -2,6 +2,9 @@
 
 Date: 2026-09-17
 
+Status: implemented, verified and scaled. **Model refits are parked**; see
+[PARTITION_OPTIONS_AND_PARKED_WORK.md](PARTITION_OPTIONS_AND_PARKED_WORK.md) (P1, P2).
+
 ## 1. Purpose
 
 Build product groups once, from training baskets only, so that each group holds products
@@ -247,4 +250,5 @@ The criteria were written after a smoke build had shown the synthetic partition:
   concentrated in popular products.
 
 The ERIM model refits with both leftover rules were stopped before completion, so that
-the scalability fixes could come first. They have not been rerun.
+the scalability fixes could come first. They are parked; see
+[PARTITION_OPTIONS_AND_PARKED_WORK.md](PARTITION_OPTIONS_AND_PARKED_WORK.md).

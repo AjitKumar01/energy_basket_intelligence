@@ -109,11 +109,13 @@ overwrite `basket_input/items_affinity.parquet`, which existing checkpoints depe
 
 **Run:** `artifacts/nested_rho_decision/run_all.sh` (about 4–5 hours).
 
-### Known stale artifact
+### Resolved
 
-The category × type bundle `data/erim_basket/model_input_availability_catalogue`:
-- it was built before the product-metadata identity fix, so its `meta.json` still records an
-  absolute path;
-- rebuilding it changes its fingerprint, which detaches the completed
-  `artifacts/erim_catalogue_refit` run;
-- rebuild it only together with a rerun of that refit.
+The category × type bundle was rebuilt on 2026-09-18 after the product-metadata identity
+fix, and its refit was rerun (`artifacts/erim_catalogue_refit`, fingerprint `3bf89a5a…`).
+Per-trip likelihoods are bit-identical to the first run and every comparison output matches,
+so no bundle now records an absolute path. Rerun with:
+
+```bash
+scripts/run_erim_partition_refit.sh catalogue 4
+```

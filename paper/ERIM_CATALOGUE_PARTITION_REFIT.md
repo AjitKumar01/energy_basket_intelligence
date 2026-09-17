@@ -12,7 +12,7 @@ partition?
 ## Setup
 
 - **Bundle.** `configs/datasets/erim_availability_catalogue.json` builds
-  `data/erim_basket/model_input_availability_catalogue` (fingerprint `71aeaab7…`).
+  `data/erim_basket/model_input_availability_catalogue` (fingerprint `3bf89a5a…`).
   - **Partition.** `catalogue_hierarchy`, with floors of 3 products and 300 training lines.
   - **Types.** Taken from `data/erim_basket/catalogue/product_types.parquet`, which ERIM's
     adapter derives from product labels.
@@ -30,6 +30,11 @@ partition?
 - **Refit and comparison.** The same four stages as the category refit
   (`artifacts/erim_catalogue_refit/`). All stages exited 0 and all gates passed. The run is
   paired against `artifacts/erim_category_refit/full` on the same trips.
+- **Rerun on 2026-09-18.** The bundle and refit were rebuilt after the product-metadata
+  identity fix (the bundle now records that file by name and hash, not by absolute path, so
+  its identity no longer depends on the repository location). Per-trip likelihoods are
+  bit-identical to the first run, and every comparison output matches; only timings and
+  identity hashes differ.
 
 ## Results
 

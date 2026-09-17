@@ -1,6 +1,6 @@
 # Product partition options and parked partition work
 
-Date: 2026-09-17
+Date: 2026-09-17 (updated 2026-09-18)
 
 The energy basket model is **frozen**. It uses one within-group penalty ρ_c per product
 group, and the partition only decides which products share a penalty. Every option below
@@ -44,7 +44,23 @@ Details:
 | Sign constraint ρ_c ≥ 0 for substitute groups | changes the model's parameter constraints | [SUBSTITUTION_EVIDENCE_PARTITION.md](SUBSTITUTION_EVIDENCE_PARTITION.md) §1 |
 | Groups learned during training | makes the partition depend on the fitted model (circular) | nested design §7 |
 
-## 2. Parked work
+## 2. Where things stand (2026-09-18)
+
+- **Nothing is running.** All partition experiments are parked.
+- **ERIM standard:** the `category` partition
+  (`configs/datasets/erim_availability_category.json`, bundle
+  `data/erim_basket/model_input_availability_category`, run `artifacts/erim_category_refit`).
+- **Retail API:** serves that category checkpoint, with its completion audit at the
+  certified levels 11-13.
+- **Model:** frozen; see [[baseline frozen]](NESTED_SUBSTITUTION_GROUPS.md) and §1 above for
+  what that rules out.
+- **Finished comparisons:** `affinity` vs `category` (category wins) and `category` vs
+  category x type (tie). Both are written up.
+- **Fully implemented but never fitted:** `finest_catalogue_level` and
+  `substitution_evidence` (P1, P2 below).
+- **Tests:** 242 passing at commit ce20159.
+
+## 3. Parked work
 
 ### P1. ERIM refits with `substitution_evidence` (parked 2026-09-17)
 

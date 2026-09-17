@@ -27,11 +27,19 @@ def main() -> None:
         choices=CanonicalBasketModelInputBuilder.PRICE_SOURCES,
         help=("canonical price sources that may price model features; purchase aggregates "
               "exist only when a panel household bought the product"))
+    parser.add_argument(
+        "--availability", default="disabled",
+        choices=CanonicalBasketModelInputBuilder.AVAILABILITY_RULES,
+        help=("retail_first_sale confirms a product at a store from its first retail sale "
+              "by non-cohort shoppers; disabled keeps the declared catalogue support"))
+    parser.add_argument("--availability-left-censor-periods", type=int, default=13)
     args = parser.parse_args()
     result = CanonicalBasketModelInputBuilder(
         args.canonical_dir, args.output_root, price_basis=args.price_basis,
         promotion_feature_name=args.promotion_feature,
-        model_price_sources=tuple(args.model_price_sources)).build()
+        model_price_sources=tuple(args.model_price_sources),
+        availability=args.availability,
+        availability_left_censor_periods=args.availability_left_censor_periods).build()
     report = result.root / "model_input_build.json"
     report.write_text(json.dumps(result.manifest, indent=2, sort_keys=True) + "\n")
     print(json.dumps({

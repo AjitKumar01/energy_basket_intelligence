@@ -1032,6 +1032,10 @@ class RaggedModel(torch.nn.Module):
         b = b + (self.zeta[it] * self.xi_c()[c["store"]]).sum(-1)
         if "rec" in c:
             b = b + (self.psi[it] * c["rec"]).sum(-1)
+        if "log_avail" in c:
+            # Fixed data, not a parameter: log a_jst scales the product's weight in both the
+            # normaliser and the energy, so an unconfirmed product keeps epsilon of its mass.
+            b = b + c["log_avail"]
         return b
 
     # ---- GAUGE FIXING on the three bilinear terms -------------------------------------

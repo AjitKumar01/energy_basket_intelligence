@@ -13,6 +13,9 @@ unset), so Dunnhumby and canonical external bundles share one implementation.
     seasonality  mu_j' delta_w
     store        zeta_j' xi_s
     recency      optional strictly-before purchase-history features from state.npz
+    availability optional log-availability offset from availability.npz: 0 once a product
+                 is confirmed at a store, log(epsilon) before that (see
+                 CanonicalBasketModelInputBuilder._write_availability)
 
 Sparse keys pack (product, store, week) as (item * n_store + store) * 128 + week, and
 recency keys pack (household-group, day) as group * 1024 + day, so a bundle must satisfy
@@ -114,6 +117,29 @@ class Features:
             raise RuntimeError(f"promotion coverage {self.promo_week_min}-"
                                f"{self.promo_week_max} does not match basket window "
                                f"{required}")
+        contract = meta.get("availability_contract") or {"enabled": False}
+        self.availability_enabled = bool(contract.get("enabled", False))
+        if self.availability_enabled:
+            with np.load(os.path.join(BI, "availability.npz")) as panel:
+                first = panel["first_period"].astype(np.int64)
+                self.log_avail_floor = float(panel["log_floor"])
+            if first.shape != (n_item, n_store):
+                raise RuntimeError(f"availability panel shape {first.shape} does not match "
+                                   f"({n_item}, {n_store})")
+            if abs(self.log_avail_floor - float(contract.get("log_floor", self.log_avail_floor))) > 1e-9:
+                raise RuntimeError("availability floor differs from meta.json")
+            if self.log_avail_floor > 0:
+                raise RuntimeError("availability floor must be at most one")
+            self.avail_first = torch.from_numpy(first)
+            log(f"availability: rule {contract.get('rule')}, "
+                f"floor {math.exp(self.log_avail_floor):.4g}, "
+                f"{int((first > 0).sum()):,} of {first.size:,} product-store pairs "
+                "not available from the first period")
+        else:
+            self.avail_first = None
+            self.log_avail_floor = 0.0
+            log("availability: declared catalogue support (no availability panel)")
+
         o = np.argsort(pr["keys"])
         self.pk = torch.from_numpy(pr["keys"][o])
         self.pd_ = torch.from_numpy(pr["disp"][o].astype(np.float32))
@@ -164,6 +190,14 @@ class Features:
         i = i.clamp(max=len(keys) - 1)
         hit = keys[i] == q
         return torch.where(hit, vals[i], torch.zeros((), dtype=vals.dtype))
+
+    def log_availability(self, item, store, week):
+        """log a_jst: 0 where the product is confirmed at the store, log(epsilon) before."""
+        if not self.availability_enabled:
+            return torch.zeros(item.shape, dtype=torch.float64)
+        confirmed = week >= self.avail_first[item, store]
+        return torch.where(confirmed, torch.zeros((), dtype=torch.float64),
+                           torch.full((), self.log_avail_floor, dtype=torch.float64))
 
     def gather(self, item, store, day, week):
         """Features at every assortment slot.  item/store/day/week are [T] longs."""

@@ -192,3 +192,22 @@ def test_failed_price_evidence_verdict_fits_zero_price_instead_of_aborting(tmp_p
         report.write_text(json.dumps({"passed": passed}))
         with pytest.raises(SystemExit):
             pipeline.price_configuration_from_evidence(status, report, coefficients)
+
+
+def test_pipeline_reports_declared_support_without_availability_contract(tmp_path, monkeypatch, capsys):
+    import importlib.util
+    from pathlib import Path
+    root = Path(__file__).resolve().parents[1]
+    spec = importlib.util.spec_from_file_location("pipeline_for_availability", root / "scripts/run_pipeline.py")
+    pipeline = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(pipeline)
+    (tmp_path / "basket_input").mkdir()
+    (tmp_path / "basket_input" / "meta.json").write_text('{"price_basis": "x"}')
+    monkeypatch.setenv("ENERGY_MODEL_DATA_ROOT", str(tmp_path))
+    assert pipeline.report_availability_contract() == {"enabled": False}
+    assert "declared catalogue" in capsys.readouterr().out
+    (tmp_path / "basket_input" / "meta.json").write_text(
+        '{"availability_contract": {"enabled": true, "rule": "retail_first_sale", "floor": 0.003,'
+        ' "unconfirmed_lines_by_split": {"train": 5}}}')
+    assert pipeline.report_availability_contract()["rule"] == "retail_first_sale"
+    assert "retail_first_sale" in capsys.readouterr().out

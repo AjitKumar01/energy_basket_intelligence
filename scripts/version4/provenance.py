@@ -11,7 +11,8 @@ from typing import Any, Mapping
 
 
 FINGERPRINT_SCHEMA = 1
-OPTIONAL_FINGERPRINT_FILES = frozenset({"observed_promotion_panel", "price_evidence_panel"})
+OPTIONAL_FINGERPRINT_FILES = frozenset({
+    "observed_promotion_panel", "price_evidence_panel", "availability_panel"})
 
 
 def model_data_root(default: str | Path) -> Path:
@@ -82,6 +83,7 @@ def build_data_fingerprint(root: str | Path, *, write: bool = True,
     optional_paths = {
         "observed_promotion_panel": basket / "promo_observed.npz",
         "price_evidence_panel": data / "price_week.parquet",
+        "availability_panel": basket / "availability.npz",
     }
     if optional_names is None:
         paths.update({name: path for name, path in optional_paths.items()

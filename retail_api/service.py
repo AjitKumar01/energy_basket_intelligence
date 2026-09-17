@@ -258,6 +258,8 @@ class RetailModelService:
             "week": (week - 1) % 52,
             "store": store,
         }
+        if self.features.availability_enabled:
+            ctx["log_avail"] = self.features.log_availability(ix.item, store, week)
         house = torch.as_tensor([context.household_index], dtype=torch.long)
         return ix, ctx, house
 

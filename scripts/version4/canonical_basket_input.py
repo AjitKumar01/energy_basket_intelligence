@@ -31,10 +31,14 @@ class CanonicalBasketModelInputBuilder:
     """Dataset-neutral bridge; all source-specific work happens before this class."""
 
     PRICE_SOURCES = ("retail_aggregate", "purchase_aggregate")
+    AVAILABILITY_RULES = ("disabled", "retail_first_sale")
+    AVAILABILITY_FLOOR_BOUNDS = (1e-4, 1.0)
 
     def __init__(self, canonical_directory: Path, output_root: Path,
                  *, price_basis: str, promotion_feature_name: str = "advertised",
-                 model_price_sources: tuple[str, ...] = ("retail_aggregate",)):
+                 model_price_sources: tuple[str, ...] = ("retail_aggregate",),
+                 availability: str = "disabled",
+                 availability_left_censor_periods: int = 13):
         self.canonical_directory = canonical_directory.resolve()
         self.output_root = output_root.resolve()
         self.price_basis = str(price_basis)
@@ -49,6 +53,12 @@ class CanonicalBasketModelInputBuilder:
         if promotion_feature_name not in {"advertised", "special_price", "disabled"}:
             raise ValueError(
                 "promotion feature must be advertised, special_price, or disabled")
+        if availability not in self.AVAILABILITY_RULES:
+            raise ValueError(f"availability must be one of {self.AVAILABILITY_RULES}")
+        if availability_left_censor_periods < 0:
+            raise ValueError("availability left-censor window must be nonnegative")
+        self.availability = availability
+        self.availability_left_censor_periods = int(availability_left_censor_periods)
 
     def build(self) -> ModelInputBuildResult:
         canonical = self.canonical_directory
@@ -96,6 +106,8 @@ class CanonicalBasketModelInputBuilder:
             promotions, items, n_stores, n_periods, basket_input)
         state_audit = self._write_state(
             baskets, items, n_users, n_days, basket_input)
+        availability_audit = self._write_availability(
+            prices, baskets, items, n_stores, n_periods, train_period_max, basket_input)
 
         val_from = int(baskets.loc[baskets.split == "validation", "WEEK_NO"].min())
         test_from = int(baskets.loc[baskets.split == "test", "WEEK_NO"].min())
@@ -127,6 +139,7 @@ class CanonicalBasketModelInputBuilder:
             "price_obs_share": price_audit["observed_item_period_fraction"],
             "median_repurchase_gap_days": state_audit["median_gap_days"],
             "promotion_contract": promotion_audit,
+            "availability_contract": availability_audit,
             "canonical_build_audit_sha256": sha256(required["build_audit"]),
         }
         meta_path = basket_input / "meta.json"
@@ -151,6 +164,8 @@ class CanonicalBasketModelInputBuilder:
                 "log_price_dev.npy", "store_price.npz", "promo.npz",
                 "promo_observed.npz", "state.npz", "meta.json")
         }
+        if availability_audit["enabled"]:
+            derived_paths["availability.npz"] = basket_input / "availability.npz"
         derived_paths["data/price_week.parquet"] = (
             data_directory / "price_week.parquet")
         derived = {name: sha256(path) for name, path in derived_paths.items()}
@@ -183,7 +198,8 @@ class CanonicalBasketModelInputBuilder:
         return ModelInputBuildResult(
             self.output_root, basket_input, data_directory,
             {"meta": meta, "preprocessing": preprocessing,
-             "price": price_audit, "promotion": promotion_audit, "state": state_audit})
+             "price": price_audit, "promotion": promotion_audit, "state": state_audit,
+             "availability": availability_audit})
 
     @staticmethod
     def _validate_ids(tx: pd.DataFrame, products: pd.DataFrame) -> None:
@@ -407,6 +423,113 @@ class CanonicalBasketModelInputBuilder:
                 "all promotion features set to zero"
                 if self.promotion_feature_name == "disabled"
                 else "partial source panel used as modeled features"),
+        }
+
+    def _write_availability(self, prices: pd.DataFrame, baskets: pd.DataFrame,
+                            items: pd.DataFrame, n_stores: int, n_periods: int,
+                            train_period_max: int, output: Path) -> dict[str, Any]:
+        """Write when each product became purchasable at each store.
+
+        Transaction logs record purchases, not stock, so availability comes from an
+        independent store sales feed: a product is confirmed at a store from the first
+        period in which that store's retail aggregate records a sale by shoppers other than
+        the modeled cohort.  Subtracting the cohort's own units prevents a modeled purchase
+        from confirming its own availability.  A first sale within the store's first
+        ``availability_left_censor_periods`` feed periods is treated as available from the
+        start, because a slow seller need not sell in the opening weeks of the feed.
+
+        A missing sale is not proof of absence, so an unconfirmed product is not removed.
+        Its utility is shifted by log(epsilon), where epsilon is the training-period purchase
+        rate of unconfirmed (product, store, period) cells relative to confirmed cells.
+        Products or stores without any retail feed are treated as always available, which
+        is the declared-catalogue support used when no feed exists.
+
+        ``first_period[item, store]`` holds the first available period (0 means always
+        available; ``n_periods + 1`` means never confirmed in the window).
+        """
+        if self.availability == "disabled":
+            return {"enabled": False, "rule": "disabled",
+                    "reason": "no store availability feed requested; declared catalogue support"}
+        item_map = items.set_index("product_id").item_id
+        retail = prices[
+            prices.price_source.eq("retail_aggregate")
+            & prices.product_id.isin(item_map.index)
+            & prices.store_id.between(0, n_stores - 1)].copy()
+        n_items = len(items)
+        first_period = np.zeros((n_items, n_stores), dtype=np.int16)
+        never = n_periods + 1
+        if retail.empty:
+            np.savez_compressed(output / "availability.npz", first_period=first_period,
+                                log_floor=np.float64(0.0), n_periods=np.int16(n_periods))
+            return {"enabled": True, "rule": self.availability, "tracked_items": 0,
+                    "tracked_stores": 0, "floor": 1.0, "log_floor": 0.0,
+                    "note": "no retail aggregate rows; every product is always available"}
+        retail["item_id"] = retail.product_id.map(item_map).astype(np.int64)
+        retail_units = retail.groupby(["item_id", "store_id", "period"]).units.sum()
+        cohort_units = baskets.groupby(["item_id", "store_id", "WEEK_NO"]).units.sum()
+        cohort_units.index = cohort_units.index.set_names(["item_id", "store_id", "period"])
+        net = retail_units - cohort_units.reindex(retail_units.index).fillna(0.0)
+        sold = net[net > 0].reset_index()
+        store_start = retail.groupby("store_id").period.min()
+        tracked_items = np.sort(retail.item_id.unique())
+        tracked_stores = np.sort(store_start.index.to_numpy())
+        first_period[np.ix_(tracked_items, tracked_stores)] = never
+        first_sale = sold.groupby(["item_id", "store_id"]).period.min().reset_index()
+        censored = first_sale.period <= (
+            first_sale.store_id.map(store_start) + self.availability_left_censor_periods)
+        launch = np.where(censored, 0, first_sale.period).astype(np.int16)
+        first_period[first_sale.item_id.to_numpy(), first_sale.store_id.to_numpy()] = launch
+
+        lines = baskets[["item_id", "store_id", "WEEK_NO", "split"]]
+        confirmed = lines.WEEK_NO.to_numpy() >= first_period[
+            lines.item_id.to_numpy(), lines.store_id.to_numpy()]
+        unconfirmed_by_split = lines[~confirmed].split.value_counts().to_dict()
+
+        # epsilon: purchase rate per exposure in unconfirmed vs confirmed training cells.
+        training = baskets[baskets.split.eq("train")]
+        trips = training.groupby(["store_id", "WEEK_NO"]).BASKET_ID.nunique()
+        sorted_first = np.sort(first_period, axis=0)
+        exposure_unconfirmed = exposure_confirmed = 0.0
+        for (store, period), count in trips.items():
+            unconfirmed = n_items - int(np.searchsorted(
+                sorted_first[:, store], period, side="right"))
+            exposure_unconfirmed += float(count) * unconfirmed
+            exposure_confirmed += float(count) * (n_items - unconfirmed)
+        train_confirmed = training.WEEK_NO.to_numpy() >= first_period[
+            training.item_id.to_numpy(), training.store_id.to_numpy()]
+        lines_confirmed = int(train_confirmed.sum())
+        lines_unconfirmed = int((~train_confirmed).sum())
+        if exposure_unconfirmed > 0:
+            epsilon = (((lines_unconfirmed + 0.5) / (exposure_unconfirmed + 1.0))
+                       / ((lines_confirmed + 0.5) / (exposure_confirmed + 1.0)))
+        else:
+            epsilon = 1.0
+        floor = float(np.clip(epsilon, *self.AVAILABILITY_FLOOR_BOUNDS))
+        np.savez_compressed(output / "availability.npz", first_period=first_period,
+                            log_floor=np.float64(np.log(floor)),
+                            n_periods=np.int16(n_periods))
+        launched_after_training = int((
+            (first_period > train_period_max) & (first_period <= n_periods)).sum())
+        return {
+            "enabled": True,
+            "rule": self.availability,
+            "source": "retail_aggregate store-period units net of the modeled cohort's units",
+            "left_censor_periods": self.availability_left_censor_periods,
+            "tracked_items": int(len(tracked_items)),
+            "tracked_stores": int(len(tracked_stores)),
+            "untracked_items_always_available": int(n_items - len(tracked_items)),
+            "confirmed_item_store_pairs": int((first_period[np.ix_(
+                tracked_items, tracked_stores)] <= n_periods).sum()),
+            "never_confirmed_item_store_pairs": int((first_period == never).sum()),
+            "pairs_launched_after_training": launched_after_training,
+            "estimated_epsilon": float(epsilon),
+            "floor": floor,
+            "log_floor": float(np.log(floor)),
+            "training_lines_confirmed": lines_confirmed,
+            "training_lines_unconfirmed": lines_unconfirmed,
+            "training_exposure_unconfirmed_share": float(
+                exposure_unconfirmed / max(exposure_unconfirmed + exposure_confirmed, 1.0)),
+            "unconfirmed_lines_by_split": {str(k): int(v) for k, v in unconfirmed_by_split.items()},
         }
 
     @staticmethod

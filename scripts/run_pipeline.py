@@ -69,6 +69,21 @@ def verify_data_bundle(*, dry_run: bool) -> None:
         require_fingerprint(recorded, model_data_root())
 
 
+def report_availability_contract() -> dict:
+    """Log the bundle's store availability contract (declared catalogue when absent)."""
+    meta_path = model_data_root() / "basket_input" / "meta.json"
+    contract = {"enabled": False}
+    if meta_path.is_file():
+        contract = json.loads(meta_path.read_text()).get("availability_contract") or contract
+    if contract.get("enabled"):
+        print(f"[pipeline] availability: rule={contract.get('rule')}, "
+              f"floor={contract.get('floor'):.4g}, unconfirmed purchase lines "
+              f"{contract.get('unconfirmed_lines_by_split')}", flush=True)
+    else:
+        print("[pipeline] availability: declared catalogue support at every store", flush=True)
+    return contract
+
+
 def price_configuration_from_evidence(status: int, report_path: Path,
                                       coefficients_path: Path) -> tuple:
     """Map the price-evidence stage's exit status and verdict to additive-fit flags."""
@@ -638,6 +653,7 @@ def main() -> None:
             # the Dunnhumby audit here would inspect ROOT rather than the selected bundle.
             verify_data_bundle(dry_run=driver.dry_run)
             print("[pipeline] verified canonical external model-data bundle", flush=True)
+            report_availability_contract()
     else:
         # Reuse the audited input without overwriting shared historical artifacts.
         verify_data_bundle(dry_run=driver.dry_run)

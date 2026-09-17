@@ -106,6 +106,8 @@ class Batches:
         dlp, dsp, mlr = self.F.gather(item, store[st], day[st], week[st])
         ctx = dict(dlp=dlp.double(), disp=dsp.double(), mail=mlr.double(),
                    week=(week[st] - 1) % 52, store=store[st])
+        if getattr(self.F, "availability_enabled", False):
+            ctx["log_avail"] = self.F.log_availability(item, store[st], week[st])
         li, lt = [], []
         for bi, t in enumerate(trips):
             a, b = int(self.lptr[t]), int(self.lptr[t + 1])
@@ -117,6 +119,8 @@ class Batches:
         dl2, ds2, ml2 = self.F.gather(LI, store[LT], day[LT], week[LT])
         lctx = dict(dlp=dl2.double(), disp=ds2.double(), mail=ml2.double(),
                     week=(week[LT] - 1) % 52, store=store[LT])
+        if getattr(self.F, "availability_enabled", False):
+            lctx["log_avail"] = self.F.log_availability(LI, store[LT], week[LT])
         # position of each purchased line within its trip's slot block
         sizes = np.asarray([len(self.store_layout[s][0]) for s in stores], dtype=np.int64)
         off_array = np.concatenate([np.zeros(1, dtype=np.int64), np.cumsum(sizes)])
@@ -161,6 +165,8 @@ class LinearIndex(torch.nn.Module):
         b = b + self.w_dsp[it] * c["disp"] + self.w_mlr[it] * c["mail"]
         b = b + (self.mu[it] * self.delta[c["week"]]).sum(-1)
         b = b + (self.zeta[it] * self.xi[c["store"]]).sum(-1)
+        if "log_avail" in c:
+            b = b + c["log_avail"]
         return b
 
 

@@ -65,10 +65,25 @@ rules. A request is rejected with HTTP 503 if the higher rule does not confirm t
 rule within the declared tolerances. Startup also verifies the checkpoint, data
 fingerprint, audit result, segment assignment digest, and trained capabilities.
 
-The following are deliberately not decision endpoints: causal price optimization,
-stockout substitution, promotion policy, assortment optimization, total demand
-forecasting, chronological stopping, and personalized bundle policy. Their current data
-or application gates did not pass. `GET /v1/capabilities` reports these exclusions.
+Decision capabilities (causal price optimization, stockout substitution, promotion policy,
+assortment optimization, total demand forecasting, chronological stopping, personalized
+bundle policy) are **refused by default**, and no decision endpoint exists for them. A
+deployment may claim one only through a declared verdict file:
+
+- **Path:** `RETAIL_API_CAPABILITY_VERDICTS`, else `capability_verdicts.json` beside the
+  checkpoint.
+- **Contract:** `schema_version` 1, the serving checkpoint's `checkpoint_sha256` and
+  `data_fingerprint_sha256`, and per capability a `status` of `supported`, `limited`,
+  `unsupported` or `untested`. A `supported` or `limited` verdict must carry `evidence` and
+  a `source`; anything else is rejected with HTTP 503.
+- **Reporting:** `GET /v1/capabilities` returns claimed capabilities under
+  `available_decisions` with their evidence, the rest under `unavailable`, and the verdict
+  file's path and hash under `capability_verdicts`.
+- **ERIM has no verdict file,** so every decision capability stays refused: its prices are
+  observational and its policy evaluation reports `not_identifiable`. The synthetic
+  deployment does have one, written by `scripts/synthetic/evaluate_capabilities.py` from
+  oracle comparisons; see
+  [SYNTHETIC_RETAIL_API_APPLICATIONS.md](SYNTHETIC_RETAIL_API_APPLICATIONS.md).
 
 ## Start the service
 

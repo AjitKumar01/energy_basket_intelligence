@@ -52,17 +52,33 @@ at startup.
 
 **Use.** Before anyone builds on the model, the API states what it was validated for.
 
-**Result.**
-- **Available:** basket completion (validated for masked-pair evaluation), cross-sell
-  (promising offline, MRR 0.45), customer segmentation (descriptive only).
-- **Not available:** causal price optimization, stockout substitution, promotion policy,
-  assortment optimization, total demand forecasting, chronological stopping, personalized
-  bundle policy.
-- **Served data:** the category partition with its 8 groups, and store availability with a
-  0.012% weight for products never confirmed in a store.
+What the service may claim depends on the deployment. Basket completion, cross-sell and
+segmentation come from the served run's own audits. Decision capabilities are refused by
+default and are opened only by a **verdict file** beside the checkpoint, which must name the
+evidence and match the checkpoint and dataset (`capability_verdicts.json`, written here by
+`evaluate_capabilities.py` from its oracle comparisons).
 
-This is the part that stops a "what if we cut the price 20%?" question turning into a
-decision the data cannot support.
+**Result for this deployment.**
+
+| Capability | Status | Evidence |
+|---|---|---|
+| Basket completion | validated for masked-pair evaluation | the run's completion audit |
+| Cross-sell | promising offline | MRR 0.45 against 0.26 for popularity |
+| Customer segmentation | descriptive only | 3 segments |
+| **Causal price optimization** | **supported** | own-product response within 3.0% of the truth; prices are randomized by design in this world |
+| **Promotion policy** | **supported** | action values correlate 0.979 with the truth over 18 actions; the best action matches; totals are conservative |
+| **Stockout substitution** | **limited** | stocked-cell precision 0.998 and recall 0.9999, substitution effects correlate 0.95, but no stockout decision was scored |
+| Assortment optimization, personalized bundle policy | untested | nothing was scored against the truth |
+| Total demand forecasting | unsupported | trip incidence is exogenous in the generating world |
+| Chronological stopping | unsupported | the law is over basket sets, without scan order |
+
+**Served data:** the category partition with 8 groups, and store availability with a 0.012%
+weight for products never confirmed in a store.
+
+On ERIM there is no verdict file, so every decision capability stays refused, which matches
+that dataset's evidence: its prices are observational and the pipeline's own policy
+evaluation reports the value as `not_identifiable`. The refusals travel with the evidence,
+not with the code.
 
 ### C. Catalogue: turn a cart into product ids (`GET /v1/products/search`)
 
@@ -149,14 +165,16 @@ matches the historical path.
 
 **Shows.**
 - Every capability the API exposes works end to end on a second dataset, with no code
-  changes: only the served bundle, checkpoint, audit and segment report differ.
+  changes: only the served bundle, checkpoint, audit, segment report and verdict file differ.
 - The answers are good where the model is validated: cross-sell close to the best possible
   ranking, basket size calibrated on average, segments broadly right.
 - The refusals hold. Unsupported questions and malformed requests are rejected.
 
 **Does not show.**
-- **Nothing causal.** The API never claims a price cut or promotion will produce a gain;
-  those capabilities report as unavailable.
+- **Causal claims here rest on the synthetic design,** where weekly prices are randomized
+  and the truth is known. That is why price and promotion pass as supported. The same
+  checkpoint's verdicts would not transfer to a dataset with observational prices, and the
+  file is bound to this checkpoint and fingerprint so it cannot.
 - **Per-shopper precision** is limited: basket-size error is about one item per trip, and
   63% of held-out items are not in the top 5.
 - **Synthetic-world results are an upper bound** for how well the model can do, because the

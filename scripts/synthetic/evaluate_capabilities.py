@@ -95,6 +95,103 @@ def midrank(scores: np.ndarray, position: int) -> float:
     return float((scores > target).sum() + 0.5 * ((scores == target).sum() - 1) + 1)
 
 
+# Thresholds for turning oracle comparisons into deployment verdicts. They were written
+# after the capability report existed, so they describe this evidence rather than predict it;
+# a future world must be judged with them fixed in advance.
+VERDICT_RULES = {
+    "own_price_relative_error": {"supported": 0.05, "limited": 0.15},
+    "price_sensitivity_correlation": 0.90,
+    "promotion_action_value_correlation": 0.90,
+    "availability_precision_recall": 0.99,
+    "pair_effect_correlation": 0.90,
+}
+
+
+def capability_verdicts(report: dict) -> dict:
+    """Decision-capability verdicts from the oracle comparisons, with the evidence attached."""
+    verdicts = {}
+    own = [(row["price_multiplier"], row["own_incidence_retained"]["model"],
+            row["own_incidence_retained"]["oracle"]) for row in report["price_scenarios"]
+           if row["price_multiplier"] != 1.0]
+    worst = max(abs(model / oracle - 1.0) for _, model, oracle in own)
+    correlation = report["price_response"]["sensitivity_correlation"] if "price_response" in report else None
+    rule = VERDICT_RULES["own_price_relative_error"]
+    status = ("supported" if worst <= rule["supported"] else
+              "limited" if worst <= rule["limited"] else "unsupported")
+    size_error = max(abs(row["uniform_size_change"]["model"] - row["uniform_size_change"]["oracle"])
+                     for row in report["price_scenarios"])
+    verdicts["causal_price_optimization"] = {
+        "status": status,
+        "evidence": {"worst_own_product_multiplier_relative_error": round(worst, 4),
+                     "worst_basket_size_change_absolute_error": round(size_error, 4),
+                     "design": "weekly chain prices are randomized in the generating world",
+                     "scenarios": report["price_scenarios"]},
+        "limitation": ("own-product response is accurate; basket-size growth under a price cut "
+                       "is overstated, so total-basket claims stay indicative"),
+        "source": "scripts/synthetic/evaluate_capabilities.py price_scenarios vs the oracle",
+    }
+    policy = report["promotion_policy"]
+    conservative = all(scenario["model_total_incremental_post_discount_sales"]
+                       <= scenario["oracle_total_incremental_post_discount_sales"]
+                       for scenario in policy["budget_scenarios"])
+    best_matches = policy["model_best_action"] == policy["oracle_best_action"]
+    verdicts["promotion_policy"] = {
+        "status": ("supported" if (policy["action_value_correlation"]
+                                   >= VERDICT_RULES["promotion_action_value_correlation"]
+                                   and best_matches and conservative) else "limited"),
+        "evidence": {"actions": len(policy["actions"]),
+                     "action_value_correlation": policy["action_value_correlation"],
+                     "model_best_action": policy["model_best_action"],
+                     "oracle_best_action": policy["oracle_best_action"],
+                     "budget_totals_model_vs_oracle": [
+                         [scenario["model_total_incremental_post_discount_sales"],
+                          scenario["oracle_total_incremental_post_discount_sales"]]
+                         for scenario in policy["budget_scenarios"]],
+                     "estimates_are_conservative": conservative},
+        "source": "scripts/synthetic/evaluate_capabilities.py promotion_policy vs the oracle",
+    }
+    availability, structure = report["availability"], report["structure"]
+    ingredients = (availability["precision_confirmed_is_stocked"] >= VERDICT_RULES["availability_precision_recall"]
+                   and availability["recall_stocked_is_confirmed"] >= VERDICT_RULES["availability_precision_recall"]
+                   and structure["effective_pair_correlation"] >= VERDICT_RULES["pair_effect_correlation"])
+    verdicts["stockout_substitution"] = {
+        "status": "limited" if ingredients else "unsupported",
+        "evidence": {"confirmed_cell_precision": availability["precision_confirmed_is_stocked"],
+                     "confirmed_cell_recall": availability["recall_stocked_is_confirmed"],
+                     "pair_effect_correlation_with_truth": structure["effective_pair_correlation"]},
+        "limitation": ("availability and substitution are recovered, but no stockout decision was "
+                       "scored against the truth"),
+        "source": "scripts/synthetic/evaluate_capabilities.py availability and structure",
+    } if ingredients else {"status": "unsupported", "reason": "availability or substitution recovery below threshold"}
+    for name, reason in (
+            ("assortment_optimization", "no assortment decision was scored against the truth"),
+            ("personalized_bundle_policy", "no personalized bundle policy was scored against the truth")):
+        verdicts[name] = {"status": "untested", "reason": reason}
+    for name, reason in (
+            ("total_demand_forecasting", "trip incidence is exogenous in the generating world too"),
+            ("chronological_stopping", "the generating law is over basket sets, without scan order")):
+        verdicts[name] = {"status": "unsupported", "reason": reason}
+    return verdicts
+
+
+def write_verdicts(report: dict, run: Path, bundle: Path, output: Path) -> dict:
+    from provenance import file_sha256
+    checkpoint = run / "artifacts" / "candidate_rank1.pt"
+    fingerprint = json.loads((bundle / "basket_input" / "model_data_fingerprint.json").read_text())
+    document = {
+        "schema_version": 1,
+        "checkpoint": str(checkpoint), "checkpoint_sha256": file_sha256(checkpoint),
+        "data_fingerprint_sha256": fingerprint["fingerprint_sha256"],
+        "declared_rules": VERDICT_RULES,
+        "note": ("verdicts for the retail API: what this checkpoint may be used to decide, with the "
+                 "oracle evidence behind each one"),
+        "capabilities": capability_verdicts(report),
+    }
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_text(json.dumps(document, indent=2) + "\n")
+    return document
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--world", type=Path, default=ROOT / "data/synthetic_capability_world")
@@ -104,7 +201,18 @@ def main() -> None:
     parser.add_argument("--nodes", type=int, default=16)
     parser.add_argument("--bundle", type=Path,
                         help="model-data bundle the run was fitted on (default: <world>/model_input)")
+    parser.add_argument("--verdicts-output", type=Path,
+                        help="capability verdicts for the API (default: <run>/artifacts/capability_verdicts.json)")
+    parser.add_argument("--verdicts-from-report", type=Path,
+                        help="write the verdicts from an existing capability report and exit")
     args = parser.parse_args()
+    verdicts_output = args.verdicts_output or args.run / "artifacts" / "capability_verdicts.json"
+    if args.verdicts_from_report:
+        bundle = (args.bundle or args.world / "model_input").resolve()
+        document = write_verdicts(json.loads(args.verdicts_from_report.read_text()), args.run,
+                                  bundle, verdicts_output)
+        print(json.dumps(document, indent=2))
+        return
     bundle = (args.bundle or args.world / "model_input").resolve()
     os.environ.setdefault("ENERGY_MODEL_DATA_ROOT", str(bundle))
     os.environ.setdefault("V3_AFFINITY", "1")
@@ -373,6 +481,7 @@ def main() -> None:
     report["runtime_seconds"] = round(time.time() - started, 1)
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(report, indent=2) + "\n")
+    write_verdicts(report, args.run, bundle, verdicts_output)
     print(json.dumps(report, indent=2))
 
 

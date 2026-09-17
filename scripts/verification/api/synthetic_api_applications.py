@@ -115,7 +115,10 @@ def main() -> None:
             "question": "which decisions may this model support, and which are out of scope?",
             "model_data": capabilities["model_data"],
             "available": {k: v.get("status") for k, v in capabilities["available"].items()},
-            "unavailable": list(capabilities["unavailable"]),
+            "available_decisions": {k: {"status": v["status"], "evidence": v["evidence"]}
+                                    for k, v in capabilities["available_decisions"].items()},
+            "unavailable": capabilities["unavailable"],
+            "capability_verdicts": capabilities["capability_verdicts"],
             "offline_cross_sell_mrr": capabilities["available"]["cross_sell"]["mrr"],
         }
 

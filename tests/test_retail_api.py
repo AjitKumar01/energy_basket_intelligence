@@ -1,3 +1,4 @@
+import json
 from fastapi.testclient import TestClient
 import pytest
 
@@ -174,3 +175,54 @@ def test_default_data_root_respects_explicit_configuration(monkeypatch, tmp_path
     assert apply_default_data_root() == tmp_path.resolve()
     monkeypatch.setenv("ENERGY_MODEL_DATA_ROOT", "/explicit")
     assert apply_default_data_root() == __import__("pathlib").Path("/explicit")
+
+
+def verdict_loader(tmp_path, capabilities, **overrides):
+    """A bare service object exercising only the capability-verdict loader."""
+    import retail_api.service as service_module
+    service = service_module.RetailModelService.__new__(service_module.RetailModelService)
+    service.checkpoint = tmp_path / "candidate_rank1.pt"
+    service.checkpoint_sha256 = "a" * 64
+    service.checkpoint_blob = {"data_fingerprint_sha256": "b" * 64}
+    document = {"schema_version": 1, "checkpoint_sha256": "a" * 64,
+                "data_fingerprint_sha256": "b" * 64, "capabilities": capabilities}
+    document.update(overrides)
+    (tmp_path / "capability_verdicts.json").write_text(json.dumps(document))
+    return service, service_module
+
+
+def test_decision_capabilities_are_refused_without_a_verdict_file(tmp_path):
+    service, module = verdict_loader(tmp_path, {})
+    (tmp_path / "capability_verdicts.json").unlink()
+    service._load_capability_verdicts()
+    report = module.RetailModelService._decision_capabilities(service)
+    assert report["available_decisions"] == {}
+    assert set(report["unavailable"]) == set(module.DECISION_CAPABILITIES)
+    assert report["capability_verdicts"]["source"] is None
+
+
+def test_a_verdict_file_opens_only_the_capabilities_it_evidences(tmp_path):
+    service, module = verdict_loader(tmp_path, {
+        "causal_price_optimization": {"status": "supported", "evidence": {"worst_error": 0.03},
+                                      "source": "oracle comparison"},
+        "promotion_policy": {"status": "untested", "reason": "no policy was scored"}})
+    service._load_capability_verdicts()
+    report = module.RetailModelService._decision_capabilities(service)
+    assert report["available_decisions"]["causal_price_optimization"]["evidence"] == {"worst_error": 0.03}
+    assert report["unavailable"]["promotion_policy"] == "no policy was scored"
+    assert "assortment_optimization" in report["unavailable"]           # untouched default
+    assert report["capability_verdicts"]["source"].endswith("capability_verdicts.json")
+
+
+@pytest.mark.parametrize("capabilities, overrides, message", [
+    ({"causal_price_optimization": {"status": "supported"}}, {}, "without evidence"),
+    ({"causal_price_optimization": {"status": "great"}}, {}, "needs a status"),
+    ({"teleportation": {"status": "untested"}}, {}, "unknown capabilities"),
+    ({}, {"checkpoint_sha256": "0" * 64}, "another checkpoint"),
+    ({}, {"data_fingerprint_sha256": "0" * 64}, "another data_fingerprint"),
+    ({}, {"schema_version": 2}, "schema_version 1"),
+])
+def test_bad_verdict_files_are_rejected(tmp_path, capabilities, overrides, message):
+    service, _ = verdict_loader(tmp_path, capabilities, **overrides)
+    with pytest.raises(RetailAPIError, match=message):
+        service._load_capability_verdicts()

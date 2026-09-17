@@ -54,6 +54,21 @@ DEFAULT_COMPLETION_AUDIT = (
 DEFAULT_SEGMENT_REPORT = (
     ROOT / "artifacts/erim_category_refit/full/reports/customer_segments.json")
 
+# Decision capabilities the service reports on. The defaults are refusals: a deployment may
+# only claim one of these with a declared verdict file that carries its evidence, so a
+# checkpoint from another dataset can never inherit someone else's claim.
+DECISION_CAPABILITIES = {
+    "causal_price_optimization": "causal effects and profit were not validated",
+    "stockout_substitution": (
+        "store availability is inferred from sales and lost-demand labels are absent"),
+    "promotion_policy": "incremental lift, cost, and margin are not identified",
+    "assortment_optimization": "historical availability interventions are absent",
+    "total_demand_forecasting": "visit incidence is outside the fitted law",
+    "chronological_stopping": "within-trip scan order is absent",
+    "personalized_bundle_policy": "only a small matched-negative proxy passed",
+}
+VERDICT_STATUSES = ("supported", "limited", "unsupported", "untested")
+
 
 def configured_path(environment: str, default: Path) -> Path:
     return Path(os.environ.get(environment, str(default))).expanduser().resolve()
@@ -131,6 +146,7 @@ class RetailModelService:
         self.batcher = Batcher(
             self.data, self.features, int(self.meta["nmax"]), include_recency=False)
         self._lock = threading.RLock()
+        self._load_capability_verdicts()
         self._load_evidence()
         self._load_products()
         self._load_segments()
@@ -139,6 +155,47 @@ class RetailModelService:
         self.levels = certified_levels(self.completion_audit, self.active_rank)
         self.rules = [padded_rule(self.model, self.active_rank, level)
                       for level in self.levels]
+
+    def _load_capability_verdicts(self):
+        """Per-deployment verdicts for the decision capabilities (optional, evidence-bearing).
+
+        Path: RETAIL_API_CAPABILITY_VERDICTS, else capability_verdicts.json beside the
+        checkpoint. Without one every decision capability stays refused. A verdict claiming
+        support must name its evidence and belong to this checkpoint and dataset.
+        """
+        configured = os.environ.get("RETAIL_API_CAPABILITY_VERDICTS")
+        path = Path(configured) if configured else self.checkpoint.with_name("capability_verdicts.json")
+        self.capability_verdicts_path = path if path.is_file() else None
+        self.capability_verdicts = {}
+        if self.capability_verdicts_path is None:
+            return
+        document = json.loads(path.read_text())
+        if document.get("schema_version") != 1:
+            raise RetailAPIError("capability verdicts require schema_version 1",
+                                 status_code=503, code="evidence_gate_failed")
+        for field, expected in (("checkpoint_sha256", self.checkpoint_sha256),
+                                ("data_fingerprint_sha256",
+                                 self.checkpoint_blob.get("data_fingerprint_sha256"))):
+            if document.get(field) != expected:
+                raise RetailAPIError(f"capability verdicts belong to another {field[:-7]}",
+                                     status_code=503, code="artifact_lineage_mismatch")
+        verdicts = document.get("capabilities", {})
+        unknown = set(verdicts).difference(DECISION_CAPABILITIES)
+        if unknown:
+            raise RetailAPIError(f"capability verdicts name unknown capabilities: {sorted(unknown)}",
+                                 status_code=503, code="evidence_gate_failed")
+        for name, verdict in verdicts.items():
+            if verdict.get("status") not in VERDICT_STATUSES:
+                raise RetailAPIError(f"capability verdict for {name} needs a status in "
+                                     f"{VERDICT_STATUSES}", status_code=503,
+                                     code="evidence_gate_failed")
+            if verdict["status"] in ("supported", "limited") and not (
+                    verdict.get("evidence") and verdict.get("source")):
+                raise RetailAPIError(f"capability verdict for {name} claims support without "
+                                     "evidence and a source", status_code=503,
+                                     code="evidence_gate_failed")
+        self.capability_verdicts = verdicts
+        self.capability_verdicts_digest = file_sha256(path)
 
     def _load_evidence(self):
         self.completion_audit = json.loads(self.completion_audit_path.read_text())
@@ -490,14 +547,27 @@ class RetailModelService:
                     "segments": self.segment_report["chosen_segments"],
                 },
             },
-            "unavailable": {
-                "causal_price_optimization": "causal effects and profit were not validated",
-                "stockout_substitution": (
-                    "store availability is inferred from sales and lost-demand labels are absent"),
-                "promotion_policy": "incremental lift, cost, and margin are not identified",
-                "assortment_optimization": "historical availability interventions are absent",
-                "total_demand_forecasting": "visit incidence is outside the fitted law",
-                "chronological_stopping": "within-trip scan order is absent",
-                "personalized_bundle_policy": "only a small matched-negative proxy passed",
-            },
+            **self._decision_capabilities(),
         }
+
+    def _decision_capabilities(self):
+        """Split the decision capabilities into available and unavailable for this deployment."""
+        available, unavailable = {}, {}
+        for name, default_reason in DECISION_CAPABILITIES.items():
+            verdict = self.capability_verdicts.get(name)
+            if verdict is None:
+                unavailable[name] = default_reason
+                continue
+            if verdict["status"] in ("supported", "limited"):
+                available[name] = {"status": verdict["status"], "evidence": verdict["evidence"],
+                                   "source": verdict["source"],
+                                   **({"limitation": verdict["limitation"]}
+                                      if verdict.get("limitation") else {})}
+            else:
+                unavailable[name] = verdict.get("reason", default_reason)
+        return {"available_decisions": available, "unavailable": unavailable,
+                "capability_verdicts": (
+                    {"source": str(self.capability_verdicts_path),
+                     "sha256": self.capability_verdicts_digest}
+                    if self.capability_verdicts_path else
+                    {"source": None, "note": "no verdict file; decision capabilities refused by default"})}

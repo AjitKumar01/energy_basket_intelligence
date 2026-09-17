@@ -95,7 +95,8 @@ Example: `configs/datasets/erim_availability.json`.
 | `model_price_sources` | canonical price sources allowed to price the model | `["retail_aggregate"]` |
 | `availability.rule` | `disabled` (declared catalogue) or `retail_first_sale` | `disabled` |
 | `availability.left_censor_periods` | first sales this close to the feed start count from the start | 13 |
-| `affinity.minimum_pair_count`, `affinity.maximum_group_size` | training-only affinity partition | 8, 128 |
+| `affinity.partition` | `affinity` (co-purchase groups) or `category` (merchandise categories as the exact within-group partition) | `affinity` |
+| `affinity.minimum_pair_count`, `affinity.maximum_group_size` | co-purchase partition settings; keep the group cap well below the catalogue size | 8, 128 |
 | `metadata_defaults` | `MANUFACTURER` and `DEPARTMENT` when the catalogue lacks them | `UNKNOWN` |
 | `promotion_coverage_note` | declared coverage of the promotion feed | generic |
 
@@ -117,3 +118,14 @@ python -u scripts/run_pipeline.py --model-data-root <model_data_root> \
 Verification: rebuilding ERIM from `configs/datasets/erim_availability.json` reproduces
 every model file of `data/erim_basket/model_input_availability` byte for byte. Only
 `meta.json` gains `dataset_name`.
+
+## 4. Choosing the partition
+
+The partition sets which product groups share the exact within-group penalty ρ_c. Co-purchase
+affinity groups put complements together, so substitutes land in different groups and
+**within-category substitution cannot be represented**. On the known-truth synthetic
+world, the category partition raised the pairwise-effect correlation with the truth from
+0.09 to 0.95. It also turned an over-valued, loss-making promotion policy into a
+correctly ranked, conservative one. See
+[SYNTHETIC_CAPABILITY_VALIDATION.md](SYNTHETIC_CAPABILITY_VALIDATION.md).
+

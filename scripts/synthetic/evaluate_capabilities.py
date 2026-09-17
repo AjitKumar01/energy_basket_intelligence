@@ -102,8 +102,10 @@ def main() -> None:
     parser.add_argument("--output", type=Path,
                         default=ROOT / "artifacts/synthetic_capability_test/capability_report.json")
     parser.add_argument("--nodes", type=int, default=16)
+    parser.add_argument("--bundle", type=Path,
+                        help="model-data bundle the run was fitted on (default: <world>/model_input)")
     args = parser.parse_args()
-    bundle = args.world / "model_input"
+    bundle = (args.bundle or args.world / "model_input").resolve()
     os.environ.setdefault("ENERGY_MODEL_DATA_ROOT", str(bundle))
     os.environ.setdefault("V3_AFFINITY", "1")
     import torch

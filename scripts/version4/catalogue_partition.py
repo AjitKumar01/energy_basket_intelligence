@@ -94,8 +94,8 @@ def finest_level_groups(items: pd.DataFrame):
     return catalogue_hierarchy_groups(items, 1, 0)
 
 
-def validate_partition(items: pd.DataFrame, group_id) -> dict:
-    """Check that group_id is a partition that nests in the category level.
+def validate_partition(items: pd.DataFrame, group_id, nest_in_category: bool = True) -> dict:
+    """Check that group_id is a partition that (by default) nests in the category level.
 
     Raises PartitionError on: wrong length, missing or negative ids, non-contiguous ids, or a
     group spanning more than one category. Returns diagnostics about the declared hierarchy.
@@ -110,13 +110,13 @@ def validate_partition(items: pd.DataFrame, group_id) -> dict:
     if not np.array_equal(groups, np.arange(len(groups))):
         raise PartitionError("group ids must be contiguous 0..G-1")
     spanning = pd.Series(category.to_numpy()).groupby(group_id).nunique()
-    if (spanning > 1).any():
+    if nest_in_category and (spanning > 1).any():
         raise PartitionError(f"{int((spanning > 1).sum())} groups span more than one category")
     sizes = np.bincount(group_id)
     reused = (pd.DataFrame({"sub": sub[declared], "category": category[declared]})
               .groupby("sub").category.nunique())
     diagnostics = {
-        "is_partition": True, "nests_in_category": True,
+        "is_partition": True, "nests_in_category": bool((spanning <= 1).all()),
         "n_categories": int(category.nunique()), "n_groups": int(len(sizes)),
         "products_with_declared_subcategory": int(declared.sum()),
         "subcategory_labels_reused_across_categories": int((reused > 1).sum()),

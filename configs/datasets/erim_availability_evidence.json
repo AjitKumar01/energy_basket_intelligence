@@ -1,0 +1,30 @@
+{
+  "schema_version": 1,
+  "dataset_name": "erim_multi_category_substitution_evidence_singleton",
+  "description": "ERIM eight-category tracked baskets, retail-only chain prices, store availability, substitution-evidence partition (singleton leftovers)",
+  "canonical_dir": "data/erim_basket/canonical",
+  "model_data_root": "data/erim_basket/model_input_availability_evidence",
+  "price_basis": "erim_chain_week_retail_aggregate_unit_price_carried_forward_constant_training_reference_without_retail_price",
+  "promotion_feature": "disabled",
+  "model_price_sources": [
+    "retail_aggregate"
+  ],
+  "availability": {
+    "rule": "retail_first_sale",
+    "left_censor_periods": 13
+  },
+  "affinity": {
+    "partition": "substitution_evidence",
+    "category_boundary": true,
+    "minimum_expected_cooccurrence": 5,
+    "evidence_threshold": -0.3,
+    "complement_threshold": 0.3,
+    "maximum_group_size": 24,
+    "unassigned": "singleton"
+  },
+  "metadata_defaults": {
+    "MANUFACTURER": "ERIM_UNKNOWN",
+    "DEPARTMENT": "ERIM_TRACKED_CATEGORIES"
+  },
+  "promotion_coverage_note": "partial: frozen dinner has no retail aggregate file"
+}

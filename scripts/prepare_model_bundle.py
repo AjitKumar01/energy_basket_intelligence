@@ -13,7 +13,7 @@ ragged index and data fingerprint. Everything dataset-specific lives in the JSON
       "promotion_feature": "disabled | advertised | special_price",
       "model_price_sources": ["retail_aggregate"],
       "availability": {"rule": "disabled | retail_first_sale", "left_censor_periods": 13},
-      "affinity": {"partition": "affinity | category | finest_catalogue_level | catalogue_hierarchy",
+      "affinity": {"partition": "affinity | category | finest_catalogue_level | catalogue_hierarchy | substitution_evidence",
                    "minimum_pair_count": 8, "maximum_group_size": 128,
                    "minimum_group_products": 3, "minimum_group_training_lines": 300},
       "product_metadata": "optional parquet: product_id + subcategory/brand/manufacturer/department",
@@ -39,6 +39,7 @@ V4 = ROOT / "scripts" / "version4"
 sys.path.insert(0, str(V4))
 
 from canonical_basket_input import CanonicalBasketModelInputBuilder  # noqa: E402
+from evidence_partition import EVIDENCE_DEFAULTS, build_evidence_partition, settings_from  # noqa: E402
 from catalogue_partition import (  # noqa: E402,F401
     REQUIRED_COLUMNS, catalogue_hierarchy_groups, finest_level_groups, validate_partition,
     write_partition)
@@ -53,6 +54,7 @@ AFFINITY_KEYS = {
     "category": {"partition"},
     "catalogue_hierarchy": {"partition", "minimum_group_products", "minimum_group_training_lines"},
     "finest_catalogue_level": {"partition"},
+    "substitution_evidence": {"partition", *EVIDENCE_DEFAULTS},
 }
 HIERARCHY_DEFAULTS = {"minimum_group_products": 3, "minimum_group_training_lines": 300}
 
@@ -116,6 +118,22 @@ def write_catalogue_hierarchy_partition(basket_input: Path, settings: dict) -> N
           f"largest {manifest['maximum_group_size_observed']}", flush=True)
 
 
+def write_evidence_partition(basket_input: Path, settings: dict) -> None:
+    import pandas as pd
+    resolved = settings_from(settings)
+    items = pd.read_parquet(basket_input / "items.parquet").sort_values("item_id")
+    group_id, summary = build_evidence_partition(basket_input, resolved)
+    diagnostics = validate_partition(items, group_id, nest_in_category=bool(resolved["category_boundary"]))
+    manifest = write_partition(basket_input, items, group_id, {
+        "schema_version": 1, "training_only": True, "partition": "substitution_evidence",
+        "rule": "household-level co-purchase shortfall on training trips; constrained average-linkage "
+                "merging and single-product moves; declared thresholds",
+        "evidence": summary, "validation": diagnostics})
+    print(f"[prepare] substitution-evidence partition: {manifest['n_groups']} groups, "
+          f"{summary['groups_with_pairs']} with pairs, {summary['unassigned_products']} unassigned "
+          f"products, kappa {summary['kappa']:.3g}", flush=True)
+
+
 def write_finest_level_partition(basket_input: Path) -> None:
     import pandas as pd
     items = pd.read_parquet(basket_input / "items.parquet").sort_values("item_id")
@@ -175,6 +193,8 @@ def main() -> None:
         write_category_partition(root / "basket_input")
     elif partition == "finest_catalogue_level":
         write_finest_level_partition(root / "basket_input")
+    elif partition == "substitution_evidence":
+        write_evidence_partition(root / "basket_input", affinity)
     else:
         write_catalogue_hierarchy_partition(root / "basket_input", affinity)
     run([sys.executable, "-u", V4 / "data.py", "--force"], root)

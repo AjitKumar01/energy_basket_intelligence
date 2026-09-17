@@ -1,0 +1,21 @@
+{
+  "schema_version": 1,
+  "dataset_name": "synthetic_capability_world",
+  "description": "Known-truth synthetic retailer from scripts/synthetic/generate_canonical_world.py (seed 20260918)",
+  "canonical_dir": "data/synthetic_capability_world/canonical",
+  "model_data_root": "data/synthetic_capability_world/model_input",
+  "price_basis": "synthetic chain week retail unit price with randomized weekly multipliers",
+  "promotion_feature": "disabled",
+  "model_price_sources": [
+    "retail_aggregate"
+  ],
+  "availability": {
+    "rule": "retail_first_sale",
+    "left_censor_periods": 13
+  },
+  "affinity": {
+    "minimum_pair_count": 8,
+    "maximum_group_size": 24
+  },
+  "promotion_coverage_note": "no promotions were generated"
+}

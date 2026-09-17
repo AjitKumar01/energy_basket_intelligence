@@ -12,3 +12,5 @@ __pycache__/
 *.so
 build/
 .DS_Store
+/paper/SHOPPER.pdf
+/paper/check.md

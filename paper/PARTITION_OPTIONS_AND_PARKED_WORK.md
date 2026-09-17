@@ -52,8 +52,8 @@ Details:
   `data/erim_basket/model_input_availability_category`, run `artifacts/erim_category_refit`).
 - **Retail API:** serves that category checkpoint, with its completion audit at the
   certified levels 11-13.
-- **Model:** frozen; see [[baseline frozen]](NESTED_SUBSTITUTION_GROUPS.md) and §1 above for
-  what that rules out.
+- **Model:** frozen; see [NESTED_SUBSTITUTION_GROUPS.md](NESTED_SUBSTITUTION_GROUPS.md) and
+  §1 above for what that rules out.
 - **Finished comparisons:** `affinity` vs `category` (category wins) and `category` vs
   category x type (tie). Both are written up.
 - **Fully implemented but never fitted:** `finest_catalogue_level` and

@@ -110,8 +110,8 @@ exceeds the incremental sales. So "positive incremental sales" does not mean pro
 ## Recommendation
 
 - Adopt `erim_availability_category.json` as the ERIM standard configuration.
-- Moving the retail API to the category checkpoint needs a separate step: rerun the
-  corrected completion audit on the new checkpoint and update the API defaults.
+- The retail API now serves the category checkpoint (completion audit passed at the
+  same certified levels 11–13; see RETAIL_APPLICATION_API.md).
 - Nested substitution groups
   ([NESTED_SUBSTITUTION_GROUPS.md](NESTED_SUBSTITUTION_GROUPS.md)) are not needed to
   obtain this gain. ERIM's flat categories are already brand-level substitute sets.

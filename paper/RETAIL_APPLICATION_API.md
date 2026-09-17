@@ -6,24 +6,44 @@ technical interface and evidence reference for engineering and model-governance 
 
 ## Served model
 
-Since 2026-09-17 the default service loads the availability-aware ERIM refit
-([ERIM_AVAILABILITY_REFIT.md](ERIM_AVAILABILITY_REFIT.md)):
+Since 2026-09-17 the default service loads the ERIM category-partition refit
+([ERIM_CATEGORY_PARTITION_REFIT.md](ERIM_CATEGORY_PARTITION_REFIT.md)):
 
 | Artifact | Default path |
 |---|---|
-| Model-data bundle | `data/erim_basket/model_input_availability` |
-| Checkpoint | `artifacts/erim_availability_refit/full/artifacts/candidate_rank1.pt` |
-| Completion audit | `artifacts/erim_availability_refit/retail_application/real_basket_completion_corrected.json` |
-| Segment report | `artifacts/erim_availability_refit/full/reports/customer_segments.json` |
+| Model-data bundle | `data/erim_basket/model_input_availability_category` |
+| Checkpoint | `artifacts/erim_category_refit/full/artifacts/candidate_rank1.pt` |
+| Completion audit | `artifacts/erim_category_refit/retail_application/real_basket_completion_corrected.json` |
+| Segment report | `artifacts/erim_category_refit/full/reports/customer_segments.json` |
 
 The catalogue is ERIM's 464 products in eight tracked categories. Baskets are
-tracked-category sub-baskets, not whole grocery checkouts. Store availability is part of
-the model: a product not yet confirmed at the context's store keeps 0.3% of its weight.
-`GET /v1/capabilities` reports the dataset and availability contract under `model_data`.
+tracked-category sub-baskets, not whole grocery checkouts.
+- **Substitution groups.** The exact within-group penalty uses the eight merchandise
+  categories, so brands in one category can substitute for each other.
+- **Store availability.** Availability is part of the model: a product not yet confirmed
+  at the context's store keeps 0.3% of its weight.
+- **Reporting.** `GET /v1/capabilities` reports the dataset, the substitution-group
+  partition and the availability contract under `model_data`.
 
 The completion audit certifies Smolyak levels 11, 12 and 13 (`level_offset` 3). The
-standard levels 10–12 missed the 1e-4 gates by 2–6× on this checkpoint, so the API reads
-the certified levels from the audit rather than using a fixed offset.
+standard levels 10–12 fail the 1e-4 stop, size and incidence gates on this checkpoint, so
+the API reads the certified levels from the audit rather than using a fixed offset.
+
+Masked-pair completion accuracy on the 256 audited validation contexts:
+
+| Measure | Category checkpoint | Previous (co-purchase groups) |
+|---|---:|---:|
+| MAE, additional items (baseline 0.771) | 0.737 | 0.737 |
+| Stop log loss | 0.646 | 0.644 |
+| Stop ROC AUC | 0.658 | 0.658 |
+
+The switch was made for the refit's better held-out likelihood and next-item ranking, and
+because the model can now represent substitution; masked completion accuracy is unchanged.
+
+The previous co-purchase-group ERIM checkpoint remains servable. Set
+`RETAIL_API_DATA_ROOT=data/erim_basket/model_input_availability`, and point the three
+artifact variables (`RETAIL_API_CHECKPOINT`, `RETAIL_API_COMPLETION_AUDIT`,
+`RETAIL_API_SEGMENT_REPORT`) at `artifacts/erim_availability_refit/...`.
 
 The previous Dunnhumby checkpoint is still servable. Set `RETAIL_API_DATA_ROOT` to the
 repository root, and point `RETAIL_API_CHECKPOINT`, `RETAIL_API_COMPLETION_AUDIT` and
@@ -167,26 +187,26 @@ experiment stratification, not treatment targeting.
 
 ## Measured latency
 
-### ERIM availability checkpoint (current default)
+### ERIM category-partition checkpoint (current default)
 
 Same method: one worker, four threads, sequential HTTP/1.1, 30 cheap and 10 inference
 repeats.
 
 | Endpoint | First/cold | Warm p50 | Warm p95 |
 |---|---:|---:|---:|
-| `GET /ready` | 0.529 ms | 0.479 ms | 0.556 ms |
-| `GET /v1/capabilities` | — | 0.596 ms | 0.666 ms |
-| `GET /v1/products/search` | — | 1.041 ms | 1.128 ms |
-| `GET /v1/households/{id}/segment` | — | 0.553 ms | 0.604 ms |
-| `POST /v1/baskets/complete`, masked pair | 157.242 ms | 134.778 ms | 136.111 ms |
-| `POST /v1/baskets/complete`, literal cart | 134.291 ms | 134.012 ms | 135.569 ms |
+| `GET /ready` | 0.647 ms | 0.512 ms | 0.662 ms |
+| `GET /v1/capabilities` | — | 0.648 ms | 0.732 ms |
+| `GET /v1/products/search` | — | 1.060 ms | 1.153 ms |
+| `GET /v1/households/{id}/segment` | — | 0.591 ms | 0.642 ms |
+| `POST /v1/baskets/complete`, masked pair | 147.364 ms | 129.611 ms | 131.175 ms |
+| `POST /v1/baskets/complete`, literal cart | 123.145 ms | 123.876 ms | 129.466 ms |
 
-ERIM's catalogue is much smaller, so exact completion is about 3× faster than Dunnhumby
-despite the finer quadrature: roughly 7.4 single-context requests per second on one
-worker. The benchmark and smoke results are in `artifacts/erim_availability_refit/retail_application/`.
-The cold `/ready` figure excludes model loading, which happened in an earlier request.
+Exact completion runs at roughly 7.7–8 single-context requests per second on one worker,
+slightly faster than the previous ERIM checkpoint (134.8 ms p50). Smoke, audit and
+benchmark results are in `artifacts/erim_category_refit/retail_application/`. The cold
+`/ready` figure excludes model loading, which happened in an earlier request.
 
-### Dunnhumby checkpoint (previous default)
+### Dunnhumby checkpoint (earlier default)
 
 The service was benchmarked through a real localhost HTTP connection, not by timing its
 Python methods. The run used one uvicorn worker, four PyTorch CPU threads and sequential

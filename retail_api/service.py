@@ -31,7 +31,7 @@ VERSION4 = ROOT / "scripts" / "version4"
 if str(VERSION4) not in sys.path:
     sys.path.insert(0, str(VERSION4))
 os.environ.setdefault("V3_AFFINITY", "1")
-# The default checkpoint is the availability-aware ERIM refit.  Entry points select its
+# The default checkpoint is the ERIM category-partition refit.  Entry points select its
 # model-data bundle with retail_api.runtime.apply_default_data_root() before importing
 # this module; load_checkpoint rejects a checkpoint whose fingerprint does not match.
 
@@ -47,12 +47,12 @@ from ragged import RaggedIndex, smolyak_grid  # noqa: E402
 torch.set_default_dtype(torch.float64)
 
 DEFAULT_CHECKPOINT = (
-    ROOT / "artifacts/erim_availability_refit/full/artifacts/candidate_rank1.pt")
+    ROOT / "artifacts/erim_category_refit/full/artifacts/candidate_rank1.pt")
 DEFAULT_COMPLETION_AUDIT = (
-    ROOT / "artifacts/erim_availability_refit/retail_application/"
+    ROOT / "artifacts/erim_category_refit/retail_application/"
     "real_basket_completion_corrected.json")
 DEFAULT_SEGMENT_REPORT = (
-    ROOT / "artifacts/erim_availability_refit/full/reports/customer_segments.json")
+    ROOT / "artifacts/erim_category_refit/full/reports/customer_segments.json")
 
 
 def configured_path(environment: str, default: Path) -> Path:
@@ -445,11 +445,18 @@ class RetailModelService:
                 for row in rows.itertuples()]
 
     def model_data_contract(self):
-        """The served bundle's identity and store-availability contract."""
-        meta = json.loads((model_data_root(ROOT) / "basket_input" / "meta.json").read_text())
+        """The served bundle's identity, substitution groups and availability contract."""
+        basket_input = model_data_root(ROOT) / "basket_input"
+        meta = json.loads((basket_input / "meta.json").read_text())
         contract = meta.get("availability_contract") or {"enabled": False}
+        groups_path = basket_input / "affinity_manifest.json"
+        groups = json.loads(groups_path.read_text()) if groups_path.is_file() else {}
         return {
             "dataset": meta.get("dataset", "dunnhumby"),
+            "substitution_groups": {
+                "partition": groups.get("partition", "co_purchase_affinity"),
+                "groups": groups.get("n_groups"),
+            },
             "availability": {
                 "enabled": bool(contract.get("enabled")),
                 "rule": contract.get("rule", "declared_catalogue"),

@@ -5,7 +5,7 @@ import os
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_DATA_ROOT = ROOT / "data/erim_basket/model_input_availability"
+DEFAULT_DATA_ROOT = ROOT / "data/erim_basket/model_input_availability_category"
 
 
 def apply_default_data_root() -> Path:

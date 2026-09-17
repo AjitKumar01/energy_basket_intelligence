@@ -534,6 +534,10 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--run-dir", type=Path,
                         help="isolated artifacts/reports/out under a new run directory; explicit --start-at permits reuse")
+    parser.add_argument(
+        "--model-data-root", type=Path,
+        help=("model-data bundle prepared by scripts/prepare_model_bundle.py; sets "
+              "ENERGY_MODEL_DATA_ROOT for every stage (the repository root holds Dunnhumby)"))
     parser.add_argument("--from-raw", action="store_true",
                         help="rebuild data/ and basket_input/ from dunnhumby CSVs")
     parser.add_argument("--dry-run", action="store_true",
@@ -562,6 +566,15 @@ def main() -> None:
         "--rebuild-interaction-bank", action="store_true",
         help="resample the stratified estimator's derived draw cache")
     args = parser.parse_args()
+    if args.model_data_root is not None:
+        bundle = args.model_data_root.expanduser().resolve()
+        if not (bundle / "basket_input" / "model_data_fingerprint.json").is_file():
+            parser.error(f"--model-data-root {bundle} is not a prepared model-data bundle")
+        configured = os.environ.get("ENERGY_MODEL_DATA_ROOT")
+        if configured and Path(configured).expanduser().resolve() != bundle:
+            parser.error("--model-data-root conflicts with ENERGY_MODEL_DATA_ROOT")
+        os.environ["ENERGY_MODEL_DATA_ROOT"] = str(bundle)
+        os.environ.setdefault("V3_AFFINITY", "1")
     if args.run_dir is not None:
         run_dir = args.run_dir.resolve()
         if not args.dry_run:

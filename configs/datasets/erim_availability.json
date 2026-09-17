@@ -1,0 +1,14 @@
+{
+  "schema_version": 1,
+  "dataset_name": "erim_multi_category",
+  "description": "ERIM eight-category tracked baskets, retail-only chain prices, store availability",
+  "canonical_dir": "data/erim_basket/canonical",
+  "model_data_root": "data/erim_basket/model_input_availability",
+  "price_basis": "erim_chain_week_retail_aggregate_unit_price_carried_forward_constant_training_reference_without_retail_price",
+  "promotion_feature": "disabled",
+  "model_price_sources": ["retail_aggregate"],
+  "availability": {"rule": "retail_first_sale", "left_censor_periods": 13},
+  "affinity": {"minimum_pair_count": 8, "maximum_group_size": 128},
+  "metadata_defaults": {"MANUFACTURER": "ERIM_UNKNOWN", "DEPARTMENT": "ERIM_TRACKED_CATEGORIES"},
+  "promotion_coverage_note": "partial: frozen dinner has no retail aggregate file"
+}

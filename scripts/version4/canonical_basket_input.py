@@ -10,6 +10,10 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
+from canonical_contract import validate_canonical_tables
+
+DEFAULT_METADATA = {"MANUFACTURER": "UNKNOWN", "DEPARTMENT": "UNKNOWN"}
+
 
 def sha256(path: Path) -> str:
     digest = hashlib.sha256()
@@ -38,7 +42,10 @@ class CanonicalBasketModelInputBuilder:
                  *, price_basis: str, promotion_feature_name: str = "advertised",
                  model_price_sources: tuple[str, ...] = ("retail_aggregate",),
                  availability: str = "disabled",
-                 availability_left_censor_periods: int = 13):
+                 availability_left_censor_periods: int = 13,
+                 dataset_name: str = "canonical_external_basket",
+                 metadata_defaults: dict[str, str] | None = None,
+                 promotion_coverage_note: str = "declared by the canonical adapter"):
         self.canonical_directory = canonical_directory.resolve()
         self.output_root = output_root.resolve()
         self.price_basis = str(price_basis)
@@ -59,15 +66,21 @@ class CanonicalBasketModelInputBuilder:
             raise ValueError("availability left-censor window must be nonnegative")
         self.availability = availability
         self.availability_left_censor_periods = int(availability_left_censor_periods)
+        self.dataset_name = str(dataset_name)
+        unknown = set(metadata_defaults or {}).difference(DEFAULT_METADATA)
+        if unknown:
+            raise ValueError(f"unknown metadata defaults: {sorted(unknown)}")
+        self.metadata_defaults = {**DEFAULT_METADATA, **(metadata_defaults or {})}
+        self.promotion_coverage_note = str(promotion_coverage_note)
 
     def build(self) -> ModelInputBuildResult:
         canonical = self.canonical_directory
         required = {
             name: canonical / f"{name}.parquet"
-            for name in (
-                "transactions", "products", "shopping_opportunities",
-                "store_week_prices", "promotions")
+            for name in ("transactions", "products", "store_week_prices", "promotions")
         }
+        if (canonical / "shopping_opportunities.parquet").is_file():
+            required["shopping_opportunities"] = canonical / "shopping_opportunities.parquet"
         required["build_audit"] = canonical / "build_audit.json"
         missing = [str(path) for path in required.values() if not path.is_file()]
         if missing:
@@ -77,13 +90,18 @@ class CanonicalBasketModelInputBuilder:
         prices = pd.read_parquet(required["store_week_prices"])
         promotions = pd.read_parquet(required["promotions"])
         source_audit = json.loads(required["build_audit"].read_text())
+        self.contract_summary = validate_canonical_tables({
+            "transactions": tx, "products": products, "store_week_prices": prices,
+            "promotions": promotions, "build_audit": source_audit,
+            "shopping_opportunities": (pd.read_parquet(required["shopping_opportunities"])
+                                       if "shopping_opportunities" in required else None)})
         self._validate_ids(tx, products)
 
         basket_input = self.output_root / "basket_input"
         data_directory = self.output_root / "data"
         basket_input.mkdir(parents=True, exist_ok=True)
         data_directory.mkdir(parents=True, exist_ok=True)
-        items = self._items(products, tx)
+        items = self._items(products, tx, self.metadata_defaults)
         baskets = self._baskets(tx, items)
         n_items = len(items)
         n_stores = int(baskets.store_id.max()) + 1
@@ -114,6 +132,7 @@ class CanonicalBasketModelInputBuilder:
         meta = {
             "schema_version": 1,
             "dataset": "canonical_external_basket",
+            "dataset_name": self.dataset_name,
             "n_users": n_users,
             "n_items": n_items,
             "n_subs": int(items.sub_id.max()) + 1,
@@ -213,7 +232,9 @@ class CanonicalBasketModelInputBuilder:
                 raise ValueError(f"{column} values must be contiguous")
 
     @staticmethod
-    def _items(products: pd.DataFrame, tx: pd.DataFrame) -> pd.DataFrame:
+    def _items(products: pd.DataFrame, tx: pd.DataFrame,
+               metadata_defaults: dict[str, str] | None = None) -> pd.DataFrame:
+        defaults = {**DEFAULT_METADATA, **(metadata_defaults or {})}
         category_values = sorted(products.category.unique())
         category_map = {value: index for index, value in enumerate(category_values)}
         counts = tx.groupby("item_id").agg(
@@ -223,13 +244,22 @@ class CanonicalBasketModelInputBuilder:
             n_train_households=("customer_id", "nunique"))
         items = products.merge(counts, on="item_id").merge(training, on="item_id")
         items["cat_id"] = items.category.map(category_map).astype(np.int32)
-        items["sub_id"] = items.cat_id
+        if "subcategory" in items:
+            sub_label = items.subcategory.astype(str)
+            sub_values = sorted(sub_label.unique())
+            items["sub_id"] = sub_label.map(
+                {value: index for index, value in enumerate(sub_values)}).astype(np.int32)
+        else:
+            sub_label = items.category
+            items["sub_id"] = items.cat_id
         items["PRODUCT_ID"] = items.item_id.astype(np.int64)
         items["COMMODITY_DESC"] = items.category
-        items["SUB_COMMODITY_DESC"] = items.category
-        items["BRAND"] = items.label
-        items["MANUFACTURER"] = "ERIM_UNKNOWN"
-        items["DEPARTMENT"] = "ERIM_TRACKED_CATEGORIES"
+        items["SUB_COMMODITY_DESC"] = sub_label
+        items["BRAND"] = items.brand.astype(str) if "brand" in items else items.label
+        items["MANUFACTURER"] = (items.manufacturer.astype(str) if "manufacturer" in items
+                                 else defaults["MANUFACTURER"])
+        items["DEPARTMENT"] = (items.department.astype(str) if "department" in items
+                               else defaults["DEPARTMENT"])
         return items.sort_values("item_id").reset_index(drop=True)
 
     @staticmethod
@@ -418,7 +448,7 @@ class CanonicalBasketModelInputBuilder:
             "feature_mapping": feature_mapping,
             "observed_cells": int(len(frame)),
             "active_cells": int(len(active)),
-            "source_coverage": "partial: frozen dinner has no retail aggregate file",
+            "source_coverage": self.promotion_coverage_note,
             "model_treatment": (
                 "all promotion features set to zero"
                 if self.promotion_feature_name == "disabled"

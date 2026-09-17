@@ -4,6 +4,33 @@ Retail operations and merchandising teams should use the plain-language
 [`RETAILER_API_USER_MANUAL.md`](RETAILER_API_USER_MANUAL.md). This document is the
 technical interface and evidence reference for engineering and model-governance teams.
 
+## Served model
+
+Since 2026-09-17 the default service loads the availability-aware ERIM refit
+([ERIM_AVAILABILITY_REFIT.md](ERIM_AVAILABILITY_REFIT.md)):
+
+| Artifact | Default path |
+|---|---|
+| Model-data bundle | `data/erim_basket/model_input_availability` |
+| Checkpoint | `artifacts/erim_availability_refit/full/artifacts/candidate_rank1.pt` |
+| Completion audit | `artifacts/erim_availability_refit/retail_application/real_basket_completion_corrected.json` |
+| Segment report | `artifacts/erim_availability_refit/full/reports/customer_segments.json` |
+
+The catalogue is ERIM's 464 products in eight tracked categories. Baskets are
+tracked-category sub-baskets, not whole grocery checkouts. Store availability is part of
+the model: a product not yet confirmed at the context's store keeps 0.3% of its weight.
+`GET /v1/capabilities` reports the dataset and availability contract under `model_data`.
+
+The completion audit certifies Smolyak levels 11, 12 and 13 (`level_offset` 3). The
+standard levels 10–12 missed the 1e-4 gates by 2–6× on this checkpoint, so the API reads
+the certified levels from the audit rather than using a fixed offset.
+
+The previous Dunnhumby checkpoint is still servable. Set `RETAIL_API_DATA_ROOT` to the
+repository root, and point `RETAIL_API_CHECKPOINT`, `RETAIL_API_COMPLETION_AUDIT` and
+`RETAIL_API_SEGMENT_REPORT` at `artifacts/corrected_complete_rank5_20260913/...` and
+`artifacts/retail_application_audit_20260915/...`. The bread-basket case study below and the
+retailer manual's example use that Dunnhumby checkpoint.
+
 ## Scope
 
 The API exposes only applications supported by the current audits:
@@ -39,6 +66,7 @@ The model loads on the first endpoint that requires it. `/live` tests the web pr
 Configuration can be overridden with:
 
 ```text
+RETAIL_API_DATA_ROOT
 RETAIL_API_CHECKPOINT
 RETAIL_API_COMPLETION_AUDIT
 RETAIL_API_SEGMENT_REPORT
@@ -51,14 +79,17 @@ feature-panel, and catalogue copies.
 ## Product and context identifiers
 
 Public basket requests use the source `PRODUCT_ID` from `items.parquet`. Product search
-returns this ID together with the internal model index and readable metadata.
+returns this ID together with the internal model index and readable metadata. For the ERIM
+bundle, `PRODUCT_ID` equals the internal item index, and the UPC-based identifier is
+`product_id` (`category:UPC`) in `items.parquet`.
 
 `household_index` and `store_index` refer to the fitted cohort's contiguous internal
 indices because the prepared data do not retain a source household-ID lookup. A production
 integration must persist that mapping during preprocessing. `day` is zero-based and must
 be supplied together with the source `WEEK_NO`; the two source fields are deliberately not
-re-derived from one another. Requests are restricted to the trained promotion coverage,
-weeks 9 through 101, and days 0 through 711.
+re-derived from one another. Requests are restricted to the served bundle's price and
+promotion coverage: weeks 1 through 51 and days 0 through 356 for ERIM, or weeks 9 through
+101 and days 0 through 711 for Dunnhumby.
 
 A `historical_trip` context is supplied for reproducible demonstrations. It reconstructs
 the household, store, day, week, factual prices, and factual promotions from the prepared
@@ -135,6 +166,27 @@ timestamps and checkout labels. Customer segments are suitable for reporting and
 experiment stratification, not treatment targeting.
 
 ## Measured latency
+
+### ERIM availability checkpoint (current default)
+
+Same method: one worker, four threads, sequential HTTP/1.1, 30 cheap and 10 inference
+repeats.
+
+| Endpoint | First/cold | Warm p50 | Warm p95 |
+|---|---:|---:|---:|
+| `GET /ready` | 0.529 ms | 0.479 ms | 0.556 ms |
+| `GET /v1/capabilities` | — | 0.596 ms | 0.666 ms |
+| `GET /v1/products/search` | — | 1.041 ms | 1.128 ms |
+| `GET /v1/households/{id}/segment` | — | 0.553 ms | 0.604 ms |
+| `POST /v1/baskets/complete`, masked pair | 157.242 ms | 134.778 ms | 136.111 ms |
+| `POST /v1/baskets/complete`, literal cart | 134.291 ms | 134.012 ms | 135.569 ms |
+
+ERIM's catalogue is much smaller, so exact completion is about 3× faster than Dunnhumby
+despite the finer quadrature: roughly 7.4 single-context requests per second on one
+worker. The benchmark and smoke results are in `artifacts/erim_availability_refit/retail_application/`.
+The cold `/ready` figure excludes model loading, which happened in an earlier request.
+
+### Dunnhumby checkpoint (previous default)
 
 The service was benchmarked through a real localhost HTTP connection, not by timing its
 Python methods. The run used one uvicorn worker, four PyTorch CPU threads and sequential

@@ -153,3 +153,24 @@ def test_product_and_segment_endpoints(client):
     error = client.get("/v1/households/99/segment")
     assert error.status_code == 400
     assert error.json()["error"]["message"] == "outside cohort"
+
+
+def test_api_uses_the_levels_its_completion_audit_certified():
+    from retail_api.service import certified_levels
+    assert certified_levels({"numerical_certification": {}}, 8) == [10, 11, 12]
+    audit = {"numerical_certification": {"level_offset": 3, "levels": [11, 12, 13]}}
+    assert certified_levels(audit, 8) == [11, 12, 13]
+    with pytest.raises(RetailAPIError, match="levels"):
+        certified_levels(audit, 7)
+
+
+def test_default_data_root_respects_explicit_configuration(monkeypatch, tmp_path):
+    from retail_api.runtime import DEFAULT_DATA_ROOT, apply_default_data_root
+    monkeypatch.delenv("ENERGY_MODEL_DATA_ROOT", raising=False)
+    monkeypatch.delenv("RETAIL_API_DATA_ROOT", raising=False)
+    assert apply_default_data_root() == DEFAULT_DATA_ROOT.resolve()
+    monkeypatch.delenv("ENERGY_MODEL_DATA_ROOT")
+    monkeypatch.setenv("RETAIL_API_DATA_ROOT", str(tmp_path))
+    assert apply_default_data_root() == tmp_path.resolve()
+    monkeypatch.setenv("ENERGY_MODEL_DATA_ROOT", "/explicit")
+    assert apply_default_data_root() == __import__("pathlib").Path("/explicit")

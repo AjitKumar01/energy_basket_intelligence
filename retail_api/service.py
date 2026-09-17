@@ -31,6 +31,9 @@ VERSION4 = ROOT / "scripts" / "version4"
 if str(VERSION4) not in sys.path:
     sys.path.insert(0, str(VERSION4))
 os.environ.setdefault("V3_AFFINITY", "1")
+# The default checkpoint is the availability-aware ERIM refit.  Entry points select its
+# model-data bundle with retail_api.runtime.apply_default_data_root() before importing
+# this module; load_checkpoint rejects a checkpoint whose fingerprint does not match.
 
 from checkpoint_io import load_checkpoint  # noqa: E402
 from conditional_basket import conditional_completion_quadrature  # noqa: E402
@@ -44,11 +47,12 @@ from ragged import RaggedIndex, smolyak_grid  # noqa: E402
 torch.set_default_dtype(torch.float64)
 
 DEFAULT_CHECKPOINT = (
-    ROOT / "artifacts/corrected_complete_rank5_20260913/artifacts/candidate_rank1.pt")
+    ROOT / "artifacts/erim_availability_refit/full/artifacts/candidate_rank1.pt")
 DEFAULT_COMPLETION_AUDIT = (
-    ROOT / "artifacts/retail_application_audit_20260915/real_basket_completion_corrected.json")
+    ROOT / "artifacts/erim_availability_refit/retail_application/"
+    "real_basket_completion_corrected.json")
 DEFAULT_SEGMENT_REPORT = (
-    ROOT / "artifacts/corrected_complete_rank5_20260913/reports/customer_segments.json")
+    ROOT / "artifacts/erim_availability_refit/full/reports/customer_segments.json")
 
 
 def configured_path(environment: str, default: Path) -> Path:
@@ -66,6 +70,21 @@ def validate_context_range(day: int, week: int, *, n_days: int,
         raise RetailAPIError(
             f"week must lie in {int(week_min)}..{int(week_max)} for the fitted "
             "promotion coverage", code="context_out_of_range")
+
+
+def certified_levels(completion_audit: dict, active_rank: int) -> list[int]:
+    """The Smolyak levels the completion audit certified for this checkpoint.
+
+    Audits written before the offset was recorded used active_rank + 2, 3 and 4.
+    """
+    certified = completion_audit.get("numerical_certification", {})
+    offset = int(certified.get("level_offset", 2))
+    levels = [active_rank + offset + step for step in (0, 1, 2)]
+    if certified.get("levels") is not None and list(certified["levels"]) != levels:
+        raise RetailAPIError(
+            "completion audit levels do not match the checkpoint's active rank",
+            status_code=503, code="artifact_lineage_mismatch")
+    return levels
 
 
 def padded_rule(model, active_rank: int, level: int):
@@ -117,7 +136,7 @@ class RetailModelService:
         self._load_segments()
         singular = torch.linalg.svdvals(self.model.phi)
         self.active_rank = int((singular > singular[0] * 1e-10).sum())
-        self.levels = [self.active_rank + offset for offset in (2, 3, 4)]
+        self.levels = certified_levels(self.completion_audit, self.active_rank)
         self.rules = [padded_rule(self.model, self.active_rank, level)
                       for level in self.levels]
 
@@ -425,12 +444,26 @@ class RetailModelService:
         return [ProductSearchResult(**self._product(int(row.item_id)))
                 for row in rows.itertuples()]
 
+    def model_data_contract(self):
+        """The served bundle's identity and store-availability contract."""
+        meta = json.loads((model_data_root(ROOT) / "basket_input" / "meta.json").read_text())
+        contract = meta.get("availability_contract") or {"enabled": False}
+        return {
+            "dataset": meta.get("dataset", "dunnhumby"),
+            "availability": {
+                "enabled": bool(contract.get("enabled")),
+                "rule": contract.get("rule", "declared_catalogue"),
+                "unconfirmed_product_weight": contract.get("floor", 1.0),
+            },
+        }
+
     def capabilities(self):
         masked = self.completion_audit["shopper_uniform_random_pair_mask_target"]
         return {
             "api_version": "1.0.0",
             "checkpoint_sha256": self.checkpoint_sha256,
             "data_fingerprint_sha256": self.checkpoint_blob["data_fingerprint_sha256"],
+            "model_data": self.model_data_contract(),
             "available": {
                 "basket_completion": {
                     "status": "validated_for_uniform_random_subset_masking",
@@ -452,7 +485,8 @@ class RetailModelService:
             },
             "unavailable": {
                 "causal_price_optimization": "causal effects and profit were not validated",
-                "stockout_substitution": "availability and lost-demand labels are absent",
+                "stockout_substitution": (
+                    "store availability is inferred from sales and lost-demand labels are absent"),
                 "promotion_policy": "incremental lift, cost, and margin are not identified",
                 "assortment_optimization": "historical availability interventions are absent",
                 "total_demand_forecasting": "visit incidence is outside the fitted law",

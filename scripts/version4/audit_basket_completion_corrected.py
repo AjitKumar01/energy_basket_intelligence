@@ -221,7 +221,8 @@ def evaluate(args):
     singular = torch.linalg.svdvals(model.phi)
     active_rank = int((singular > singular[0] * 1e-10).sum())
     low_level, high_level, follow_level = (
-        active_rank + 2, active_rank + 3, active_rank + 4)
+        active_rank + args.level_offset, active_rank + args.level_offset + 1,
+        active_rank + args.level_offset + 2)
     low_rule = padded_rule(model, active_rank, low_level)
     high_rule = padded_rule(model, active_rank, high_level)
     follow_rule = padded_rule(model, active_rank, follow_level)
@@ -385,6 +386,7 @@ def evaluate(args):
         },
         "numerical_certification":{
             "levels":[low_level,high_level,follow_level],
+            "level_offset":int(args.level_offset),
             "nodes":[len(low_rule[1]),len(high_rule[1]),len(follow_rule[1])],
             "followup_contexts":int(len(follow_indices)),
             "maximum_initial_stop_gap":float(np.max(np.abs(high_stop-low_stop))),
@@ -440,6 +442,8 @@ def main():
     parser.add_argument("--followup-chunk",type=int,default=2)
     parser.add_argument("--threads",type=int,default=4)
     parser.add_argument("--seed",type=int,default=91531)
+    parser.add_argument("--level-offset",type=int,default=2,
+                        help="Smolyak levels are active_rank + offset, +1 and +2")
     parser.add_argument("--maximum-stop-gap",type=float,default=1e-4)
     parser.add_argument("--maximum-size-gap",type=float,default=.02)
     parser.add_argument("--maximum-size-probability-gap",type=float,default=1e-4)

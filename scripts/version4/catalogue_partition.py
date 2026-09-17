@@ -33,6 +33,7 @@ import pandas as pd
 
 SEP = "\x1f"
 HIERARCHY_RULES = ("category", "finest_catalogue_level", "catalogue_hierarchy")
+HIERARCHY_DEFAULTS = {"minimum_group_products": 3, "minimum_group_training_lines": 300}
 REQUIRED_COLUMNS = ("item_id", "cat_id", "COMMODITY_DESC", "SUB_COMMODITY_DESC", "n_train_lines")
 
 

@@ -41,7 +41,7 @@ sys.path.insert(0, str(V4))
 from canonical_basket_input import CanonicalBasketModelInputBuilder  # noqa: E402
 from evidence_partition import EVIDENCE_DEFAULTS, build_evidence_partition, settings_from  # noqa: E402
 from catalogue_partition import (  # noqa: E402,F401
-    REQUIRED_COLUMNS, catalogue_hierarchy_groups, finest_level_groups, validate_partition,
+    HIERARCHY_DEFAULTS, REQUIRED_COLUMNS, catalogue_hierarchy_groups, finest_level_groups, validate_partition,
     write_partition)
 
 CONFIG_KEYS = {
@@ -56,7 +56,6 @@ AFFINITY_KEYS = {
     "finest_catalogue_level": {"partition"},
     "substitution_evidence": {"partition", *EVIDENCE_DEFAULTS},
 }
-HIERARCHY_DEFAULTS = {"minimum_group_products": 3, "minimum_group_training_lines": 300}
 
 
 def resolve(value: str) -> Path:
@@ -81,6 +80,16 @@ def load_config(path: Path) -> dict:
     unknown_affinity = set(affinity).difference(AFFINITY_KEYS[partition])
     if unknown_affinity:
         raise SystemExit(f"affinity keys {sorted(unknown_affinity)} do not apply to partition {partition!r}")
+    if partition == "substitution_evidence":
+        try:
+            settings_from(affinity)
+        except ValueError as error:
+            raise SystemExit(f"affinity: {error}") from None
+    if partition == "catalogue_hierarchy":
+        for key, lowest in (("minimum_group_products", 1), ("minimum_group_training_lines", 0)):
+            value = affinity.get(key, HIERARCHY_DEFAULTS[key])
+            if not isinstance(value, int) or isinstance(value, bool) or value < lowest:
+                raise SystemExit(f"affinity.{key} must be an integer >= {lowest}")
     return config
 
 
@@ -130,7 +139,7 @@ def write_evidence_partition(basket_input: Path, settings: dict) -> None:
                 "merging and single-product moves; declared thresholds",
         "evidence": summary, "validation": diagnostics})
     print(f"[prepare] substitution-evidence partition: {manifest['n_groups']} groups, "
-          f"{summary['groups_with_pairs']} with pairs, {summary['unassigned_products']} unassigned "
+          f"roles {summary['groups_by_role']}, {summary['unassigned_products']} unassigned "
           f"products, kappa {summary['kappa']:.3g}", flush=True)
 
 
@@ -210,6 +219,8 @@ def main() -> None:
         "model_data_root": str(root),
         "contract_summary": builder.contract_summary,
         "availability": result.manifest["availability"],
+        **({"product_metadata": str(resolve(config["product_metadata"]))}
+           if config.get("product_metadata") else {}),
         "data_fingerprint_sha256": fingerprint["fingerprint_sha256"],
         "next_command": (f"python -u scripts/run_pipeline.py --model-data-root {root} "
                          "--run-dir <new run directory> --profile full"),

@@ -184,13 +184,14 @@ def test_product_metadata_adds_declared_columns_and_validates(tmp_path):
     path = tmp_path / "meta.parquet"
     pd.DataFrame({"product_id": ["p0"], "subcategory": ["fine"]}).to_parquet(path)
     merged, audit = CanonicalBasketModelInputBuilder._apply_product_metadata(products, path)
-    assert merged.subcategory.tolist() == ["fine", "a", "b"]      # others fall back to category
+    items = CanonicalBasketModelInputBuilder._items(merged, tiny_tables()["transactions"])
+    assert items.SUB_COMMODITY_DESC.tolist() == ["fine", "a", "b"]   # others fall back to category
     assert audit["columns"] == ["subcategory"] and audit["products_covered"] == 1
+    assert audit["file"] == "meta.parquet" and "path" not in audit      # no machine-specific path
     for bad, message in (
             (pd.DataFrame({"product_id": ["p9"], "subcategory": ["s"]}), "unknown products"),
             (pd.DataFrame({"product_id": ["p0", "p0"], "subcategory": ["s", "t"]}), "more than once"),
-            (pd.DataFrame({"product_id": ["p0"], "category": ["z"]}), "subset"),
-            (pd.DataFrame({"product_id": ["p0"], "brand": ["B"]}), "cover every product")):
+            (pd.DataFrame({"product_id": ["p0"], "category": ["z"]}), "subset")):
         bad.to_parquet(path)
         with pytest.raises(ValueError, match=message):
             CanonicalBasketModelInputBuilder._apply_product_metadata(products, path)
@@ -208,3 +209,25 @@ def test_finest_catalogue_level_config_takes_no_floors(tmp_path):
     with pytest.raises(SystemExit, match="do not apply"):
         module.load_config(path)
 
+
+def test_partial_metadata_falls_back_to_contract_defaults(tmp_path):
+    tables = tiny_tables()
+    products = tables["products"].assign(brand=["B0", None, "B2"])
+    path = tmp_path / "meta.parquet"
+    pd.DataFrame({"product_id": ["p2"], "manufacturer": ["M"], "brand": ["Z"]}).to_parquet(path)
+    merged, _ = CanonicalBasketModelInputBuilder._apply_product_metadata(products, path)
+    items = CanonicalBasketModelInputBuilder._items(merged, tables["transactions"], {"MANUFACTURER": "UNK"})
+    assert items.BRAND.tolist() == ["B0", "y", "Z"]                 # missing brand -> label
+    assert items.MANUFACTURER.tolist() == ["UNK", "UNK", "M"]        # uncovered -> declared default
+
+
+def test_partition_settings_are_validated_when_the_config_loads(tmp_path):
+    module = load_prepare_module("prepare_bundle_settings")
+    config = json.loads((ROOT / "configs" / "datasets" / "erim_availability_category.json").read_text())
+    path = tmp_path / "config.json"
+    for affinity, message in (({"partition": "substitution_evidence", "unassigned": "drop"}, "unassigned"),
+                              ({"partition": "catalogue_hierarchy", "minimum_group_products": 0}, "integer")):
+        config["affinity"] = affinity
+        path.write_text(json.dumps(config))
+        with pytest.raises(SystemExit, match=message):
+            module.load_config(path)

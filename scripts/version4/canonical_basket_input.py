@@ -245,8 +245,10 @@ class CanonicalBasketModelInputBuilder:
 
         Catalogue attributes often come from a source other than the transaction adapter.
         The file supplies optional product columns of the canonical contract; it may not
-        change identifiers or categories, and it must cover every product it names exactly
-        once. Products it omits keep their canonical values (or the contract defaults).
+        change identifiers or categories, and it names each product at most once. Products it
+        omits keep their canonical values, and missing values fall back to the contract
+        defaults in ``_items``. The audit records the file by name and content hash only, so
+        the bundle identity does not depend on where the repository lives.
         """
         import hashlib
         if not path.is_file():
@@ -269,16 +271,10 @@ class CanonicalBasketModelInputBuilder:
         products = products.copy()
         lookup = extra.set_index("product_id")
         for column in columns:
-            fallback = (products[column].astype(str) if column in products
-                        else products.category.astype(str) if column == "subcategory" else None)
             mapped = products.product_id.map(lookup[column].astype(str))
-            if fallback is None:
-                if mapped.isna().any():
-                    raise ValueError(f"product metadata must cover every product for {column}")
-                products[column] = mapped
-            else:
-                products[column] = mapped.fillna(fallback)
-        audit = {"path": str(path), "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+            products[column] = (mapped.where(mapped.notna(), products[column]) if column in products
+                                else mapped)
+        audit = {"file": path.name, "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
                  "columns": columns, "products_covered": int(len(extra))}
         return products, audit
 
@@ -296,7 +292,7 @@ class CanonicalBasketModelInputBuilder:
         items = products.merge(counts, on="item_id").merge(training, on="item_id")
         items["cat_id"] = items.category.map(category_map).astype(np.int32)
         if "subcategory" in items:
-            sub_label = items.subcategory.astype(str)
+            sub_label = items.subcategory.where(items.subcategory.notna(), items.category).astype(str)
             sub_values = sorted(sub_label.unique())
             items["sub_id"] = sub_label.map(
                 {value: index for index, value in enumerate(sub_values)}).astype(np.int32)
@@ -306,11 +302,12 @@ class CanonicalBasketModelInputBuilder:
         items["PRODUCT_ID"] = items.item_id.astype(np.int64)
         items["COMMODITY_DESC"] = items.category
         items["SUB_COMMODITY_DESC"] = sub_label
-        items["BRAND"] = items.brand.astype(str) if "brand" in items else items.label
-        items["MANUFACTURER"] = (items.manufacturer.astype(str) if "manufacturer" in items
-                                 else defaults["MANUFACTURER"])
-        items["DEPARTMENT"] = (items.department.astype(str) if "department" in items
-                               else defaults["DEPARTMENT"])
+        items["BRAND"] = (items.brand.where(items.brand.notna(), items.label).astype(str)
+                          if "brand" in items else items.label)
+        items["MANUFACTURER"] = (items.manufacturer.fillna(defaults["MANUFACTURER"]).astype(str)
+                                 if "manufacturer" in items else defaults["MANUFACTURER"])
+        items["DEPARTMENT"] = (items.department.fillna(defaults["DEPARTMENT"]).astype(str)
+                               if "department" in items else defaults["DEPARTMENT"])
         return items.sort_values("item_id").reset_index(drop=True)
 
     @staticmethod

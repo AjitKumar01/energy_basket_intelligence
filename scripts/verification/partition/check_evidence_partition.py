@@ -32,19 +32,19 @@ from sklearn.metrics import adjusted_rand_score
 
 ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(ROOT / "scripts/version4"))
-from evidence_partition import (build_evidence_partition, load_trips, pair_evidence,  # noqa: E402
-                                settings_from)
+import pandas as pd  # noqa: E402
+from evidence_partition import build_evidence_partition, household_evidence, settings_from  # noqa: E402
 
 
 def aggregate(O, E, mask):
-    return {"pairs": int(mask.sum() // 2), "observed": float(O[mask].sum() / 2), "expected": float(E[mask].sum() / 2),
-            "shortfall": float(np.log((O[mask].sum() + 1) / (E[mask].sum() + 1)))}
+    pairs = int(mask.sum() // 2)
+    return {"pairs": pairs, "observed": float(O[mask].sum() / 2), "expected": float(E[mask].sum() / 2),
+            "shortfall": float(np.log((O[mask].sum() + 1) / (E[mask].sum() + 1))) if pairs else None}
 
 
 def out_of_sample(basket_input: Path, group_id: np.ndarray, split: str = "validation"):
-    items, Y, household, store, week, first_period = load_trips(basket_input, split)
-    cols = np.arange(len(items))
-    ev = pair_evidence(Y, household, store, week, first_period, cols)
+    items = pd.read_parquet(basket_input / "items.parquet").sort_values("item_id")
+    (ev,), _ = household_evidence(basket_input, [np.arange(len(items))], split)
     category = items.COMMODITY_DESC.astype(str).to_numpy()
     sizes = np.bincount(group_id)
     off = ~np.eye(len(items), dtype=bool)
@@ -58,8 +58,8 @@ def out_of_sample(basket_input: Path, group_id: np.ndarray, split: str = "valida
 
 
 def stability(basket_input: Path, settings: dict, full: np.ndarray, draws: int = 5, seed: int = 7):
-    items, _, household, *_ = load_trips(basket_input, "train")
-    households = np.unique(household)
+    lines = pd.read_parquet(basket_input / "baskets.parquet", columns=["user_id", "split"])
+    households = np.unique(lines.user_id[lines.split == "train"])
     rng = np.random.default_rng(seed)
     grouped = np.bincount(full)[full] >= 2
     out = []

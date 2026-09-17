@@ -95,10 +95,11 @@ Example: `configs/datasets/erim_availability.json`.
 | `model_price_sources` | canonical price sources allowed to price the model | `["retail_aggregate"]` |
 | `availability.rule` | `disabled` (declared catalogue) or `retail_first_sale` | `disabled` |
 | `availability.left_censor_periods` | first sales this close to the feed start count from the start | 13 |
-| `affinity.partition` | `affinity` (co-purchase groups), `category` (merchandise categories), `finest_catalogue_level` (finest declared catalogue level, no floors) or `catalogue_hierarchy` (finest declared level meeting fixed floors); see §4 | `affinity` |
+| `affinity.partition` | `affinity` (co-purchase groups), `category` (merchandise categories), `finest_catalogue_level` (finest declared catalogue level, no floors), `catalogue_hierarchy` (finest declared level meeting fixed floors) or `substitution_evidence` (groups from household-level co-purchase shortfall); see §4 | `affinity` |
+| `affinity.category_boundary`, `minimum_expected_cooccurrence`, `evidence_threshold`, `complement_threshold`, `maximum_group_size`, `unassigned`, `maximum_dense_pairs` | `substitution_evidence` only; see [SUBSTITUTION_EVIDENCE_PARTITION.md](SUBSTITUTION_EVIDENCE_PARTITION.md) | true, 5, −0.3, 0.3, 24, `singleton`, 5e7 |
 | `affinity.minimum_pair_count`, `affinity.maximum_group_size` | `affinity` only: co-purchase partition settings; keep the group cap well below the catalogue size | 8, 128 |
 | `affinity.minimum_group_products`, `affinity.minimum_group_training_lines` | `catalogue_hierarchy` only: floors a declared subcategory must meet to form its own group | 3, 300 |
-| `product_metadata` | optional parquet keyed by `product_id` adding declared catalogue columns (`subcategory`, `brand`, `manufacturer`, `department`) without changing the canonical directory | none |
+| `product_metadata` | optional parquet keyed by `product_id` adding declared catalogue columns (`subcategory`, `brand`, `manufacturer`, `department`) without changing the canonical directory. Products it omits keep canonical values, and missing values fall back to the contract defaults. `meta.json` records the file by name and hash only, so bundle identity does not depend on the repository location | none |
 | `metadata_defaults` | `MANUFACTURER` and `DEPARTMENT` when the catalogue lacks them | `UNKNOWN` |
 | `promotion_coverage_note` | declared coverage of the promotion feed | generic |
 
@@ -127,13 +128,14 @@ Verification:
 ## 4. Choosing the partition
 
 The partition is an **input** to the frozen model. It changes which products share a
-penalty, never the model's form. There are four options:
+penalty, never the model's form. There are five options:
 
 | Option | Groups | Settings | Use when | Measured |
 |---|---|---|---|---|
 | `affinity` (default) | products frequently bought together, one large residual group | `minimum_pair_count`, `maximum_group_size` | there is no usable catalogue, or categories are too large for the exact program | cannot represent substitution. Synthetic pair correlation 0.09; ERIM −0.029 nats per basket against `category` |
 | `category` | one group per merchandise category | none | categories hold competing products (typical branded grocery) | synthetic correlation 0.95; **ERIM standard** (+0.029 over `affinity`, significant MRR gain) |
 | `finest_catalogue_level` | each product's finest declared level: one group per (category, subcategory) path; products without a subcategory form their category's remainder group | none | the catalogue's finest level is trusted as the substitute unit (for example Dunnhumby sub-commodities) | equals `category` for ERIM and the synthetic world (no subcategories). Dunnhumby: 802 groups in 187 commodities, 244 singletons |
+| `substitution_evidence` | products bought instead of each other: household-level co-purchase shortfall on training trips, constrained average-linkage merging (optionally within categories), leftovers as singletons or one residual group per category | see [SUBSTITUTION_EVIDENCE_PARTITION.md](SUBSTITUTION_EVIDENCE_PARTITION.md) | no trusted catalogue, or substitutes cut across the catalogue; needs enough co-purchase evidence | synthetic: recovers the true sets (ARI 1.0, also without a boundary). ERIM: 18 evidence groups, 240 products without evidence, stability 0.52–0.75. Dunnhumby: 4 s (boundary) / 16 s (none) |
 | `catalogue_hierarchy` | category × declared subcategory meeting floors; the rest pooled per category | `minimum_group_products`, `minimum_group_training_lines`, optional `product_metadata` | subcategories are distinct substitute sets that do **not** substitute across each other | equals `category` without subcategories; ERIM category × type tied with `category` (−0.001) because types there also substitute weakly across each other |
 
 The ERIM `affinity` figure is from the availability refit against the category refit on

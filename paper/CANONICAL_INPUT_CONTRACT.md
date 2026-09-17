@@ -95,8 +95,10 @@ Example: `configs/datasets/erim_availability.json`.
 | `model_price_sources` | canonical price sources allowed to price the model | `["retail_aggregate"]` |
 | `availability.rule` | `disabled` (declared catalogue) or `retail_first_sale` | `disabled` |
 | `availability.left_censor_periods` | first sales this close to the feed start count from the start | 13 |
-| `affinity.partition` | `affinity` (co-purchase groups) or `category` (merchandise categories as the exact within-group partition) | `affinity` |
-| `affinity.minimum_pair_count`, `affinity.maximum_group_size` | co-purchase partition settings; keep the group cap well below the catalogue size | 8, 128 |
+| `affinity.partition` | `affinity` (co-purchase groups), `category` (merchandise categories) or `catalogue_hierarchy` (finest declared catalogue level meeting fixed floors; §4) | `affinity` |
+| `affinity.minimum_pair_count`, `affinity.maximum_group_size` | `affinity` only: co-purchase partition settings; keep the group cap well below the catalogue size | 8, 128 |
+| `affinity.minimum_group_products`, `affinity.minimum_group_training_lines` | `catalogue_hierarchy` only: floors a declared subcategory must meet to form its own group | 3, 300 |
+| `product_metadata` | optional parquet keyed by `product_id` adding declared catalogue columns (`subcategory`, `brand`, `manufacturer`, `department`) without changing the canonical directory | none |
 | `metadata_defaults` | `MANUFACTURER` and `DEPARTMENT` when the catalogue lacks them | `UNKNOWN` |
 | `promotion_coverage_note` | declared coverage of the promotion feed | generic |
 
@@ -109,15 +111,18 @@ python -u scripts/run_pipeline.py --model-data-root <model_data_root> \
 ```
 
 `prepare_model_bundle.py` runs these steps and writes `bundle_preparation.json`:
-1. contract validation;
+1. contract validation (after merging any `product_metadata`);
 2. bundle build;
-3. affinity partition;
+3. partition (co-purchase, category or catalogue hierarchy; model-free, before training);
 4. ragged index;
 5. data fingerprint.
 
-Verification: rebuilding ERIM from `configs/datasets/erim_availability.json` reproduces
-every model file of `data/erim_basket/model_input_availability` byte for byte. Only
-`meta.json` gains `dataset_name`.
+Verification:
+- Rebuilding ERIM from `configs/datasets/erim_availability.json` reproduces every model
+  file of `data/erim_basket/model_input_availability` byte for byte. Only `meta.json` gains
+  `dataset_name`.
+- Rebuilding from `erim_availability_category.json` after the catalogue-hierarchy change
+  reproduces `model_input_availability_category` byte for byte (fingerprint `5d67c480…`).
 
 ## 4. Choosing the partition
 
@@ -129,3 +134,32 @@ world, the category partition raised the pairwise-effect correlation with the tr
 correctly ranked, conservative one. See
 [SYNTHETIC_CAPABILITY_VALIDATION.md](SYNTHETIC_CAPABILITY_VALIDATION.md).
 
+### Catalogue hierarchy (`catalogue_hierarchy`)
+
+A fixed, model-free rule declared in the config, applied once before training:
+- **Own groups.** Within each category, every declared subcategory with at least
+  `minimum_group_products` products and `minimum_group_training_lines` training purchase
+  lines becomes its own exact group.
+- **Remainder.** Products without a declared subcategory (subcategory equal to the
+  category) and products in subcategories below either floor stay together in one category
+  remainder group.
+- **No subcategories.** Without declared subcategories the rule gives exactly the category
+  partition. This was checked on ERIM and on the synthetic world: identical
+  `items_affinity.parquet` and ragged index.
+- **Manifest.** `affinity_manifest.json` records the floors and, per category, every
+  declared subcategory with its products, training lines and whether it formed a group.
+
+**Where subcategories come from.** The pipeline never interprets catalogue text.
+Subcategories come either from the canonical `subcategory` column, or from a
+`product_metadata` file written by dataset-specific adapter code:
+- **Dunnhumby:** has sub-commodities natively.
+- **ERIM:** its product types (for example oil- or water-packed tuna) are parsed from labels
+  in `scripts/version4/erim_catalogue.py`, and written by `scripts/build_erim_product_types.py`
+  to `data/erim_basket/catalogue/product_types.parquet`. See
+  [ERIM_SUBSTRUCTURE_SCREEN.md](ERIM_SUBSTRUCTURE_SCREEN.md) for why types matter.
+- **Why a separate file:** it keeps the canonical directory, and every bundle already built
+  from it, unchanged.
+
+**Limitation.** The partition is one level. Substitution between groups of the same
+category, for example across product types, is not represented. A nested tree would
+restore it ([NESTED_SUBSTITUTION_GROUPS.md](NESTED_SUBSTITUTION_GROUPS.md)).

@@ -95,7 +95,7 @@ Example: `configs/datasets/erim_availability.json`.
 | `model_price_sources` | canonical price sources allowed to price the model | `["retail_aggregate"]` |
 | `availability.rule` | `disabled` (declared catalogue) or `retail_first_sale` | `disabled` |
 | `availability.left_censor_periods` | first sales this close to the feed start count from the start | 13 |
-| `affinity.partition` | `affinity` (co-purchase groups), `category` (merchandise categories) or `catalogue_hierarchy` (finest declared catalogue level meeting fixed floors; §4) | `affinity` |
+| `affinity.partition` | `affinity` (co-purchase groups), `category` (merchandise categories), `finest_catalogue_level` (finest declared catalogue level, no floors) or `catalogue_hierarchy` (finest declared level meeting fixed floors); see §4 | `affinity` |
 | `affinity.minimum_pair_count`, `affinity.maximum_group_size` | `affinity` only: co-purchase partition settings; keep the group cap well below the catalogue size | 8, 128 |
 | `affinity.minimum_group_products`, `affinity.minimum_group_training_lines` | `catalogue_hierarchy` only: floors a declared subcategory must meet to form its own group | 3, 300 |
 | `product_metadata` | optional parquet keyed by `product_id` adding declared catalogue columns (`subcategory`, `brand`, `manufacturer`, `department`) without changing the canonical directory | none |
@@ -127,12 +127,13 @@ Verification:
 ## 4. Choosing the partition
 
 The partition is an **input** to the frozen model. It changes which products share a
-penalty, never the model's form. There are three options:
+penalty, never the model's form. There are four options:
 
 | Option | Groups | Settings | Use when | Measured |
 |---|---|---|---|---|
 | `affinity` (default) | products frequently bought together, one large residual group | `minimum_pair_count`, `maximum_group_size` | there is no usable catalogue, or categories are too large for the exact program | cannot represent substitution. Synthetic pair correlation 0.09; ERIM −0.029 nats per basket against `category` |
 | `category` | one group per merchandise category | none | categories hold competing products (typical branded grocery) | synthetic correlation 0.95; **ERIM standard** (+0.029 over `affinity`, significant MRR gain) |
+| `finest_catalogue_level` | each product's finest declared level: one group per (category, subcategory) path; products without a subcategory form their category's remainder group | none | the catalogue's finest level is trusted as the substitute unit (for example Dunnhumby sub-commodities) | equals `category` for ERIM and the synthetic world (no subcategories). Dunnhumby: 802 groups in 187 commodities, 244 singletons |
 | `catalogue_hierarchy` | category × declared subcategory meeting floors; the rest pooled per category | `minimum_group_products`, `minimum_group_training_lines`, optional `product_metadata` | subcategories are distinct substitute sets that do **not** substitute across each other | equals `category` without subcategories; ERIM category × type tied with `category` (−0.001) because types there also substitute weakly across each other |
 
 The ERIM `affinity` figure is from the availability refit against the category refit on
@@ -145,6 +146,35 @@ world, the category partition raised the pairwise-effect correlation with the tr
 0.09 to 0.95. It also turned an over-valued, loss-making promotion policy into a
 correctly ranked, conservative one. See
 [SYNTHETIC_CAPABILITY_VALIDATION.md](SYNTHETIC_CAPABILITY_VALIDATION.md).
+
+### Catalogue partitions and the partition check
+
+`category`, `finest_catalogue_level` and `catalogue_hierarchy` share one implementation
+(`scripts/version4/catalogue_partition.py`).
+
+**Group key.** Groups are keyed by the **full path** (category, subcategory), never by a
+subcategory label alone. Dunnhumby reuses 39 sub-commodity labels under different
+commodities, and a label-only key would merge unrelated products.
+
+**Partition check.** Every grouping is validated before it is written:
+- every product has exactly one group;
+- group ids are contiguous;
+- every group lies inside exactly one category.
+
+**Diagnostics.** The check records singleton groups, reused labels, and categories filed
+under more than one department. Departments are reported, not used: Dunnhumby has 5 such
+commodities, for example apples filed under travel & leisure.
+
+**Singletons.** A single-product group has no pairs, so its penalty is inert.
+
+**Other bundles.** Bundles not built by `prepare_model_bundle.py`, such as the Dunnhumby
+route, can use the same rules without replacing an existing partition:
+
+```bash
+cd scripts/version4
+python build_catalogue_partition.py --basket-input ../../basket_input \
+    --rule finest_catalogue_level --output-dir <new bundle>/basket_input   # or --validate-only
+```
 
 ### Catalogue hierarchy (`catalogue_hierarchy`)
 

@@ -194,3 +194,17 @@ def test_product_metadata_adds_declared_columns_and_validates(tmp_path):
         bad.to_parquet(path)
         with pytest.raises(ValueError, match=message):
             CanonicalBasketModelInputBuilder._apply_product_metadata(products, path)
+
+
+def test_finest_catalogue_level_config_takes_no_floors(tmp_path):
+    module = load_prepare_module("prepare_bundle_finest")
+    config = json.loads((ROOT / "configs" / "datasets" / "erim_availability_category.json").read_text())
+    config["affinity"] = {"partition": "finest_catalogue_level"}
+    path = tmp_path / "config.json"
+    path.write_text(json.dumps(config))
+    module.load_config(path)
+    config["affinity"]["minimum_group_products"] = 3
+    path.write_text(json.dumps(config))
+    with pytest.raises(SystemExit, match="do not apply"):
+        module.load_config(path)
+

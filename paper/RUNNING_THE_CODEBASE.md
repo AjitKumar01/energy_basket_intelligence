@@ -336,6 +336,33 @@ ENERGY_MODEL_DATA_ROOT=<bundle> python basket_counterfactual_query.py \
     --checkpoint <run>/artifacts/candidate_rank1.pt --query <query.json> --output <out.json>
 ```
 
+The query file names one historical trip, the price action, the baskets to compare and any
+events to score:
+
+```json
+{
+  "name": "soya_to_dairy_with_bread",
+  "trip": 172657,
+  "action": {"item_id": 4112, "price_multiplier": 1.15},
+  "candidate_baskets": [
+    {"name": "soya_milk_and_bread", "items": [4112, 62]},
+    {"name": "dairy_milk_and_bread", "items": [2976, 62]}
+  ],
+  "events": [
+    {"name": "soya_with_bread_given_bread",
+     "any_item_groups": [[2951, 4112, 5114, 4649]],
+     "condition": {"any_item_groups": [[955, 1932, 62]]}}
+  ],
+  "exact_rest_additions": [{"name": "add_dairy", "rest_items": [2976]}]
+}
+```
+
+`item_id` values are model indices, not product codes. Candidate-basket odds and exact
+add/drop probabilities are exact; event probabilities use annealed SMC and **fail closed**
+when effective sample size is low. Two frozen worked examples live in
+`artifacts/retail_counterfactual_queries_20260914/`, and
+`scripts/run_retail_counterfactual_examples.py` runs both.
+
 ## 10. Adding a new dataset
 
 1. **Write an adapter** that produces the canonical directory: `transactions.parquet`,
@@ -368,7 +395,30 @@ ENERGY_MODEL_DATA_ROOT=<bundle> python basket_counterfactual_query.py \
 | Memory pressure in full-population stages | lower `--threads`, close other work, or run the smoke profile to verify the path first. |
 | `pytest` import errors when running a script directly | run from the repository root, or rely on `pytest.ini`'s path setup. |
 
-## 12. Conventions worth knowing
+## 12. What has been verified, and what has not
+
+Executed on 2026-09-18 on macOS 26.5 (Apple Silicon, Python 3.13.4):
+
+| Step | Status |
+|---|---|
+| Install and `pytest -q` | 258 tests pass in about 35 s |
+| §4.1 quick check (generate, bundle, smoke pipeline) | exit 0 in about 30 s |
+| §4.2 synthetic full run (generate, bundle, full pipeline) | exit 0; every stage and audit, 21 reports |
+| §5 step 2, ERIM canonical build from the local archives | exit 0 in 68 s; reproduces every canonical data file byte for byte |
+| §5 steps 4 and 5b, ERIM bundle and 4-stage route | run repeatedly today; all four stages exit 0 |
+| §8 serving over a real HTTP server | `uvicorn` starts, `/ready` and `/v1/capabilities` answer, and the price endpoint refuses with HTTP 403 on ERIM as designed |
+| §8 completion audit, smoke and benchmark scripts | run for the ERIM and synthetic checkpoints |
+| §6 Dunnhumby `--from-raw --dry-run` | exit 0; prints the full command graph |
+
+Not executed here, so treat as unverified:
+
+- **§5 step 1, the ERIM download.** The archives were already on this machine; the fetch
+  script itself was not re-run.
+- **§6 Dunnhumby fitting** (`--profile smoke` or `full`). Only the dry run was checked. The
+  README records a clean-clone smoke run from 2026-09-01.
+- **§9 offline counterfactual queries** against a Dunnhumby checkpoint.
+
+## 13. Conventions worth knowing
 
 - **The model is frozen.** Product groupings are inputs; changing the model's form (for
   example nested groups) is a separate decision. See

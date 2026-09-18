@@ -64,7 +64,7 @@ scripts import `data`, `features`, `ragged` and friends directly.
 
 | Dataset | What it is | Data needed | Fit time (full pipeline) |
 |---|---|---|---|
-| **Synthetic** | generated world with known truth; the only dataset where answers can be scored against truth | none: generate it | about 8 min |
+| **Synthetic** | generated world with known truth; the only dataset where answers can be scored against truth | none: generate it | about 8 min, or a few minutes for the §4.1 check |
 | **ERIM** | 8 tracked grocery categories, 464 products, 3,862 households, public archives | download, about 600 MB | about 8–11 min, plus a 4-stage price route of about 50 min |
 | **Dunnhumby** | The Complete Journey, 5,455 products | licensed CSVs you supply | about 45 min |
 
@@ -72,10 +72,39 @@ Start with the synthetic world: it needs no downloads and exercises every capabi
 
 ---
 
-## 4. Synthetic world, end to end
+## 4. Synthetic world
+
+### 4.1 Quick check that this machine works (a few minutes)
+
+Do this first on a new machine. It exercises the whole path — generation, contract
+validation, bundle build, the native extension, every fitting stage and the audits — on a
+small world in a scratch directory, without touching anything else.
 
 ```bash
-# 1. generate the world (canonical format + truth.npz), about 2 min
+python -u scripts/synthetic/generate_canonical_world.py --output data/_check/world \
+    --households 600 --weeks 30 --train-weeks 20 --validation-weeks 5
+python -c "import json; c=json.load(open('configs/datasets/synthetic_capability_world_category.json')); \
+c['canonical_dir']='data/_check/world/canonical'; c['model_data_root']='data/_check/world/model_input_category'; \
+json.dump(c, open('data/_check/config.json','w'), indent=2)"
+python -u scripts/prepare_model_bundle.py --dataset-config data/_check/config.json
+python -u scripts/run_pipeline.py --model-data-root data/_check/world/model_input_category \
+    --run-dir data/_check/run --profile smoke --threads 4
+rm -rf data/_check        # nothing here is needed afterwards
+```
+
+A zero exit means the software path works on this machine: it ends with
+`smoke integration completed; ... this is not a certified fit`. Smoke models are deliberately
+undertrained, so their numbers are not results and their statistical gates may fail.
+
+**Do not shrink the world further.** With very few products or weeks the price-evidence
+stage stops with `no products have eligible training price events`, because there are not
+enough price movements to measure. The sizes above are the smallest that were verified to
+work.
+
+### 4.2 The real run, end to end
+
+```bash
+# 1. generate the world (canonical format + truth.npz), under a minute
 python -u scripts/synthetic/generate_canonical_world.py \
     --output data/synthetic_capability_world
 
@@ -98,6 +127,10 @@ python -u scripts/synthetic/evaluate_capabilities.py \
 Step 4 also writes `capability_verdicts.json` next to the checkpoint, which is what lets the
 API serve price scenarios for this deployment (§8).
 
+**Verified on 2026-09-18**, both paths from scratch in a scratch directory: §4.1 completes
+in about 30 s end to end, and §4.2 steps 1–3 ran generation (27 s), a bundle build that
+passed the contract with 8 category groups, and a full pipeline through every audit.
+
 Generator options: `--households --stores --products-per-category --weeks --train-weeks
 --validation-weeks --visit-probability --nmax --seed`. Changing any of them changes the
 truth, so regenerate the bundle and refit.
@@ -118,7 +151,7 @@ python -u scripts/build_erim_product_types.py
 python -u scripts/prepare_model_bundle.py \
     --dataset-config configs/datasets/erim_availability_category.json
 
-# 5a. quick route: fit and audit only, about 9 min
+# 5a. fit and audit only, about 9 min (add --profile smoke to just test the path)
 python -u scripts/run_pipeline.py \
     --model-data-root data/erim_basket/model_input_availability_category \
     --run-dir artifacts/erim_category_refit/full --profile full --threads 4
@@ -149,7 +182,7 @@ the repository root (`basket_input/`, `data/`).
 export NF_RAW_DIR="/absolute/path/to/dunnhumby_The-Complete-Journey CSV/"   # optional if the
 # CSVs sit in dunnhumby_The-Complete-Journey/dunnhumby_The-Complete-Journey CSV/
 python scripts/run_pipeline.py --from-raw --dry-run        # command graph, no compute
-python scripts/run_pipeline.py --from-raw --profile smoke  # software path, undertrained
+python scripts/run_pipeline.py --from-raw --profile smoke  # the quick check for this dataset
 python scripts/run_pipeline.py --from-raw --profile full 2>&1 | tee artifacts/pipeline.log
 ```
 

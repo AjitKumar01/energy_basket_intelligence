@@ -118,7 +118,7 @@ def test_particle_estimators_must_match_external_reference_not_only_each_other()
     assert not replicate_fidelity(mutually_agreeing, 0.0, spec)["passed"]
 
 
-def test_parent_incidence_gradient_keeps_context_normalizers_independent():
+def test_parent_incidence_gradient_keeps_context_normalizers_independent(native_dp):
     model, ix, membership, _ = make_world(
         seed=92317, products=7, contexts=3, nmax=4, strength=0)
     item = 0
@@ -181,7 +181,7 @@ def test_initialization_support_defaults_to_training_maximum():
     assert resolve_basket_support(data, np.asarray([0, 1, 2]), 12, 120) == (12, 12)
 
 
-def test_selected_item_rao_blackwell_matches_full_statistics():
+def test_selected_item_rao_blackwell_matches_full_statistics(native_dp):
     model, ix, _membership, _ = make_world(
         seed=93217, products=7, contexts=3, nmax=4, strength=.7)
     bank = direct_interaction_particles(
@@ -200,7 +200,7 @@ def test_selected_item_rao_blackwell_matches_full_statistics():
                           atol=1e-12, rtol=1e-12)
 
 
-def test_grouped_repeated_reverse_sampler_matches_exact_base_incidence():
+def test_grouped_repeated_reverse_sampler_matches_exact_base_incidence(native_dp):
     model, ix, membership, _ = make_world(
         seed=94217, products=7, contexts=2, nmax=4, strength=0)
     draws = 20_000

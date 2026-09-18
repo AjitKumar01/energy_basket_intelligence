@@ -91,7 +91,7 @@ def test_weighted_joint_and_conditional_events_match_enumeration_under_price_act
     assert np.isfinite(counterfactual["condition_ess"])
 
 
-def test_forced_cart_completion_score_and_smc_match_exact_conditional_law():
+def test_forced_cart_completion_score_and_smc_match_exact_conditional_law(native_dp):
     model, ix, membership, baskets = make_world(
         seed=75301, products=7, contexts=2, nmax=4, strength=.8)
     energy = exact_energy(model, ix, membership)

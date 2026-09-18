@@ -51,8 +51,18 @@ python -m venv .venv
 source .venv/bin/activate
 python -m pip install --upgrade pip
 python -m pip install -r requirements.txt
-pytest -q                                    # 258 tests, about 35 s, no data needed
+
+# build the exact dynamic program (a C++ extension); about 6 s
+python scripts/version4/setup_poly_degree_native.py build_ext \
+    --build-lib artifacts/native/lib --build-temp artifacts/native/temp
+
+pytest -q      # 257 pass, 1 skips (it needs a frozen verification artifact), about 35 s
 ```
+
+The extension lives in git-ignored `artifacts/native/`, so a fresh clone does not have it.
+Any pipeline run builds it automatically; building it up front lets the tests exercise the
+exact dynamic program. Without it, `pytest -q` still passes but skips 11 tests with the
+build command in the skip message. No data is needed for the tests either way.
 
 Pinned versions are the certification environment. PyTorch C++ extensions are ABI-specific,
 so changing a pin requires a fresh smoke run.
@@ -391,6 +401,7 @@ when effective sample size is low. Two frozen worked examples live in
 | `this deployment does not claim causal_price_optimization` (HTTP 403) | no verdict file, or it does not claim that capability. See §8. |
 | `products are not offered in this store and week` | the price scenario named a product outside that context's assortment. |
 | `zsh: no matches found: …*.log` | zsh does not expand a glob with no matches. Quote it or use `setopt NULL_GLOB`. |
+| `ImportError: build the extension via scripts/run_pipeline.py, or run …` | the compiled dynamic program is missing. Run the build command in §2; any pipeline run also builds it. |
 | Native extension build failure | install the compiler toolchain; the pipeline builds `setup_poly_degree_native.py` on every run. |
 | Memory pressure in full-population stages | lower `--threads`, close other work, or run the smoke profile to verify the path first. |
 | `pytest` import errors when running a script directly | run from the repository root, or rely on `pytest.ini`'s path setup. |
@@ -401,7 +412,8 @@ Executed on 2026-09-18 on macOS 26.5 (Apple Silicon, Python 3.13.4):
 
 | Step | Status |
 |---|---|
-| Install and `pytest -q` | 258 tests pass in about 35 s |
+| Fresh clone, `pytest -q` with no extension built | 247 pass, 11 skip, no failures |
+| Fresh clone, extension built (6 s) then `pytest -q` | 257 pass, 1 skip, about 35 s |
 | §4.1 quick check (generate, bundle, smoke pipeline) | exit 0 in about 30 s |
 | §4.2 synthetic full run (generate, bundle, full pipeline) | exit 0; every stage and audit, 21 reports |
 | §5 step 2, ERIM canonical build from the local archives | exit 0 in 68 s; reproduces every canonical data file byte for byte |

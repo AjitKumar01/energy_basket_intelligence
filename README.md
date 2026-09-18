@@ -218,8 +218,13 @@ python -m venv .venv
 source .venv/bin/activate
 python -m pip install --upgrade pip
 python -m pip install -r requirements.txt
+python scripts/version4/setup_poly_degree_native.py build_ext \
+    --build-lib artifacts/native/lib --build-temp artifacts/native/temp
 pytest -q
 ```
+
+The extension build is optional for the test suite: without it `pytest -q` skips the tests
+that exercise the native dynamic program, and every pipeline run builds it anyway.
 
 ## Data
 

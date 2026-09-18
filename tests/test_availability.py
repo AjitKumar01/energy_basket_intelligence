@@ -92,7 +92,7 @@ def test_log_availability_lookup():
                        torch.zeros(5, dtype=torch.float64))
 
 
-def test_availability_offset_enters_energy_and_normalizer_exactly():
+def test_availability_offset_enters_energy_and_normalizer_exactly(native_dp):
     model, ix, membership, _ = make_world(
         seed=411, products=7, contexts=3, nmax=4, strength=0.0, kappa=1.0)
     without = model.b_flat(ix).detach().clone()

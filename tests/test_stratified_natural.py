@@ -233,7 +233,7 @@ def _toy_model_and_index():
     return model, index
 
 
-def test_fixed_size_and_stratified_reverse_samplers_respect_declared_sizes():
+def test_fixed_size_and_stratified_reverse_samplers_respect_declared_sizes(native_dp):
     model, index = _toy_model_and_index()
     generator = torch.Generator().manual_seed(201)
     z = torch.zeros(1, model.Kz, dtype=torch.float64)
@@ -254,7 +254,7 @@ def test_fixed_size_and_stratified_reverse_samplers_respect_declared_sizes():
                       atol=1e-12)
 
 
-def test_stratified_ratio_matches_exact_enumeration_in_expectation():
+def test_stratified_ratio_matches_exact_enumeration_in_expectation(native_dp):
     """Audit the complete sampling identity, including within-size composition."""
     model, index = _toy_model_and_index()
     baskets = [basket for n in range(1, 5)

@@ -53,7 +53,7 @@ def test_split_price_jacobian_preserves_uniform_price_direction():
         assert torch.allclose(price_jacobian(g, kappa) @ torch.ones(3), -g)
 
 
-def test_direct_current_price_joint_normalizer_matches_enumeration():
+def test_direct_current_price_joint_normalizer_matches_enumeration(native_dp):
     """The SHOPPER-style term must enter numerator and every denominator basket."""
     model, ix, membership, _ = make_world(
         seed=319, products=7, contexts=3, nmax=4, strength=0.0, kappa=1.0)

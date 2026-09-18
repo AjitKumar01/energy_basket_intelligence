@@ -179,6 +179,9 @@ retained as historical evidence rather than current checkpoint comparisons.
 
 ## Requirements
 
+New machine? [`paper/RUNNING_THE_CODEBASE.md`](paper/RUNNING_THE_CODEBASE.md) is the
+step-by-step manual for all three datasets, the API and the audits.
+
 - Python 3.11 or newer
 - macOS or Linux (Windows users should use WSL)
 - a C++ compiler compatible with the active Python installation

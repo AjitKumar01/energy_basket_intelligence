@@ -3,10 +3,11 @@ import itertools
 import math
 
 import numpy as np
+import pytest
 import torch
 
-from joint_refinement import (SlotBaskets, baskets_from_items, basket_energy, damped_round,
-                              draw_bank, orthonormal_basis, slot_table)
+from joint_refinement import (SlotBaskets, bank_design, baskets_from_items, basket_energy, damped_round,
+                              design_energy, draw_bank, orthonormal_basis, slot_table, taste_utility)
 from ragged import RaggedIndex, RaggedModel
 
 torch.set_default_dtype(torch.float64)
@@ -201,17 +202,22 @@ def test_numpy_reference_bank_draws_the_phi_nonzero_law(native_dp):
     assert tv < 1.5 * floor + 0.005
 
 
-def test_compiled_conditional_draws_match_the_exact_law_at_fixed_z(native_dp):
-    """S | z at a fixed nonzero z: compiled draws against enumeration of the conditional law."""
+@pytest.mark.parametrize("parallel,trips", [(False, 1), (True, 1), (True, 8)])
+def test_compiled_conditional_draws_match_the_exact_law_at_fixed_z(native_dp, parallel, trips):
+    """S | z at a fixed nonzero z: compiled draws (serial and trip-parallel kernels) against
+    enumeration of the conditional law, pooled over identical trips."""
     from compiled_backtrack import compiled_draws
     from tempered_block_gibbs import conditional_log_tables_levels
     model = toy_model()
-    model.house = torch.zeros(1, dtype=torch.long)
-    index = replicated_index(1)
-    z = torch.tensor([[0.7, -0.4]])
+    model.house = torch.zeros(trips, dtype=torch.long)
+    index = replicated_index(trips)
+    z = torch.tensor([[0.7, -0.4]]).repeat(trips, 1)
     log_g, centred, log_size = conditional_log_tables_levels(model, index, z.unsqueeze(0), [1.0])
     draws = 40000
-    slots, basket = compiled_draws(log_g, centred, log_size, index, draws, torch.Generator().manual_seed(3))
+    slots, basket = compiled_draws(log_g, centred, log_size, index, draws // trips,
+                                   torch.Generator().manual_seed(3), parallel=parallel)
+    slots = slots - (slots // J) * J        # slot position within its (identical) trip
+    index = replicated_index(1)
     lam = model.lam.detach().numpy()
     phi = model.phi.detach().numpy()
     rho0 = model.rho_0().detach().numpy()
@@ -235,3 +241,50 @@ def test_compiled_conditional_draws_match_the_exact_law_at_fixed_z(native_dp):
                                               minlength=len(BASKETS)) / draws - probability).sum()
                      for _ in range(20)])
     assert tv < 1.5 * floor + 0.005
+
+
+def test_design_energy_matches_basket_energy_in_value_and_gradient(native_dp):
+    for size_rank1 in (False, True):
+        model = toy_model()
+        model.household_size_rank1 = size_rank1
+        g = torch.Generator().manual_seed(5)
+        contexts = 7
+        with torch.no_grad():
+            model.theta = torch.nn.Parameter(torch.randn(3, model.alpha.shape[1], generator=g))
+            model.alpha.copy_(torch.randn(model.alpha.shape, generator=g))
+        model.house = torch.tensor([0, 1, 2, 0, 1, 2, 1])
+        ix = replicated_index(contexts)
+        table = slot_table(ix, J)
+        items = [list(BASKETS[i]) for i in torch.randint(len(BASKETS), (40,), generator=g).tolist()]
+        baskets = baskets_from_items(table, [k % contexts for k in range(40)], items)
+        U, C = orthonormal_basis(model.phi.detach(), 2)
+        C = C + 0.3 * torch.tensor([[0.0, 1.0], [1.0, 0.0]])
+        frozen = (model.b_flat(ix) - taste_utility(model, ix)).detach() + torch.randn(ix.item.numel(), generator=g)
+        design = bank_design(model, ix, baskets, U, frozen)
+        params = [model.lam, model.alpha, model.theta, model.rho_c, model.rho_0_free]
+        weights = torch.randn(40, generator=g)
+
+        reference = basket_energy(model, ix, baskets, U, C, frozen + taste_utility(model, ix))
+        grads_ref = torch.autograd.grad((weights * reference).sum(), params)
+        fast = design_energy(model, design, C)
+        grads_fast = torch.autograd.grad((weights * fast).sum(), params)
+        assert torch.allclose(fast, reference, atol=1e-10)
+        for a, b in zip(grads_fast, grads_ref):
+            assert torch.allclose(a, b, atol=1e-10)
+
+
+def test_parallel_compiled_draws_do_not_depend_on_the_thread_count(native_dp):
+    import numba
+    from compiled_backtrack import compiled_draws
+    from tempered_block_gibbs import conditional_log_tables_levels
+    model = toy_model()
+    model.house = torch.zeros(16, dtype=torch.long)
+    index = replicated_index(16)
+    z = torch.randn(16, 2, generator=torch.Generator().manual_seed(8))
+    tables = conditional_log_tables_levels(model, index, z.unsqueeze(0), [1.0])
+    results = []
+    for threads in (1, numba.config.NUMBA_NUM_THREADS):
+        numba.set_num_threads(threads)
+        results.append(compiled_draws(*tables, index, 50, torch.Generator().manual_seed(9), parallel=True))
+    numba.set_num_threads(numba.config.NUMBA_NUM_THREADS)
+    assert torch.equal(results[0][0], results[1][0]) and torch.equal(results[0][1], results[1][1])

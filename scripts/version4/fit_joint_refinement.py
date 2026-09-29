@@ -65,7 +65,7 @@ def observed_items_of(data, trips):
 
 
 def draw_all(model, batcher, trips, table, chains, draws_per_chain, burn, batch, generator, full,
-             observed_items=None, baskets_per_z=1):
+             observed_items=None, baskets_per_z=1, parallel=True):
     """Bank for every context, drawn in batches of contexts (each repeated once per chain).
 
     Chains start at z ~ N(sum of phi over the context's observed basket, I) when observed_items is
@@ -80,7 +80,7 @@ def draw_all(model, batcher, trips, table, chains, draws_per_chain, burn, batch,
         base = np.repeat(np.arange(c0, c1), chains)
         warm = None if observed_items is None else [observed_items[c] for c in base]
         part = draw_bank_fast(model, ix_rep, base, table, draws_per_chain, burn, generator,
-                              init_items=warm, baskets_per_z=baskets_per_z)
+                              init_items=warm, baskets_per_z=baskets_per_z, parallel=parallel)
         slots.append(part.slots); basket.append(part.basket + offset); context.append(part.context)
         offset += part.n
     model.house, model.ctx = full
@@ -108,6 +108,11 @@ def main():
     p.add_argument("--cap", type=float, default=1.0, help="Phi contract: C <= cap * I")
     p.add_argument("--validation-trips", type=int, default=1024)
     p.add_argument("--level-offset", type=int, default=2, help="evaluation level = rank + offset")
+    p.add_argument("--node-trips", type=int, default=141_440,
+                   help="quadrature nodes x trips per validation batch (128 trips at rank 8, level 11)")
+    p.add_argument("--serial-sampler", action="store_true", help="single-threaded compiled backtrack")
+    p.add_argument("--train-probe", type=int, default=0,
+                   help="also score the exact likelihood on this many training contexts every round")
     p.add_argument("--mixing-check", action="store_true")
     p.add_argument("--seed", type=int, default=41001)
     p.add_argument("--threads", type=int, default=8)
@@ -151,7 +156,8 @@ def main():
         banks = [draw_all(model, batcher, trips[sample], slot_table(batcher.make(trips[sample])[0], J),
                           args.chains, args.draws_per_chain, args.burn, args.batch_contexts,
                           torch.Generator().manual_seed(args.seed + k), full,
-                          [observed_items[i] for i in sample], args.baskets_per_z) for k in range(4)]
+                          [observed_items[i] for i in sample], args.baskets_per_z, not args.serial_sampler)
+                 for k in range(4)]
         bank_seconds = (time.time() - t0) / 4
         sub_ix = batcher.make(trips[sample])[0]
         sizes = [torch.bincount(b.basket, minlength=b.n).double().mean().item() for b in banks]
@@ -178,12 +184,17 @@ def main():
     valid = np.sort(valid_all[rng.permutation(len(valid_all))[:args.validation_trips]])
     valid_households = np.asarray(data["trip_user"])[valid]
 
-    def validation(level):
-        install_quadrature(model, smolyak_rule(model, rank, level))
+    probe = np.sort(trips[rng.permutation(len(trips))[:args.train_probe]]) if args.train_probe else None
+
+    def validation(level, subset=None):
+        subset = valid if subset is None else subset
+        rule = smolyak_rule(model, rank, level)
+        install_quadrature(model, rule)
+        batch = max(4, min(128, args.node_trips // len(rule[1])))   # bound nodes x trips per batch
         out = []
         with torch.no_grad():
-            for s in range(0, len(valid), 128):
-                vix, vctx, vline, vhouse, li, lt, lc, _lq = batcher.make(valid[s:s + 128])
+            for s in range(0, len(subset), batch):
+                vix, vctx, vline, vhouse, li, lt, lc, _lq = batcher.make(subset[s:s + batch])
                 model.house, model.ctx = vhouse, vctx
                 out.append(model.energy(li, lt, lc, vix.B, vline) - model.log_Z(vix, drop_empty=True))
         model.house, model.ctx = full
@@ -192,6 +203,7 @@ def main():
 
     level = rank + args.level_offset
     start_valid = validation(level)
+    start_probe = validation(level, probe) if probe is not None else None
     best_valid, best_round, best_state = start_valid, 0, None
     U, C = orthonormal_basis(model.phi.detach(), rank)
     capacities = category_capacities(data, int(data["n_cat"]), nmax)
@@ -201,32 +213,46 @@ def main():
         return q05 >= args.ess_q05 and med >= args.ess_median, {"q05": round(q05, 3), "median": round(med, 3)}
 
     rounds = []
+    ladder = list(args.trust_ladder)          # later rounds start one level below the last accepted trust
     print(f"[joint-refinement] staged start: validation {start_valid.mean():.5f} at level {level} "
           f"({time.time() - started:.0f}s)", flush=True)
     for rnd in range(1, args.rounds + 1):
         t0 = time.time()
         bank = draw_all(model, batcher, trips, table, args.chains, args.draws_per_chain, args.burn,
-                        args.batch_contexts, generator, full, observed_items, args.baskets_per_z)
+                        args.batch_contexts, generator, full, observed_items, args.baskets_per_z,
+                        not args.serial_sampler)
         draw_seconds = time.time() - t0
-        ok, record = damped_round(model, ix, observed, bank, draws, U, C, rank, args.trust_ladder, ess_rule,
+        t1 = time.time()
+        ok, record = damped_round(model, ix, observed, bank, draws, U, C, rank, ladder, ess_rule,
                                   args.cycles, args.pool_prod, args.cap,
                                   log=lambda m: print(m, flush=True))
+        if ok:
+            ladder = [t for t in args.trust_ladder if t >= record["trust"] / 10] or list(args.trust_ladder)
         if not ok:
             rounds.append({"round": rnd, **record})
             print(f"[joint-refinement] round {rnd}: {record['status']}; stopping", flush=True)
             break
+        solve_seconds = time.time() - t1
         C = set_phi_from(model, U, record["C"], rank, args.cap)
         model.project_rho_c(-1.5)
         project_category_reward_(model, capacities, 1.5)
         model.project_context_gauges()
+        t2 = time.time()
         v = validation(level)
         entry = {"round": rnd, "trust": record["trust"], "bank_gain": record["bank_gain"], "ess": record["ess"],
-                 "validation": float(v.mean()), "draw_seconds": draw_seconds,
+                 "validation": float(v.mean()), "draw_seconds": draw_seconds, "solve_seconds": solve_seconds,
+                 "trust_seconds": record["trust_seconds"], "validation_seconds": time.time() - t2,
                  "round_seconds": time.time() - t0}
+        if probe is not None:
+            entry["train_exact_gain"] = float(validation(level, probe).mean() - start_probe.mean())
+            print(f"[joint-refinement] round {rnd}: exact training gain on {len(probe)} training contexts "
+                  f"{entry['train_exact_gain']:+.5f} (bank claimed {record['bank_gain']:+.5f} this round)", flush=True)
         rounds.append(entry)
         print(f"[joint-refinement] round {rnd}: validation {v.mean():.5f} "
               f"(gain vs staged {v.mean() - start_valid.mean():+.5f}), bank gain {record['bank_gain']:+.5f}, "
-              f"trust {record['trust']:g}, ESS {record['ess']}, {entry['round_seconds']:.0f}s", flush=True)
+              f"trust {record['trust']:g}, ESS {record['ess']}, bank {draw_seconds:.0f}s"
+              f", solve {solve_seconds:.0f}s, validation {entry['validation_seconds']:.0f}s, "
+              f"{entry['round_seconds']:.0f}s", flush=True)
         if v.mean() > best_valid.mean() + 1e-5:
             best_valid, best_round = v, rnd
             best_state = {k: t.detach().clone() for k, t in model.state_dict().items()}

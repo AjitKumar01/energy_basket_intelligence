@@ -24,6 +24,7 @@ fixed.  Acceptance is decided outside this module, on held-out likelihood.
 from __future__ import annotations
 
 import math
+import time
 from dataclasses import dataclass
 
 import numpy as np
@@ -119,6 +120,78 @@ def basket_energy(model, ix, baskets: SlotBaskets, basis=None, C=None, slot_b=No
     return linear + pair - penalty - model.rho_0()[size]
 
 
+@dataclass
+class BankDesign:
+    """Per-basket sufficient statistics of a fixed set of baskets for the refined terms of E(S).
+
+    With the frozen utility part and the Phi basis U held fixed, every refined term is linear in
+    these statistics (the taste term bilinear in alpha and theta), so an objective evaluation is a
+    few sparse products over N baskets instead of a gather over every basket member:
+
+      E(S) = frozen(S) + A_S lam + sum_k theta_h,k (A_S alpha)_k + 0.5 <G_S, C> - P_S rho_c - rho_0[|S|]
+
+    with A the basket-by-product incidence, G_S = s s' - sum_j u_j u_j' (s = sum_j u_j) stored as
+    its upper triangle (off-diagonals doubled), and P_S the capped category pair counts.
+    """
+    frozen: torch.Tensor      # [N]
+    incidence: torch.Tensor   # sparse [N, J]
+    household: torch.Tensor   # [N]
+    gram: torch.Tensor        # [N, r(r+1)/2]
+    pairs: torch.Tensor       # sparse [N, n_cat]
+    size: torch.Tensor        # [N]
+
+
+def _upper(rank: int):
+    iu = torch.triu_indices(rank, rank)
+    weight = torch.where(iu[0] == iu[1], 1.0, 2.0).to(torch.get_default_dtype())
+    return iu, weight
+
+
+@torch.no_grad()
+def bank_design(model, ix, baskets: SlotBaskets, basis: torch.Tensor, frozen_slot: torch.Tensor,
+                chunk: int = 1 << 20) -> BankDesign:
+    N, J = baskets.n, model.lam.numel()
+    dtype = frozen_slot.dtype
+    item = ix.item[baskets.slots]
+    frozen = torch.zeros(N, dtype=dtype).index_add(0, baskets.basket, frozen_slot[baskets.slots])
+    incidence = torch.sparse_coo_tensor(torch.stack([baskets.basket, item]),
+                                        torch.ones(item.numel(), dtype=dtype), (N, J)).coalesce()
+    iu, _ = _upper(basis.shape[1])
+    s = torch.zeros(N, basis.shape[1], dtype=dtype)
+    self_term = torch.zeros(N, iu.shape[1], dtype=dtype)
+    for a in range(0, item.numel(), chunk):
+        rows = basis[item[a:a + chunk]]
+        s.index_add_(0, baskets.basket[a:a + chunk], rows)
+        self_term.index_add_(0, baskets.basket[a:a + chunk], rows[:, iu[0]] * rows[:, iu[1]])
+    gram = s[:, iu[0]] * s[:, iu[1]] - self_term
+    category = ix.row_cat[ix.row_of[baskets.slots]]
+    key = baskets.basket * model.C + category
+    unique, counts = torch.unique(key, return_counts=True)
+    feature = model.pair_feature(counts.to(dtype))
+    keep = feature != 0
+    pairs = torch.sparse_coo_tensor(torch.stack([unique[keep] // model.C, unique[keep] % model.C]),
+                                    feature[keep], (N, model.C)).coalesce()
+    size = torch.bincount(baskets.basket, minlength=N)
+    return BankDesign(frozen, incidence, model.house[baskets.context], gram, pairs, size)
+
+
+def design_energy(model, design: BankDesign, C: torch.Tensor) -> torch.Tensor:
+    """basket_energy(model, ix, baskets, basis, C, frozen + taste_utility) from the design."""
+    A = design.incidence
+    theta = model.theta_c()[design.household]
+    if model.household_size_rank1:
+        alpha = model.alpha[:, :-1]
+        alpha = alpha - alpha.mean(0, keepdim=True).detach()
+        taste = theta[:, -1] * design.size.to(theta.dtype) + (torch.sparse.mm(A, alpha) * theta[:, :-1]).sum(-1)
+    else:
+        taste = (torch.sparse.mm(A, model.alpha) * theta).sum(-1)
+    linear = torch.sparse.mm(A, model.lam.unsqueeze(1)).squeeze(1)
+    iu, weight = _upper(C.shape[0])
+    pair = 0.5 * (design.gram @ (C[iu[0], iu[1]] * weight))
+    penalty = torch.sparse.mm(design.pairs, model.rho_c.unsqueeze(1)).squeeze(1)
+    return design.frozen + linear + taste + pair - penalty - model.rho_0()[design.size]
+
+
 # ---------------------------------------------------------------------------------------------
 # Bank: blocked Gibbs on (S, z) at beta = 1
 # ---------------------------------------------------------------------------------------------
@@ -159,7 +232,7 @@ def _flatten(state):
 @torch.no_grad()
 def draw_bank_fast(model, ix_rep, base_of_rep, table, draws_per_chain: int, burn: int,
                    generator: torch.Generator, init_items=None, baskets_per_z: int = 1,
-                   compiled: bool = True) -> SlotBaskets:
+                   compiled: bool = True, parallel: bool = True) -> SlotBaskets:
     """Same law as draw_bank, with Model A's vectorized exact S | z sampler.
 
     init_items: optional per-rep-trip item lists; the chain starts at z ~ N(sum phi over them, I)
@@ -184,7 +257,7 @@ def draw_bank_fast(model, ix_rep, base_of_rep, table, draws_per_chain: int, burn
             from compiled_backtrack import compiled_draws
             k = baskets_per_z if recording else 1
             log_g, centred, log_size = conditional_log_tables_levels(model, ix_rep, z.unsqueeze(0), [1.0])
-            slots, basket = compiled_draws(log_g, centred, log_size, ix_rep, k, generator)
+            slots, basket = compiled_draws(log_g, centred, log_size, ix_rep, k, generator, parallel)
             trip = basket % B
             if recording:
                 flat_slots.append(table[base_tensor[trip], ix_rep.item[slots]])
@@ -278,25 +351,28 @@ def damped_round(model, ix, observed: SlotBaskets, bank: SlotBaskets, draws: int
                  cap: float, log=print):
     """One round: parent = current model; returns (accepted, record)."""
     names = ("lam", "theta", "rho_c", "rho_0_free")
+    N = observed.n
     with torch.no_grad():
         frozen = model.b_flat(ix) - taste_utility(model, ix)
-        E_obs0 = basket_energy(model, ix, observed, U, C)
-        E_bank0 = basket_energy(model, ix, bank, U, C)
-    N = observed.n
+        obs_design = bank_design(model, ix, observed, U, frozen)
+        bank_design_ = bank_design(model, ix, bank, U, frozen)
+        E_obs0 = design_energy(model, obs_design, C)
+        E_bank0 = design_energy(model, bank_design_, C)
     start = {name: getattr(model, name).detach().clone() for name in names + ("alpha",)}
     C_start = C.detach().clone()
+    timings = []
 
     for lam_trust in trust_ladder:
+        t_level = time.time()
         with torch.no_grad():
             for name, value in start.items():
                 getattr(model, name).copy_(value)
         Cv = C_start.clone().requires_grad_(True)
 
         def objective():
-            slot_b = frozen + taste_utility(model, ix)
             Cs = (Cv + Cv.T) / 2
-            dE_obs = basket_energy(model, ix, observed, U, Cs, slot_b) - E_obs0
-            dE_bank = (basket_energy(model, ix, bank, U, Cs, slot_b) - E_bank0).view(N, draws)
+            dE_obs = design_energy(model, obs_design, Cs) - E_obs0
+            dE_bank = (design_energy(model, bank_design_, Cs) - E_bank0).view(N, draws)
             fit = (dE_obs.sum() - (torch.logsumexp(dE_bank, 1) - math.log(draws)).sum()) / N
             change = sum((getattr(model, k) - start[k]).square().sum() for k in start) \
                 + (Cv - C_start).square().sum()
@@ -317,17 +393,19 @@ def damped_round(model, ix, observed: SlotBaskets, bank: SlotBaskets, draws: int
                     p.requires_grad_(flag)
         with torch.no_grad():
             Cs = (Cv + Cv.T) / 2
-            dE_bank = (basket_energy(model, ix, bank, U, Cs) - E_bank0).view(N, draws)
-            dE_obs = basket_energy(model, ix, observed, U, Cs) - E_obs0
+            dE_bank = (design_energy(model, bank_design_, Cs) - E_bank0).view(N, draws)
+            dE_obs = design_energy(model, obs_design, Cs) - E_obs0
             ess = bank_statistics(dE_bank)
             gain = float((dE_obs.sum() - (torch.logsumexp(dE_bank, 1) - math.log(draws)).sum()) / N)
             finite = bool(torch.isfinite(dE_bank).all() and torch.isfinite(dE_obs).all())
         ok, summary = ess_rule(ess)
-        log(f"[joint-refinement]   trust {lam_trust:g}: bank gain {gain:+.5f}, ESS {summary}"
-            + ("" if finite else ", non-finite"))
+        timings.append({"trust": lam_trust, "seconds": round(time.time() - t_level, 2)})
+        log(f"[joint-refinement]   trust {lam_trust:g}: bank gain {gain:+.5f}, ESS {summary}, "
+            f"{timings[-1]['seconds']:.1f}s" + ("" if finite else ", non-finite"))
         if finite and ok:
-            return True, {"trust": lam_trust, "bank_gain": gain, "ess": summary, "C": Cs.detach()}
+            return True, {"trust": lam_trust, "bank_gain": gain, "ess": summary, "C": Cs.detach(),
+                          "trust_seconds": timings}
     with torch.no_grad():
         for name, value in start.items():
             getattr(model, name).copy_(value)
-    return False, {"status": "no trust level kept the bank valid"}
+    return False, {"status": "no trust level kept the bank valid", "trust_seconds": timings}

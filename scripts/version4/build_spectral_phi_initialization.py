@@ -84,7 +84,10 @@ def main():
         raise RuntimeError("spectral score initialization requires an exact Phi=0 parent")
     train = supported_trips(data, 0, int(meta["nmax"]))
     if args.trips > len(train):
-        raise ValueError("requested more score contexts than the training population")
+        # a smaller dataset: score every supported training trip instead of failing
+        print(f"[spectral-score] {args.trips} contexts requested, {len(train)} training trips "
+              f"available; using all of them", flush=True)
+        args.trips = len(train)
     rng = np.random.default_rng(args.seed)
     trips = train[rng.permutation(len(train))[:args.trips]]
     half_a = rng.random(args.trips) < 0.5

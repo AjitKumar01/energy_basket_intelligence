@@ -29,7 +29,7 @@ from dataclasses import dataclass
 import numpy as np
 import torch
 
-from tempered_block_gibbs import conditional_slots
+from tempered_block_gibbs import conditional_slots, conditional_slots_levels, conditional_slots_repeated
 
 
 # ---------------------------------------------------------------------------------------------
@@ -73,13 +73,30 @@ def baskets_from_items(table: torch.Tensor, contexts, item_lists) -> SlotBaskets
 # ---------------------------------------------------------------------------------------------
 # Energy
 # ---------------------------------------------------------------------------------------------
-def basket_energy(model, ix, baskets: SlotBaskets, basis=None, C=None) -> torch.Tensor:
-    """E(S) for every basket with Model A's utilities (model.b_flat) and penalties.
+def taste_utility(model, ix) -> torch.Tensor:
+    """The refined part of b_at at every slot: lam_j + theta_c[h]'alpha_j (Model A's formula).
+
+    b_flat = (frozen part: price, promotion, season, store, availability) + this term, so the
+    frozen part can be computed once per round and only this term re-evaluated.
+    """
+    hh = model.house[ix.item_trip]
+    it = ix.item
+    theta = model.theta_c()
+    if model.household_size_rank1:
+        alpha = model.alpha[:, :-1]
+        alpha = alpha - alpha.mean(0, keepdim=True).detach()
+        return model.lam[it] + theta[hh, -1] + (theta[hh, :-1] * alpha[it]).sum(-1)
+    return model.lam[it] + (theta[hh] * model.alpha[it]).sum(-1)
+
+
+def basket_energy(model, ix, baskets: SlotBaskets, basis=None, C=None, slot_b=None) -> torch.Tensor:
+    """E(S) for every basket with Model A's utilities and penalties.
 
     With (basis, C) the Gram energy is sum_{i<j} u_i'C u_j (linear in C); otherwise it is phi's.
+    slot_b, when given, replaces model.b_flat(ix).
     """
     N = baskets.n
-    b = model.b_flat(ix)
+    b = model.b_flat(ix) if slot_b is None else slot_b
     linear = torch.zeros(N, dtype=b.dtype).index_add(0, baskets.basket, b[baskets.slots])
     item = ix.item[baskets.slots]
     if basis is None:
@@ -129,6 +146,61 @@ def draw_bank(model, ix_rep, base_of_rep, table, draws_per_chain: int, burn: int
     contexts = np.asarray(contexts)[order]
     items = [items[i] for i in order]
     return baskets_from_items(table, contexts, items)
+
+
+def _flatten(state):
+    """List of per-trip slot tensors -> (slots, trip) flat arrays."""
+    lengths = torch.as_tensor([len(s) for s in state], dtype=torch.long)
+    slots = torch.cat([torch.as_tensor(s, dtype=torch.long) for s in state]) if len(state) else torch.zeros(0, dtype=torch.long)
+    return slots, torch.repeat_interleave(torch.arange(len(state)), lengths)
+
+
+@torch.no_grad()
+def draw_bank_fast(model, ix_rep, base_of_rep, table, draws_per_chain: int, burn: int,
+                   generator: torch.Generator, init_items=None, baskets_per_z: int = 1) -> SlotBaskets:
+    """Same law as draw_bank, with Model A's vectorized exact S | z sampler.
+
+    init_items: optional per-rep-trip item lists; the chain starts at z ~ N(sum phi over them, I)
+    (a warm start at an observed basket).  After burn-in, each z draw yields `baskets_per_z`
+    independent exact draws from S | z (each is marginally a draw from the basket law once z is
+    stationary; baskets sharing a z are correlated).
+    """
+    B, Kz = ix_rep.B, model.Kz
+    if init_items is not None:
+        v = torch.zeros(B, Kz, dtype=model.phi.dtype)
+        for trip, items in enumerate(init_items):
+            v[trip] = model.phi[torch.as_tensor(items, dtype=torch.long)].sum(0)
+        z = v + torch.randn(v.shape, generator=generator, dtype=v.dtype)
+    else:
+        z = torch.zeros(B, Kz, dtype=model.phi.dtype)
+    contexts, flat_slots, flat_basket = [], [], []
+    count = 0
+    for sweep in range(burn + draws_per_chain):
+        recording = sweep >= burn
+        if recording and baskets_per_z > 1:
+            draws = conditional_slots_repeated(model, ix_rep, z, 1.0, baskets_per_z, generator)
+            states = [[d[t] for t in range(B)] for d in draws]
+        else:
+            states = [conditional_slots_levels(model, ix_rep, z.unsqueeze(0), [1.0], generator)[0]]
+        last = None
+        for state in states:
+            slots, trip = _flatten(state)
+            last = (slots, trip)
+            if recording:
+                items = ix_rep.item[slots]
+                base_trip = torch.as_tensor(np.asarray(base_of_rep), dtype=torch.long)[trip]
+                flat_slots.append(table[base_trip, items])
+                flat_basket.append(trip + count)
+                contexts.append(np.asarray(base_of_rep))
+                count += B
+        slots, trip = last
+        v = torch.zeros(B, Kz, dtype=model.phi.dtype).index_add(0, trip, model.phi[ix_rep.item[slots]])
+        z = v + torch.randn(v.shape, generator=generator, dtype=v.dtype)
+    slots = torch.cat(flat_slots); basket = torch.cat(flat_basket)
+    context = torch.as_tensor(np.concatenate(contexts), dtype=torch.long)
+    order = torch.argsort(context, stable=True)              # context-major basket order
+    rank = torch.empty_like(order); rank[order] = torch.arange(order.numel())
+    return SlotBaskets(slots, rank[basket], context[order])
 
 
 # ---------------------------------------------------------------------------------------------
@@ -188,6 +260,7 @@ def damped_round(model, ix, observed: SlotBaskets, bank: SlotBaskets, draws: int
     """One round: parent = current model; returns (accepted, record)."""
     names = ("lam", "theta", "rho_c", "rho_0_free")
     with torch.no_grad():
+        frozen = model.b_flat(ix) - taste_utility(model, ix)
         E_obs0 = basket_energy(model, ix, observed, U, C)
         E_bank0 = basket_energy(model, ix, bank, U, C)
     N = observed.n
@@ -201,8 +274,10 @@ def damped_round(model, ix, observed: SlotBaskets, bank: SlotBaskets, draws: int
         Cv = C_start.clone().requires_grad_(True)
 
         def objective():
-            dE_obs = basket_energy(model, ix, observed, U, (Cv + Cv.T) / 2) - E_obs0
-            dE_bank = (basket_energy(model, ix, bank, U, (Cv + Cv.T) / 2) - E_bank0).view(N, draws)
+            slot_b = frozen + taste_utility(model, ix)
+            Cs = (Cv + Cv.T) / 2
+            dE_obs = basket_energy(model, ix, observed, U, Cs, slot_b) - E_obs0
+            dE_bank = (basket_energy(model, ix, bank, U, Cs, slot_b) - E_bank0).view(N, draws)
             fit = (dE_obs.sum() - (torch.logsumexp(dE_bank, 1) - math.log(draws)).sum()) / N
             change = sum((getattr(model, k) - start[k]).square().sum() for k in start) \
                 + (Cv - C_start).square().sum()

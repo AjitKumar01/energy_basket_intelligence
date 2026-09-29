@@ -150,3 +150,28 @@ def test_one_damped_round_raises_the_exact_likelihood(native_dp):
     assert ok
     after = exact_loglik(model)
     assert after > before + 0.01
+
+
+def test_fast_warm_started_bank_draws_the_phi_nonzero_law(native_dp):
+    """The vectorized sampler with observed-basket warm starts and several baskets per z."""
+    from joint_refinement import draw_bank_fast
+    model = toy_model()
+    chains = 4000
+    ix_rep = replicated_index(chains)
+    model.house = torch.zeros(chains, dtype=torch.long)
+    base = replicated_index(1)
+    rng = np.random.default_rng(3)
+    warm = [list(BASKETS[i]) for i in rng.integers(len(BASKETS), size=chains)]
+    bank = draw_bank_fast(model, ix_rep, np.zeros(chains, dtype=int), slot_table(base, J), 2, 3,
+                          torch.Generator().manual_seed(5), init_items=warm, baskets_per_z=2)
+    _, probability = exact_law(model)
+    lookup = {b: i for i, b in enumerate(BASKETS)}
+    members = [[] for _ in range(bank.n)]
+    for slot, b in zip(bank.slots.tolist(), bank.basket.tolist()):
+        members[b].append(int(base.item[slot]))
+    counts = np.bincount([lookup[tuple(sorted(m))] for m in members], minlength=len(BASKETS))
+    tv = 0.5 * np.abs(counts / counts.sum() - probability).sum()
+    floor = np.mean([0.5 * np.abs(np.bincount(rng.choice(len(BASKETS), size=bank.n, p=probability),
+                                              minlength=len(BASKETS)) / bank.n - probability).sum()
+                     for _ in range(20)])
+    assert tv < 1.5 * floor + 0.005

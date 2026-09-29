@@ -29,7 +29,8 @@ from dataclasses import dataclass
 import numpy as np
 import torch
 
-from tempered_block_gibbs import conditional_slots, conditional_slots_levels, conditional_slots_repeated
+from tempered_block_gibbs import (conditional_log_tables_levels, conditional_slots, conditional_slots_levels,
+                                  conditional_slots_repeated)
 
 
 # ---------------------------------------------------------------------------------------------
@@ -157,7 +158,8 @@ def _flatten(state):
 
 @torch.no_grad()
 def draw_bank_fast(model, ix_rep, base_of_rep, table, draws_per_chain: int, burn: int,
-                   generator: torch.Generator, init_items=None, baskets_per_z: int = 1) -> SlotBaskets:
+                   generator: torch.Generator, init_items=None, baskets_per_z: int = 1,
+                   compiled: bool = True) -> SlotBaskets:
     """Same law as draw_bank, with Model A's vectorized exact S | z sampler.
 
     init_items: optional per-rep-trip item lists; the chain starts at z ~ N(sum phi over them, I)
@@ -175,8 +177,25 @@ def draw_bank_fast(model, ix_rep, base_of_rep, table, draws_per_chain: int, burn
         z = torch.zeros(B, Kz, dtype=model.phi.dtype)
     contexts, flat_slots, flat_basket = [], [], []
     count = 0
+    base_tensor = torch.as_tensor(np.asarray(base_of_rep), dtype=torch.long)
     for sweep in range(burn + draws_per_chain):
         recording = sweep >= burn
+        if compiled:
+            from compiled_backtrack import compiled_draws
+            k = baskets_per_z if recording else 1
+            log_g, centred, log_size = conditional_log_tables_levels(model, ix_rep, z.unsqueeze(0), [1.0])
+            slots, basket = compiled_draws(log_g, centred, log_size, ix_rep, k, generator)
+            trip = basket % B
+            if recording:
+                flat_slots.append(table[base_tensor[trip], ix_rep.item[slots]])
+                flat_basket.append(basket + count)
+                contexts.append(np.tile(np.asarray(base_of_rep), k))
+                count += k * B
+            first_draw = basket < B                       # the first draw of each trip sets z
+            v = torch.zeros(B, Kz, dtype=model.phi.dtype).index_add(
+                0, trip[first_draw], model.phi[ix_rep.item[slots[first_draw]]])
+            z = v + torch.randn(v.shape, generator=generator, dtype=v.dtype)
+            continue
         if recording and baskets_per_z > 1:
             draws = conditional_slots_repeated(model, ix_rep, z, 1.0, baskets_per_z, generator)
             states = [[d[t] for t in range(B)] for d in draws]

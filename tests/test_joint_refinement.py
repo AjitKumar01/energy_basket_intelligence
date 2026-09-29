@@ -175,3 +175,63 @@ def test_fast_warm_started_bank_draws_the_phi_nonzero_law(native_dp):
                                               minlength=len(BASKETS)) / bank.n - probability).sum()
                      for _ in range(20)])
     assert tv < 1.5 * floor + 0.005
+
+
+def test_numpy_reference_bank_draws_the_phi_nonzero_law(native_dp):
+    """The NumPy reverse sampler (compiled=False) stays covered as the reference path."""
+    from joint_refinement import draw_bank_fast
+    model = toy_model()
+    chains = 3000
+    ix_rep = replicated_index(chains)
+    model.house = torch.zeros(chains, dtype=torch.long)
+    base = replicated_index(1)
+    bank = draw_bank_fast(model, ix_rep, np.zeros(chains, dtype=int), slot_table(base, J), 2, 5,
+                          torch.Generator().manual_seed(6), compiled=False)
+    _, probability = exact_law(model)
+    lookup = {b: i for i, b in enumerate(BASKETS)}
+    members = [[] for _ in range(bank.n)]
+    for slot, b in zip(bank.slots.tolist(), bank.basket.tolist()):
+        members[b].append(int(base.item[slot]))
+    counts = np.bincount([lookup[tuple(sorted(m))] for m in members], minlength=len(BASKETS))
+    tv = 0.5 * np.abs(counts / counts.sum() - probability).sum()
+    rng = np.random.default_rng(2)
+    floor = np.mean([0.5 * np.abs(np.bincount(rng.choice(len(BASKETS), size=bank.n, p=probability),
+                                              minlength=len(BASKETS)) / bank.n - probability).sum()
+                     for _ in range(20)])
+    assert tv < 1.5 * floor + 0.005
+
+
+def test_compiled_conditional_draws_match_the_exact_law_at_fixed_z(native_dp):
+    """S | z at a fixed nonzero z: compiled draws against enumeration of the conditional law."""
+    from compiled_backtrack import compiled_draws
+    from tempered_block_gibbs import conditional_log_tables_levels
+    model = toy_model()
+    model.house = torch.zeros(1, dtype=torch.long)
+    index = replicated_index(1)
+    z = torch.tensor([[0.7, -0.4]])
+    log_g, centred, log_size = conditional_log_tables_levels(model, index, z.unsqueeze(0), [1.0])
+    draws = 40000
+    slots, basket = compiled_draws(log_g, centred, log_size, index, draws, torch.Generator().manual_seed(3))
+    lam = model.lam.detach().numpy()
+    phi = model.phi.detach().numpy()
+    rho0 = model.rho_0().detach().numpy()
+    rhoc = model.rho_c.detach().numpy()
+    energy = []
+    for b in BASKETS:
+        b = np.asarray(b)
+        counts = np.bincount(CATEGORY[b], minlength=2)
+        w = lam[b] - 0.5 * (phi[b] ** 2).sum(1) + phi[b] @ z[0].numpy()
+        energy.append(w.sum() - np.sum(rhoc * counts * (counts - 1) / 2) - rho0[len(b)])
+    energy = np.asarray(energy)
+    probability = np.exp(energy - np.logaddexp.reduce(energy))
+    lookup = {b: i for i, b in enumerate(BASKETS)}
+    members = [[] for _ in range(draws)]
+    for s, b in zip(slots.tolist(), basket.tolist()):
+        members[b].append(int(index.item[s]))
+    counts = np.bincount([lookup[tuple(sorted(m))] for m in members], minlength=len(BASKETS))
+    tv = 0.5 * np.abs(counts / counts.sum() - probability).sum()
+    rng = np.random.default_rng(4)
+    floor = np.mean([0.5 * np.abs(np.bincount(rng.choice(len(BASKETS), size=draws, p=probability),
+                                              minlength=len(BASKETS)) / draws - probability).sum()
+                     for _ in range(20)])
+    assert tv < 1.5 * floor + 0.005

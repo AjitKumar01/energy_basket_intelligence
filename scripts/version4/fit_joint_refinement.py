@@ -111,6 +111,8 @@ def main():
     p.add_argument("--node-trips", type=int, default=141_440,
                    help="quadrature nodes x trips per validation batch (128 trips at rank 8, level 11)")
     p.add_argument("--serial-sampler", action="store_true", help="single-threaded compiled backtrack")
+    p.add_argument("--freeze", nargs="*", default=[], choices=["lam", "theta", "alpha", "rho_c", "rho_0_free"],
+                   help="refined parameters to hold at the staged values")
     p.add_argument("--train-probe", type=int, default=0,
                    help="also score the exact likelihood on this many training contexts every round")
     p.add_argument("--mixing-check", action="store_true")
@@ -225,7 +227,7 @@ def main():
         t1 = time.time()
         ok, record = damped_round(model, ix, observed, bank, draws, U, C, rank, ladder, ess_rule,
                                   args.cycles, args.pool_prod, args.cap,
-                                  log=lambda m: print(m, flush=True))
+                                  log=lambda m: print(m, flush=True), frozen_names=tuple(args.freeze))
         if ok:
             ladder = [t for t in args.trust_ladder if t >= record["trust"] / 10] or list(args.trust_ladder)
         if not ok:

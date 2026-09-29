@@ -348,9 +348,11 @@ def bank_statistics(dE_bank: torch.Tensor):
 
 def damped_round(model, ix, observed: SlotBaskets, bank: SlotBaskets, draws: int, U, C,
                  rank: int, trust_ladder, ess_rule, cycles: int, pool_prod: float,
-                 cap: float, log=print):
-    """One round: parent = current model; returns (accepted, record)."""
-    names = ("lam", "theta", "rho_c", "rho_0_free")
+                 cap: float, log=print, frozen_names=()):
+    """One round: parent = current model; returns (accepted, record).
+
+    frozen_names: refined parameters to hold at their current values this round (e.g. "theta")."""
+    names = tuple(n for n in ("lam", "theta", "rho_c", "rho_0_free") if n not in frozen_names)
     N = observed.n
     with torch.no_grad():
         frozen = model.b_flat(ix) - taste_utility(model, ix)
@@ -379,9 +381,9 @@ def damped_round(model, ix, observed: SlotBaskets, bank: SlotBaskets, draws: int
             return -fit + pooling_penalty(model, pool_prod) + lam_trust * change / N
 
         block_a = [Cv] + [getattr(model, k) for k in names]
-        block_b = [model.alpha]
+        blocks = [block_a] + ([] if "alpha" in frozen_names else [[model.alpha]])
         for _ in range(cycles):
-            for block in (block_a, block_b):
+            for block in blocks:
                 others = [p for p in model.parameters() if all(p is not q for q in block)]
                 saved = [p.requires_grad for p in others]
                 for p in others:

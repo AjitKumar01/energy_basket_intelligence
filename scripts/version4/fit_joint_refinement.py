@@ -117,6 +117,8 @@ def main():
                    help="quadrature nodes x products x trips per validation batch (memory-bound above this)")
     p.add_argument("--select-trust", type=float, nargs="*", default=[],
                    help="choose each round's step among these trust levels on held-out selection trips")
+    p.add_argument("--select-fallback", type=float, nargs="*", default=[1e4, 1e5],
+                   help="with --select-trust: tried in order only when no candidate passes the ESS rule")
     p.add_argument("--select-theta-scale", type=float, nargs="+", default=[1.0],
                    help="with --select-trust: extra trust multipliers on the household tastes theta")
     p.add_argument("--selection-trips", type=int, default=1024)
@@ -292,7 +294,12 @@ def main():
         else:
             parent_state = {k: t.detach().clone() for k, t in model.state_dict().items()}
             best = None
-            for trust in args.select_trust:
+            # normal candidates first; fallback levels (smaller steps) are tried in order only while
+            # no candidate has passed the ESS rule, so a staged fit far from the optimum still moves
+            levels = list(args.select_trust) + list(args.select_fallback)
+            for i, trust in enumerate(levels):
+                if i >= len(args.select_trust) and best is not None:
+                    break
                 for theta_scale in args.select_theta_scale:
                     model.load_state_dict(parent_state)
                     ok_c, rec_c, C_c = step([trust], theta_scale)

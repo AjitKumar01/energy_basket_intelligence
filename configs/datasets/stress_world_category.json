@@ -1,0 +1,20 @@
+{
+  "schema_version": 1,
+  "dataset_name": "stress_world_category_partition",
+  "description": "Misspecified procedural retail world from scripts/synthetic/generate_stress_world.py (seed 20260924): missions, nested choice, loyalty, stockpiling, reference prices; merchandise-category partition",
+  "canonical_dir": "data/stress_world/canonical",
+  "model_data_root": "data/stress_world/model_input_category",
+  "price_basis": "synthetic chain week retail unit price with weekly noise and 25% promotions",
+  "promotion_feature": "advertised",
+  "model_price_sources": [
+    "retail_aggregate"
+  ],
+  "availability": {
+    "rule": "retail_first_sale",
+    "left_censor_periods": 13
+  },
+  "affinity": {
+    "partition": "category"
+  },
+  "promotion_coverage_note": "chain-level promotions (25% off with display) in every store"
+}

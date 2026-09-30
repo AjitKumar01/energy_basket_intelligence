@@ -44,6 +44,7 @@ def test_isolated_dry_run_preserves_shared_outputs_and_uses_fitted_parent(tmp_pa
     for key in ("ART", "REPORT", "OUT"):
         monkeypatch.setattr(pipeline, key, getattr(pipeline, key))
     monkeypatch.setattr(pipeline, "preflight", lambda **_kwargs: None)
+    monkeypatch.setenv("ENERGY_MODEL_DATA_ROOT", str(tmp_path))   # the bundle is required
     destination = tmp_path / "new_run"
     monkeypatch.setattr(sys, "argv", ["run_pipeline.py", "--dry-run", "--profile", "smoke",
                         "--start-at", "initialize", "--stop-after", "evaluation",
@@ -56,28 +57,6 @@ def test_isolated_dry_run_preserves_shared_outputs_and_uses_fitted_parent(tmp_pa
     # Top-level CLI imports from scripts/, without requiring a custom PYTHONPATH.
     from version4.provenance import require_fingerprint
     assert callable(require_fingerprint)
-
-
-def test_raw_directory_auto_detects_repository_local_bundle(tmp_path, monkeypatch):
-    sibling = tmp_path / "missing-sibling"
-    local = tmp_path / "repository-local"
-    local.mkdir()
-    monkeypatch.delenv("NF_RAW_DIR", raising=False)
-    monkeypatch.setattr(pipeline, "RAW_DEFAULT", sibling)
-    monkeypatch.setattr(pipeline, "RAW_LOCAL", local)
-    assert pipeline.resolve_raw_directory() == local.resolve()
-
-
-def test_explicit_raw_directory_overrides_auto_detection(tmp_path, monkeypatch):
-    explicit = tmp_path / "explicit"
-    sibling = tmp_path / "sibling"
-    local = tmp_path / "repository-local"
-    for path in (explicit, sibling, local):
-        path.mkdir()
-    monkeypatch.setenv("NF_RAW_DIR", str(explicit))
-    monkeypatch.setattr(pipeline, "RAW_DEFAULT", sibling)
-    monkeypatch.setattr(pipeline, "RAW_LOCAL", local)
-    assert pipeline.resolve_raw_directory() == explicit.resolve()
 
 
 def test_additive_resurrection_validates_initialization_lineage(tmp_path, monkeypatch):
@@ -271,6 +250,7 @@ def test_dry_run_executes_only_requested_stage_suffix(
     monkeypatch.setattr(pipeline, "REPORT", tmp_path / "reports")
     monkeypatch.setattr(pipeline, "V4", tmp_path / "scripts" / "version4")
     monkeypatch.setattr(pipeline, "preflight", lambda **_kwargs: None)
+    monkeypatch.setenv("ENERGY_MODEL_DATA_ROOT", str(tmp_path))   # the bundle is required
     monkeypatch.setattr(
         sys, "argv", ["run_pipeline.py", "--dry-run", "--profile", "smoke",
                       "--start-at", start_at])
@@ -288,6 +268,7 @@ def test_dry_run_uses_stratified_estimator_by_default(
     monkeypatch.setattr(pipeline, "REPORT", tmp_path / "reports")
     monkeypatch.setattr(pipeline, "V4", tmp_path / "scripts" / "version4")
     monkeypatch.setattr(pipeline, "preflight", lambda **_kwargs: None)
+    monkeypatch.setenv("ENERGY_MODEL_DATA_ROOT", str(tmp_path))   # the bundle is required
     monkeypatch.setattr(
         sys, "argv", ["run_pipeline.py", "--dry-run", "--profile", "smoke",
                       "--start-at", "interaction", "--stop-after", "interaction",
@@ -314,6 +295,7 @@ def test_full_test_score_is_reporting_only_not_a_gain_gate(
     monkeypatch.setattr(pipeline, "REPORT", tmp_path / "reports")
     monkeypatch.setattr(pipeline, "V4", tmp_path / "scripts" / "version4")
     monkeypatch.setattr(pipeline, "preflight", lambda **_kwargs: None)
+    monkeypatch.setenv("ENERGY_MODEL_DATA_ROOT", str(tmp_path))   # the bundle is required
     monkeypatch.setattr(
         sys, "argv", ["run_pipeline.py", "--dry-run", "--profile", "full",
                       "--start-at", "evaluation", "--stop-after", "evaluation"])

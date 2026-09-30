@@ -11,7 +11,7 @@ Any dataset enters the energy-basket pipeline by writing one canonical directory
 
 Dataset-specific choices (price basis, promotion feature, availability rule, affinity
 partition sizes, catalogue metadata defaults) are parameters in a dataset configuration,
-not code. See ``paper/CANONICAL_INPUT_CONTRACT.md``.
+not code. See ``docs/CANONICAL_INPUT_CONTRACT.md``.
 """
 from __future__ import annotations
 

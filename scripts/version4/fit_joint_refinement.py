@@ -1,27 +1,26 @@
 #!/usr/bin/env python3
-"""Joint refinement stage: damped iterated Monte Carlo likelihood from the staged Version-4 fit.
+"""Joint refinement stage: iterated Monte Carlo maximum likelihood from the staged Version-4 fit.
 
-Starting from the staged final checkpoint (additive stage, then Phi in a fixed spectral basis),
-each round draws a bank of baskets from the current law with Model A's blocked Gibbs sampler,
-solves the fixed-bank likelihood for the linear blocks -- interaction C in the fixed basis, item
-intercepts, rho_c, the size potential, household taste (then product taste) -- under the smallest
-trust region that keeps the bank's effective sample size above target, and makes the solution the
-next parent.  See joint_refinement.py for the estimator.
+Starting from the staged final checkpoint, each round draws a bank of baskets per training
+context from the current law (blocked Gibbs with an exact S | z sampler), solves the fixed-bank
+likelihood for the linear blocks -- interaction C in the fixed basis U, item intercepts, rho_c,
+the size potential, household taste and product taste -- for each candidate trust weight, and
+keeps the candidate with the best exact log likelihood on held-out selection trips.  Rounds stop
+when the selection score stops improving.  See joint_refinement.py and
+docs/JOINT_REFINEMENT_STAGE.md.
 
 Frozen: the certified price component, promotion, season and store blocks, and Phi's basis.
-Kept from Model A: its energy, its Phi contract (0 <= C <= I), its rho_c clamps and its pooling
-term.  Accepted only if the paired validation log likelihood (Model A's quadrature at the
-pipeline's evaluation level) improves with a positive 95% lower bound AND the refined model passes
-the one-level-finer numerical audit; the output checkpoint records the decision.
-
-  --mixing-check   only draw four independent banks for a sample of contexts and compare them
+Kept from the staged model: its energy, its Phi contract (0 <= C <= cap), its rho_c clamps and its
+pooling term.  Rounds are tried in order of held-out validation; the first with a positive
+paired 95% gain interval that passes the one-level-finer numerical audit and (with --size-gate)
+the certification population-size audit is written to --output.  Otherwise no output is written
+and the staged model stays.  --report always records the decision.
 """
 from __future__ import annotations
 
 import argparse
 import hashlib
 import json
-import math
 import os
 import subprocess
 import sys
@@ -39,8 +38,7 @@ from data import build
 from features import Features
 from fit import Batcher
 from joint_refinement import (SlotBaskets, bank_design, baskets_from_items, concat_designs, damped_round,
-                              draw_bank_fast,
-                              orthonormal_basis, set_phi_from, slot_table, taste_utility)
+                              draw_bank, orthonormal_basis, set_phi_from, slot_table, taste_utility)
 from pipeline_support import install_quadrature, smolyak_rule, supported_trips
 from uncertainty import paired_score_summary
 
@@ -69,11 +67,11 @@ def observed_items_of(data, trips):
 
 
 def draw_all(model, batcher, trips, table, chains, draws_per_chain, burn, batch, generator, full,
-             observed_items=None, baskets_per_z=1, parallel=True):
+             observed_items, baskets_per_z):
     """Bank for every context, drawn in batches of contexts (each repeated once per chain).
 
-    Chains start at z ~ N(sum of phi over the context's observed basket, I) when observed_items is
-    given (a warm start), and each recorded z yields `baskets_per_z` exact baskets.
+    Chains start at z ~ N(sum of phi over the context's observed basket, I) (a warm start), and
+    each recorded z yields `baskets_per_z` exact baskets.
     """
     slots, basket, context = [], [], []
     offset = 0
@@ -82,63 +80,64 @@ def draw_all(model, batcher, trips, table, chains, draws_per_chain, burn, batch,
         ix_rep, ctx_rep, _lc, house_rep, *_ = batcher.make(np.repeat(trips[c0:c1], chains))
         model.house, model.ctx = house_rep, ctx_rep
         base = np.repeat(np.arange(c0, c1), chains)
-        warm = None if observed_items is None else [observed_items[c] for c in base]
-        part = draw_bank_fast(model, ix_rep, base, table, draws_per_chain, burn, generator,
-                              init_items=warm, baskets_per_z=baskets_per_z, parallel=parallel)
+        part = draw_bank(model, ix_rep, base, table, draws_per_chain, burn, generator,
+                         init_items=[observed_items[c] for c in base], baskets_per_z=baskets_per_z)
         slots.append(part.slots); basket.append(part.basket + offset); context.append(part.context)
         offset += part.n
     model.house, model.ctx = full
     return SlotBaskets(torch.cat(slots), torch.cat(basket), torch.cat(context))
 
 
+def file_digest(path: Path) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for block in iter(lambda: f.read(1 << 20), b""):
+            h.update(block)
+    return h.hexdigest()
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     p.add_argument("--checkpoint", type=Path, required=True, help="staged final checkpoint")
-    p.add_argument("--output", type=Path, required=True)
+    p.add_argument("--output", type=Path, required=True, help="refined checkpoint (written only if accepted)")
     p.add_argument("--report", type=Path, help="JSON decision report (always written)")
     p.add_argument("--contexts-per-household", type=int, default=10)
     p.add_argument("--max-contexts", type=int, default=0, help="0 = no cap beyond per-household")
-    p.add_argument("--chains", type=int, default=16)
-    p.add_argument("--draws-per-chain", type=int, default=2)
+    p.add_argument("--chains", type=int, default=4)
+    p.add_argument("--draws-per-chain", type=int, default=4)
     p.add_argument("--burn", type=int, default=3)
     p.add_argument("--baskets-per-z", type=int, default=2)
     p.add_argument("--batch-contexts", type=int, default=128)
     p.add_argument("--chunk-contexts", type=int, default=1024,
                    help="contexts whose assortments are held in memory at once (multiple of --batch-contexts)")
-    p.add_argument("--rounds", type=int, default=10)
-    p.add_argument("--round-tolerance", type=float, default=1e-4)
-    p.add_argument("--trust-ladder", type=float, nargs="+", default=[1, 10, 100, 1e3, 1e4, 1e5])
+    p.add_argument("--rounds", type=int, default=5)
+    p.add_argument("--round-tolerance", type=float, default=1e-4,
+                   help="minimum selection-score improvement that continues the rounds")
+    p.add_argument("--select-trust", type=float, nargs="+", default=[300, 1000],
+                   help="candidate trust weights, chosen each round on held-out selection trips")
+    p.add_argument("--select-fallback", type=float, nargs="*", default=[1e4, 1e5],
+                   help="smaller steps tried in order only when no candidate passes the ESS rule")
     p.add_argument("--ess-q05", type=float, default=0.2, help="5th percentile of per-context ESS")
     p.add_argument("--ess-median", type=float, default=0.5)
     p.add_argument("--cycles", type=int, default=2)
     p.add_argument("--pool-prod", type=float, default=1.45)
     p.add_argument("--cap", type=float, default=1.0, help="Phi contract: C <= cap * I")
     p.add_argument("--validation-trips", type=int, default=1024)
+    p.add_argument("--selection-trips", type=int, default=1024)
     p.add_argument("--level-offset", type=int, default=2, help="evaluation level = rank + offset")
     p.add_argument("--node-item-trips", type=int, default=16_000_000,
                    help="quadrature nodes x products x trips per validation batch (memory-bound above this)")
-    p.add_argument("--select-trust", type=float, nargs="*", default=[],
-                   help="choose each round's step among these trust levels on held-out selection trips")
-    p.add_argument("--select-fallback", type=float, nargs="*", default=[1e4, 1e5],
-                   help="with --select-trust: tried in order only when no candidate passes the ESS rule")
-    p.add_argument("--select-theta-scale", type=float, nargs="+", default=[1.0],
-                   help="with --select-trust: extra trust multipliers on the household tastes theta")
-    p.add_argument("--selection-trips", type=int, default=1024)
-    p.add_argument("--serial-sampler", action="store_true", help="single-threaded compiled backtrack")
-    p.add_argument("--freeze", nargs="*", default=[], choices=["lam", "theta", "alpha", "rho_c", "rho_0_free"],
-                   help="refined parameters to hold at the staged values")
     p.add_argument("--size-gate", action="store_true",
                    help="accept a round only if it also passes audit_population_size.py (the certification gate)")
     p.add_argument("--size-gate-contexts", type=int, default=0, help="0 = every training context")
     p.add_argument("--size-gate-confirm-contexts", type=int, default=2048)
     p.add_argument("--size-gate-calibration-contexts", type=int, default=2048)
     p.add_argument("--size-gate-chunk", type=int, default=48)
-    p.add_argument("--train-probe", type=int, default=0,
-                   help="also score the exact likelihood on this many training contexts every round")
-    p.add_argument("--mixing-check", action="store_true")
     p.add_argument("--seed", type=int, default=41001)
     p.add_argument("--threads", type=int, default=8)
     args = p.parse_args()
+    if args.chunk_contexts % args.batch_contexts:
+        p.error("--chunk-contexts must be a multiple of --batch-contexts")
     torch.set_num_threads(args.threads)
     started = time.time()
     for stale in (args.output, args.output.with_suffix(".tmp")):
@@ -151,12 +150,10 @@ def main():
     rank, nmax, J = int(blob["active_rank"]), int(meta["nmax"]), int(data["n_item"])
     for name, parameter in model.named_parameters():
         parameter.requires_grad_(name in REFINED)
-    features = Features(J, int(data["n_store"]), include_recency=False)
-    batcher = Batcher(data, features, nmax, include_recency=False)
+    batcher = Batcher(data, Features(J, int(data["n_store"]), include_recency=False), nmax,
+                      include_recency=False)
     trips = choose_contexts(data, nmax, args.contexts_per_household, args.max_contexts, rng)
     observed_items = observed_items_of(data, trips)
-    if args.chunk_contexts % args.batch_contexts:
-        raise ValueError("--chunk-contexts must be a multiple of --batch-contexts")
     chunks = [(a, min(a + args.chunk_contexts, len(trips))) for a in range(0, len(trips), args.chunk_contexts)]
 
     def chunk_index(a, b):
@@ -181,46 +178,13 @@ def main():
     if split_error > 1e-10:
         raise RuntimeError(f"utility split does not reproduce b_flat (max error {split_error:.2e})")
 
-    if args.mixing_check:
-        sample = np.sort(rng.choice(len(trips), size=min(200, len(trips)), replace=False))
-        t0 = time.time()
-        sub_ix, sub_ctx, _lc, sub_house, *_ = batcher.make(trips[sample])
-        banks = [draw_all(model, batcher, trips[sample], slot_table(sub_ix, J),
-                          args.chains, args.draws_per_chain, args.burn, args.batch_contexts,
-                          torch.Generator().manual_seed(args.seed + k), (sub_house, sub_ctx),
-                          [observed_items[i] for i in sample], args.baskets_per_z, not args.serial_sampler)
-                 for k in range(4)]
-        bank_seconds = (time.time() - t0) / 4
-        sizes = [torch.bincount(b.basket, minlength=b.n).double().mean().item() for b in banks]
-        incidence = []
-        for b in banks:
-            inc = torch.zeros(J).index_add(0, sub_ix.item[b.slots], torch.ones(b.slots.numel(), dtype=torch.float64))
-            incidence.append(inc / b.n)
-        inc = torch.stack(incidence)
-        top = torch.argsort(inc.mean(0), descending=True)[:20]
-        spread = (inc[:, top].max(0).values - inc[:, top].min(0).values)
-        se = (inc[:, top].mean(0) * (1 - inc[:, top].mean(0)) / banks[0].n).sqrt()
-        report = {"contexts": int(len(sample)), "draws_per_context": draws,
-                  "mean_basket_size_per_bank": sizes,
-                  "top20_incidence_spread_over_monte_carlo_se": {
-                      "max": float((spread / se).max()), "median": float((spread / se).median())},
-                  "observed_mean_size": float(np.mean(np.diff(data["line_ptr"])[trips[sample]])),
-                  "seconds_per_bank": bank_seconds,
-                  "seconds_per_context_per_bank": bank_seconds / len(sample),
-                  "projected_seconds_per_round_bank": bank_seconds / len(sample) * len(trips)}
-        print(json.dumps(report, indent=2), flush=True)
-        return
-
     valid_all = supported_trips(data, 1, nmax)
     valid = np.sort(valid_all[rng.permutation(len(valid_all))[:args.validation_trips]])
     valid_households = np.asarray(data["trip_user"])[valid]
     rest = np.setdiff1d(valid_all, valid)
-    select = np.sort(rest[rng.permutation(len(rest))[:args.selection_trips]]) if args.select_trust else None
+    select = np.sort(rest[rng.permutation(len(rest))[:args.selection_trips]])
 
-    probe = np.sort(trips[rng.permutation(len(trips))[:args.train_probe]]) if args.train_probe else None
-
-    def validation(level, subset=None):
-        subset = valid if subset is None else subset
+    def validation(level, subset):
         rule = smolyak_rule(model, rank, level)
         install_quadrature(model, rule)
         batch = max(1, min(128, args.node_item_trips // (len(rule[1]) * J)))   # bound nodes x items x trips
@@ -234,12 +198,9 @@ def main():
         return torch.cat(out).numpy()
 
     level = rank + args.level_offset
-    start_valid = validation(level)
-    start_probe = validation(level, probe) if probe is not None else None
-    select_score = float(validation(level, select).mean()) if select is not None else None
-    best_valid, best_round = start_valid, 0
+    start_valid = validation(level, valid)
+    select_score = float(validation(level, select).mean())
     round_states = []                     # (round, validation per trip, state) for every completed round
-    progress_path = args.output.with_name(args.output.stem + "_progress.pt")
     U, C = orthonormal_basis(model.phi.detach(), rank)
     t0 = time.time()
     parts = []
@@ -260,8 +221,7 @@ def main():
         for a, b in chunks:
             ixc, tablec, chunk_full = chunk_index(a, b)
             bank_c = draw_all(model, batcher, trips[a:b], tablec, args.chains, args.draws_per_chain, args.burn,
-                              args.batch_contexts, generator, chunk_full, observed_items[a:b],
-                              args.baskets_per_z, not args.serial_sampler)
+                              args.batch_contexts, generator, chunk_full, observed_items[a:b], args.baskets_per_z)
             with torch.no_grad():
                 model.house, model.ctx = chunk_full
                 frozen = model.b_flat(ixc) - taste_utility(model, ixc)
@@ -274,8 +234,19 @@ def main():
         q05, med = float(ess.quantile(0.05)), float(ess.median())
         return q05 >= args.ess_q05 and med >= args.ess_median, {"q05": round(q05, 3), "median": round(med, 3)}
 
+    def step(bank_design_, trust):
+        """Solve one candidate step from the current parent, then apply the staged model's projections."""
+        ok, record = damped_round(model, obs_design, bank_design_, draws, U, C, rank, [trust], ess_rule,
+                                  args.cycles, args.pool_prod, args.cap, log=lambda m: print(m, flush=True))
+        if not ok:
+            return ok, record, C
+        C_new = set_phi_from(model, U, record["C"], rank, args.cap)
+        model.project_rho_c(-1.5)
+        project_category_reward_(model, capacities, 1.5)
+        model.project_context_gauges()
+        return ok, record, C_new
+
     rounds = []
-    ladder = list(args.trust_ladder)          # later rounds start one level below the last accepted trust
     print(f"[joint-refinement] staged start: validation {start_valid.mean():.5f} at level {level} "
           f"({time.time() - started:.0f}s)", flush=True)
     for rnd in range(1, args.rounds + 1):
@@ -283,71 +254,40 @@ def main():
         bank_design_ = bank_designs_for_round()
         draw_seconds = time.time() - t0
         t1 = time.time()
-
-        def step(trust_levels, theta_scale):
-            ok, record = damped_round(model, obs_design, bank_design_, draws, U, C, rank, trust_levels, ess_rule,
-                                      args.cycles, args.pool_prod, args.cap,
-                                      log=lambda m: print(m, flush=True), frozen_names=tuple(args.freeze),
-                                      trust_scale={"theta": theta_scale})
-            if not ok:
-                return ok, record, C
-            C_new = set_phi_from(model, U, record["C"], rank, args.cap)
-            model.project_rho_c(-1.5)
-            project_category_reward_(model, capacities, 1.5)
-            model.project_context_gauges()
-            return ok, record, C_new
-
-        if select is None:
-            ok, record, C_next = step(ladder, 1.0)
-            if ok:
-                ladder = [t for t in args.trust_ladder if t >= record["trust"] / 10] or list(args.trust_ladder)
-        else:
-            parent_state = {k: t.detach().clone() for k, t in model.state_dict().items()}
-            best = None
-            # normal candidates first; fallback levels (smaller steps) are tried in order only while
-            # no candidate has passed the ESS rule, so a staged fit far from the optimum still moves
-            levels = list(args.select_trust) + list(args.select_fallback)
-            for i, trust in enumerate(levels):
-                if i >= len(args.select_trust) and best is not None:
-                    break
-                for theta_scale in args.select_theta_scale:
-                    model.load_state_dict(parent_state)
-                    ok_c, rec_c, C_c = step([trust], theta_scale)
-                    if not ok_c:
-                        print(f"[joint-refinement]   candidate trust {trust:g}, theta x{theta_scale:g}: ESS rule failed",
-                              flush=True)
-                        continue
-                    score = float(validation(level, select).mean())
-                    print(f"[joint-refinement]   candidate trust {trust:g}, theta x{theta_scale:g}: selection "
-                          f"{score:.5f} ({score - select_score:+.5f} vs parent)", flush=True)
-                    if best is None or score > best[0]:
-                        best = (score, {k: t.detach().clone() for k, t in model.state_dict().items()}, C_c,
-                                {**rec_c, "theta_scale": theta_scale, "selection": score})
+        parent_state = {k: t.detach().clone() for k, t in model.state_dict().items()}
+        best = None
+        # normal candidates first; fallback levels (smaller steps) are tried in order only while
+        # no candidate has passed the ESS rule, so a staged fit far from the optimum still moves
+        levels = list(args.select_trust) + list(args.select_fallback)
+        for i, trust in enumerate(levels):
+            if i >= len(args.select_trust) and best is not None:
+                break
             model.load_state_dict(parent_state)
-            ok = best is not None and best[0] > select_score + args.round_tolerance
-            if ok:
-                select_score = best[0]
-                model.load_state_dict(best[1])
-                C_next, record = best[2], best[3]
-            else:
-                record = {"status": "no candidate improved the selection trips"}
-        if not ok:
-            rounds.append({"round": rnd, **record})
-            print(f"[joint-refinement] round {rnd}: {record['status']}; stopping", flush=True)
+            ok_c, rec_c, C_c = step(bank_design_, trust)
+            if not ok_c:
+                print(f"[joint-refinement]   candidate trust {trust:g}: ESS rule failed", flush=True)
+                continue
+            score = float(validation(level, select).mean())
+            print(f"[joint-refinement]   candidate trust {trust:g}: selection {score:.5f} "
+                  f"({score - select_score:+.5f} vs parent)", flush=True)
+            if best is None or score > best[0]:
+                best = (score, {k: t.detach().clone() for k, t in model.state_dict().items()}, C_c,
+                        {**rec_c, "selection": score})
+        model.load_state_dict(parent_state)
+        if best is None or best[0] <= select_score + args.round_tolerance:
+            rounds.append({"round": rnd, "status": "no candidate improved the selection trips"})
+            print(f"[joint-refinement] round {rnd}: no candidate improved the selection trips; stopping", flush=True)
             break
-        C = C_next
+        select_score = best[0]
+        model.load_state_dict(best[1])
+        C, record = best[2], best[3]
         solve_seconds = time.time() - t1
         t2 = time.time()
-        v = validation(level)
-        entry = {"round": rnd, "trust": record["trust"], "theta_scale": record.get("theta_scale", 1.0),
-                 "selection": record.get("selection"), "bank_gain": record["bank_gain"], "ess": record["ess"],
-                 "validation": float(v.mean()), "draw_seconds": draw_seconds, "solve_seconds": solve_seconds,
-                 "trust_seconds": record["trust_seconds"], "validation_seconds": time.time() - t2,
-                 "round_seconds": time.time() - t0}
-        if probe is not None:
-            entry["train_exact_gain"] = float(validation(level, probe).mean() - start_probe.mean())
-            print(f"[joint-refinement] round {rnd}: exact training gain on {len(probe)} training contexts "
-                  f"{entry['train_exact_gain']:+.5f} (bank claimed {record['bank_gain']:+.5f} this round)", flush=True)
+        v = validation(level, valid)
+        entry = {"round": rnd, "trust": record["trust"], "selection": record["selection"],
+                 "bank_gain": record["bank_gain"], "ess": record["ess"], "validation": float(v.mean()),
+                 "draw_seconds": draw_seconds, "solve_seconds": solve_seconds,
+                 "validation_seconds": time.time() - t2, "round_seconds": time.time() - t0}
         rounds.append(entry)
         print(f"[joint-refinement] round {rnd}: validation {v.mean():.5f} "
               f"(gain vs staged {v.mean() - start_valid.mean():+.5f}), bank gain {record['bank_gain']:+.5f}, "
@@ -355,14 +295,6 @@ def main():
               f", solve {solve_seconds:.0f}s, validation {entry['validation_seconds']:.0f}s, "
               f"{entry['round_seconds']:.0f}s", flush=True)
         round_states.append((rnd, v, {k: t.detach().clone() for k, t in model.state_dict().items()}))
-        if v.mean() > best_valid.mean() + 1e-5:
-            best_valid, best_round = v, rnd
-            payload = dict(blob)
-            payload["model"] = round_states[-1][2]
-            payload["joint_refinement"] = {"round": rnd, "rounds": rounds, "accepted": None}
-            torch.save(payload, progress_path.with_suffix(".tmp")); os.replace(progress_path.with_suffix(".tmp"), progress_path)
-        if select is None and record["bank_gain"] < args.round_tolerance:
-            break
 
     # Acceptance: rounds are tried in order of held-out validation; the first that has a positive
     # paired gain interval, passes the numerical audit one level finer and (with --size-gate) the
@@ -406,7 +338,7 @@ def main():
         if not gain["95_interval"][0] > 0:
             decision["attempts"].append({**attempt, "result": "gain interval includes zero"})
             continue
-        audit_gap = float(abs(validation(level + 1).mean() - v.mean()))
+        audit_gap = float(abs(validation(level + 1, valid).mean() - v.mean()))
         attempt.update(audit_level=level + 1, audit_gap=audit_gap)
         if audit_gap > 0.01:
             decision["attempts"].append({**attempt, "result": "numerical audit failed"})
@@ -430,17 +362,11 @@ def main():
             decision["reason"] = "no improving round passed every acceptance gate"
     print(f"[joint-refinement] decision {json.dumps(decision)} ({time.time() - started:.0f}s)", flush=True)
     if args.report is not None:
-        def digest(path):
-            h = hashlib.sha256()
-            with open(path, "rb") as f:
-                for block in iter(lambda: f.read(1 << 20), b""):
-                    h.update(block)
-            return h.hexdigest()
         report = {"decision": decision, "rounds": rounds, "contexts": int(len(trips)),
                   "draws_per_context": draws, "evaluation_level": level,
-                  "parent": str(args.checkpoint), "parent_sha256": digest(args.checkpoint),
+                  "parent": str(args.checkpoint), "parent_sha256": file_digest(args.checkpoint),
                   "output": str(args.output) if args.output.is_file() else None,
-                  "output_sha256": digest(args.output) if args.output.is_file() else None,
+                  "output_sha256": file_digest(args.output) if args.output.is_file() else None,
                   "seconds": time.time() - started}
         args.report.parent.mkdir(parents=True, exist_ok=True)
         args.report.write_text(json.dumps(report, indent=2, default=float))

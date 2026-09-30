@@ -5,14 +5,10 @@
 
 numpy==2.3.5
 pandas==2.3.3
-pyarrow==21.0.0        # parquet engine for the intermediate panels
-scipy==1.16.3          # KS test, t distribution, sparse matrices in the placebo tests
-scikit-learn==1.7.2    # deterministic household segmentation
-matplotlib==3.10.7     # every figure in figures/
-torch==2.9.1           # both model stages; CPU execution is supported
+pyarrow==21.0.0        # parquet engine for the model-data bundle
+scipy==1.16.3          # optimisation and sparse matrices
+scikit-learn==1.7.2    # deterministic household segmentation audit
+torch==2.9.1           # model, exact normalizer and optimisation; CPU execution
+numba==0.63.1          # compiled exact basket sampler for joint refinement
 setuptools==80.9.0     # builds the local PyTorch C++ extension
-pytest==9.0.1          # executable numerical and pipeline-contract checks
-fastapi==0.123.4       # typed evidence-gated retail inference API
-uvicorn==0.38.0        # local/production ASGI server for the API
-pydantic==2.12.5       # strict request and response contracts
-httpx==0.28.1          # in-process HTTP contract tests
+pytest==9.0.1          # unit tests

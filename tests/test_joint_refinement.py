@@ -154,9 +154,8 @@ def test_one_damped_round_raises_the_exact_likelihood(native_dp):
     assert after > before + 0.01
 
 
-def test_fast_warm_started_bank_draws_the_phi_nonzero_law(native_dp):
-    """The vectorized sampler with observed-basket warm starts and several baskets per z."""
-    from joint_refinement import draw_bank_fast
+def test_warm_started_bank_draws_the_phi_nonzero_law(native_dp):
+    """The bank sampler with observed-basket warm starts and several baskets per z."""
     model = toy_model()
     chains = 4000
     ix_rep = replicated_index(chains)
@@ -164,8 +163,8 @@ def test_fast_warm_started_bank_draws_the_phi_nonzero_law(native_dp):
     base = replicated_index(1)
     rng = np.random.default_rng(3)
     warm = [list(BASKETS[i]) for i in rng.integers(len(BASKETS), size=chains)]
-    bank = draw_bank_fast(model, ix_rep, np.zeros(chains, dtype=int), slot_table(base, J), 2, 3,
-                          torch.Generator().manual_seed(5), init_items=warm, baskets_per_z=2)
+    bank = draw_bank(model, ix_rep, np.zeros(chains, dtype=int), slot_table(base, J), 2, 3,
+                     torch.Generator().manual_seed(5), init_items=warm, baskets_per_z=2)
     _, probability = exact_law(model)
     lookup = {b: i for i, b in enumerate(BASKETS)}
     members = [[] for _ in range(bank.n)]
@@ -179,33 +178,9 @@ def test_fast_warm_started_bank_draws_the_phi_nonzero_law(native_dp):
     assert tv < 1.5 * floor + 0.005
 
 
-def test_numpy_reference_bank_draws_the_phi_nonzero_law(native_dp):
-    """The NumPy reverse sampler (compiled=False) stays covered as the reference path."""
-    from joint_refinement import draw_bank_fast
-    model = toy_model()
-    chains = 3000
-    ix_rep = replicated_index(chains)
-    model.house = torch.zeros(chains, dtype=torch.long)
-    base = replicated_index(1)
-    bank = draw_bank_fast(model, ix_rep, np.zeros(chains, dtype=int), slot_table(base, J), 2, 5,
-                          torch.Generator().manual_seed(6), compiled=False)
-    _, probability = exact_law(model)
-    lookup = {b: i for i, b in enumerate(BASKETS)}
-    members = [[] for _ in range(bank.n)]
-    for slot, b in zip(bank.slots.tolist(), bank.basket.tolist()):
-        members[b].append(int(base.item[slot]))
-    counts = np.bincount([lookup[tuple(sorted(m))] for m in members], minlength=len(BASKETS))
-    tv = 0.5 * np.abs(counts / counts.sum() - probability).sum()
-    rng = np.random.default_rng(2)
-    floor = np.mean([0.5 * np.abs(np.bincount(rng.choice(len(BASKETS), size=bank.n, p=probability),
-                                              minlength=len(BASKETS)) / bank.n - probability).sum()
-                     for _ in range(20)])
-    assert tv < 1.5 * floor + 0.005
-
-
-@pytest.mark.parametrize("parallel,trips", [(False, 1), (True, 1), (True, 8)])
-def test_compiled_conditional_draws_match_the_exact_law_at_fixed_z(native_dp, parallel, trips):
-    """S | z at a fixed nonzero z: compiled draws (serial and trip-parallel kernels) against
+@pytest.mark.parametrize("trips", [1, 8])
+def test_compiled_conditional_draws_match_the_exact_law_at_fixed_z(native_dp, trips):
+    """S | z at a fixed nonzero z: compiled trip-parallel draws against
     enumeration of the conditional law, pooled over identical trips."""
     from compiled_backtrack import compiled_draws
     from tempered_block_gibbs import conditional_log_tables_levels
@@ -216,7 +191,7 @@ def test_compiled_conditional_draws_match_the_exact_law_at_fixed_z(native_dp, pa
     log_g, centred, log_size = conditional_log_tables_levels(model, index, z.unsqueeze(0), [1.0])
     draws = 40000
     slots, basket = compiled_draws(log_g, centred, log_size, index, draws // trips,
-                                   torch.Generator().manual_seed(3), parallel=parallel)
+                                   torch.Generator().manual_seed(3))
     slots = slots - (slots // J) * J        # slot position within its (identical) trip
     index = replicated_index(1)
     lam = model.lam.detach().numpy()
@@ -286,7 +261,7 @@ def test_parallel_compiled_draws_do_not_depend_on_the_thread_count(native_dp):
     results = []
     for threads in (1, numba.config.NUMBA_NUM_THREADS):
         numba.set_num_threads(threads)
-        results.append(compiled_draws(*tables, index, 50, torch.Generator().manual_seed(9), parallel=True))
+        results.append(compiled_draws(*tables, index, 50, torch.Generator().manual_seed(9)))
     numba.set_num_threads(numba.config.NUMBA_NUM_THREADS)
     assert torch.equal(results[0][0], results[1][0]) and torch.equal(results[0][1], results[1][1])
 

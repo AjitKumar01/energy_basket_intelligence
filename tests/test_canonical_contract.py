@@ -171,8 +171,10 @@ def test_catalogue_hierarchy_floors_are_declared_not_inferred(tmp_path):
     module = load_prepare_module("prepare_bundle_hierarchy_floors")
     loose, _ = module.catalogue_hierarchy_groups(hierarchy_items(), 2, 20)
     assert len(set(loose.tolist())) == 4          # y now qualifies as well
-    config = json.loads((ROOT / "configs" / "datasets" / "erim_availability_catalogue.json").read_text())
-    config["affinity"]["minimum_pair_count"] = 8   # an affinity-partition key
+    config = json.loads((ROOT / "configs" / "datasets" / "stress_world_category.json").read_text())
+    config["affinity"] = {"partition": "catalogue_hierarchy", "minimum_group_products": 3,
+                          "minimum_group_training_lines": 300,
+                          "minimum_pair_count": 8}      # an affinity-partition key
     path = tmp_path / "config.json"
     path.write_text(json.dumps(config))
     with pytest.raises(SystemExit, match="do not apply"):
@@ -199,7 +201,7 @@ def test_product_metadata_adds_declared_columns_and_validates(tmp_path):
 
 def test_finest_catalogue_level_config_takes_no_floors(tmp_path):
     module = load_prepare_module("prepare_bundle_finest")
-    config = json.loads((ROOT / "configs" / "datasets" / "erim_availability_category.json").read_text())
+    config = json.loads((ROOT / "configs" / "datasets" / "stress_world_category.json").read_text())
     config["affinity"] = {"partition": "finest_catalogue_level"}
     path = tmp_path / "config.json"
     path.write_text(json.dumps(config))
@@ -223,7 +225,7 @@ def test_partial_metadata_falls_back_to_contract_defaults(tmp_path):
 
 def test_partition_settings_are_validated_when_the_config_loads(tmp_path):
     module = load_prepare_module("prepare_bundle_settings")
-    config = json.loads((ROOT / "configs" / "datasets" / "erim_availability_category.json").read_text())
+    config = json.loads((ROOT / "configs" / "datasets" / "stress_world_category.json").read_text())
     path = tmp_path / "config.json"
     for affinity, message in (({"partition": "substitution_evidence", "unassigned": "drop"}, "unassigned"),
                               ({"partition": "catalogue_hierarchy", "minimum_group_products": 0}, "integer")):

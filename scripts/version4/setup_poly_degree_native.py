@@ -1,4 +1,4 @@
-"""Build the audit-only degree-aware C++ extension without Ninja."""
+"""Build the degree-aware C++ extension (the category/size dynamic program) without Ninja."""
 import platform
 from pathlib import Path
 

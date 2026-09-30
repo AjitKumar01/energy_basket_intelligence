@@ -371,7 +371,7 @@ def rec_eval(m, B, trips, seed=0, chunk=24, return_ranks=False, conditioned=True
     set, and shift the category and total-size potentials by its counts.  Differentiate the
     SAME normaliser used by training once per batch.  Ranking on the raw energy increment
     ``b + phi + rho_c`` is a different
-    exactly-one-completion task; version4.html measured that scorer at about 0.023 versus
+    exactly-one-completion task; an earlier audit measured that scorer at about 0.023 versus
     about 0.082 for incidence.  Logging it as version-4 MRR therefore masks the quantity the
     experiment actually declares.
 

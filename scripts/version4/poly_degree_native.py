@@ -1,4 +1,4 @@
-"""Audit-only autograd wrapper for the prebuilt native degree-aware product."""
+"""Autograd wrapper for the compiled degree-aware product (the category/size dynamic program)."""
 from __future__ import annotations
 
 import sys

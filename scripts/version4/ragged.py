@@ -1,10 +1,9 @@
 """
-The ragged kernel: the same model as core.py, without padding the item axis.
+The ragged kernel: the Version-4 model without padding the item axis.
 
-WHY THIS EXISTS.  core.py assumes every trip sees C categories of exactly P products.  A
-dunnhumby store carries a median of 18 products in a category and up to 225.  Padding every
-category to 225 would waste roughly 12x the arithmetic -- the same mistake that cost an
-earlier branch 17.8 hours per fit against a projected 1.
+WHY THIS EXISTS.  A dense kernel assumes every trip sees C categories of exactly P products.  A
+large grocery store carries a median of 18 products in a category and up to 225.  Padding every
+category to 225 would waste roughly 12x the arithmetic.
 
 WHAT IS RAGGED AND WHAT IS NOT.  Items are kept in one flat array with a row index, so a
 category of 3 products costs 3 slots.  The CATEGORY axis is padded to the batch maximum,

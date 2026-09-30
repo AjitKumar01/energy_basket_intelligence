@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build the training-only co-purchase partition used by version4.html.
+"""Build the training-only co-purchase partition (the `affinity` partition option).
 
 The partition is a deterministic preprocessing choice.  It is learned only from training
 baskets and caps non-residual groups at 128 products, keeping the exact category

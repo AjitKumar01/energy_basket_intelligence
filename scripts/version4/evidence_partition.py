@@ -1,7 +1,7 @@
 """Model-free substitute groups from household-level co-purchase evidence.
 
 Builds the product partition once, from training baskets only, before any model is fitted.
-Method, proofs and complexity: paper/SUBSTITUTION_EVIDENCE_PARTITION.md.
+Method, proofs and complexity: docs/SUBSTITUTION_EVIDENCE_PARTITION.md.
 
 1. Pair evidence. For household h and training trip t with basket size s_t:
        p_tj = st_tj * min(1, a_hj * s_t / S_hj),   a_hj = sum_t y_tj st_tj,   S_hj = sum_t s_t st_tj,

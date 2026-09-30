@@ -1,25 +1,26 @@
-"""Joint refinement of a staged Version-4 fit by damped, iterated Monte Carlo maximum likelihood.
+"""Joint refinement of a staged Version-4 fit by iterated Monte Carlo maximum likelihood.
 
 The staged pipeline is a two-step estimator: the additive block (utilities, household taste,
-rho_c, rho_0) is fitted with Phi = 0 and then frozen while the interaction is solved.  The
+rho_c, rho_0) is fitted with Phi = 0 and then frozen while the interaction is solved, so the
 additive block absorbs part of the interaction and cannot give it back.  This module moves the
-blocks together, starting from the staged optimum, without differentiating the quadrature:
+blocks together from the staged optimum without differentiating the quadrature:
 
-  1. Bank.  For every context, draw M baskets from the CURRENT law with Model A's blocked Gibbs
-     sampler on (S, z) at beta = 1: z | S ~ N(sum_{j in S} phi_j, I) and S | z exactly by the
-     category/size dynamic program (tempered_block_gibbs.conditional_slots).
+  1. Bank.  For every context, draw M baskets from the CURRENT law by blocked Gibbs on (S, z):
+     z | S ~ N(sum_{j in S} phi_j, I), and S | z exactly by the category/size dynamic program
+     (compiled_backtrack).
   2. Fixed-bank objective (Geyer and Thompson 1992).  With dE = E_new - E_parent,
-         sum_t dE(S_t) - sum_t log mean_m exp dE(S_t^m).
-     Every refined block enters the energy linearly -- the interaction as tr(C F_U(S)) in the fixed
-     basis U, item intercepts, rho_c, the size potential, household taste theta (product taste
-     alpha fixed) and alpha (theta fixed) -- so each block's objective is concave.
-  3. Trust region.  Each round solves the objective plus lam * |change|^2 / N and takes the
-     smallest lam whose solution keeps the bank's effective sample size above target; the step
-     therefore never leaves the region where the bank represents the law.  The solution becomes
-     the next parent, the bank is redrawn, and the rounds stop when the bank gain vanishes.
+         sum_t dE(S_t) - sum_t log mean_m exp dE(S_t^m),
+     evaluated from per-basket sufficient statistics (BankDesign).  Every refined block enters the
+     energy linearly -- the interaction as tr(C F_U(S)) in the fixed basis U, item intercepts,
+     rho_c, the size potential, household taste theta (product taste alpha fixed) and alpha
+     (theta fixed) -- so each block's objective is concave and is solved by full-batch L-BFGS.
+  3. Trust region.  Each candidate step solves the objective plus tau * |change|^2 / N and must keep
+     the bank's effective sample size above target.  The driver (fit_joint_refinement.py) chooses
+     tau on held-out selection trips, redraws the bank from the new parent, and stops when the
+     selection score stops improving.
 
 The certified price component, seasonality, store and promotion blocks, and Phi's basis U stay
-fixed.  Acceptance is decided outside this module, on held-out likelihood.
+fixed.  Acceptance is decided by the driver on held-out likelihood and the certification gates.
 """
 from __future__ import annotations
 
@@ -30,8 +31,7 @@ from dataclasses import dataclass
 import numpy as np
 import torch
 
-from tempered_block_gibbs import (conditional_log_tables_levels, conditional_slots, conditional_slots_levels,
-                                  conditional_slots_repeated)
+from tempered_block_gibbs import conditional_log_tables_levels
 
 
 # ---------------------------------------------------------------------------------------------
@@ -197,49 +197,17 @@ def design_energy(model, design: BankDesign, C: torch.Tensor) -> torch.Tensor:
 # ---------------------------------------------------------------------------------------------
 @torch.no_grad()
 def draw_bank(model, ix_rep, base_of_rep, table, draws_per_chain: int, burn: int,
-              generator: torch.Generator) -> SlotBaskets:
-    """Draw baskets from the current law.
+              generator: torch.Generator, init_items=None, baskets_per_z: int = 1) -> SlotBaskets:
+    """Draw baskets from the current law by blocked Gibbs on (S, z).
 
     ix_rep indexes the contexts repeated once per chain; base_of_rep maps each of its trips to the
     base context.  Each chain runs `burn` sweeps, then records `draws_per_chain` sweeps.
-    """
-    Kz = model.Kz
-    z = torch.zeros(ix_rep.B, Kz, dtype=model.phi.dtype)
-    contexts, items = [], []
-    for sweep in range(burn + draws_per_chain):
-        state = conditional_slots(model, ix_rep, z, 1.0, generator)
-        v = torch.zeros(ix_rep.B, Kz, dtype=model.phi.dtype)
-        for trip, slots in enumerate(state):
-            chosen = ix_rep.item[slots]
-            v[trip] = model.phi[chosen].sum(0)
-            if sweep >= burn:
-                contexts.append(int(base_of_rep[trip]))
-                items.append(chosen.numpy())
-        z = v + torch.randn(v.shape, generator=generator, dtype=v.dtype)
-    order = np.argsort(np.asarray(contexts), kind="stable")
-    contexts = np.asarray(contexts)[order]
-    items = [items[i] for i in order]
-    return baskets_from_items(table, contexts, items)
-
-
-def _flatten(state):
-    """List of per-trip slot tensors -> (slots, trip) flat arrays."""
-    lengths = torch.as_tensor([len(s) for s in state], dtype=torch.long)
-    slots = torch.cat([torch.as_tensor(s, dtype=torch.long) for s in state]) if len(state) else torch.zeros(0, dtype=torch.long)
-    return slots, torch.repeat_interleave(torch.arange(len(state)), lengths)
-
-
-@torch.no_grad()
-def draw_bank_fast(model, ix_rep, base_of_rep, table, draws_per_chain: int, burn: int,
-                   generator: torch.Generator, init_items=None, baskets_per_z: int = 1,
-                   compiled: bool = True, parallel: bool = True) -> SlotBaskets:
-    """Same law as draw_bank, with Model A's vectorized exact S | z sampler.
-
+    z | S ~ N(sum_{j in S} phi_j, I); S | z is drawn exactly by the compiled reverse sampler.
     init_items: optional per-rep-trip item lists; the chain starts at z ~ N(sum phi over them, I)
-    (a warm start at an observed basket).  After burn-in, each z draw yields `baskets_per_z`
-    independent exact draws from S | z (each is marginally a draw from the basket law once z is
-    stationary; baskets sharing a z are correlated).
+    (a warm start at an observed basket).  After burn-in each z yields `baskets_per_z` exact
+    draws from S | z (baskets sharing a z are correlated).  Baskets are returned context-major.
     """
+    from compiled_backtrack import compiled_draws
     B, Kz = ix_rep.B, model.Kz
     if init_items is not None:
         v = torch.zeros(B, Kz, dtype=model.phi.dtype)
@@ -253,40 +221,18 @@ def draw_bank_fast(model, ix_rep, base_of_rep, table, draws_per_chain: int, burn
     base_tensor = torch.as_tensor(np.asarray(base_of_rep), dtype=torch.long)
     for sweep in range(burn + draws_per_chain):
         recording = sweep >= burn
-        if compiled:
-            from compiled_backtrack import compiled_draws
-            k = baskets_per_z if recording else 1
-            log_g, centred, log_size = conditional_log_tables_levels(model, ix_rep, z.unsqueeze(0), [1.0])
-            slots, basket = compiled_draws(log_g, centred, log_size, ix_rep, k, generator, parallel)
-            trip = basket % B
-            if recording:
-                flat_slots.append(table[base_tensor[trip], ix_rep.item[slots]])
-                flat_basket.append(basket + count)
-                contexts.append(np.tile(np.asarray(base_of_rep), k))
-                count += k * B
-            first_draw = basket < B                       # the first draw of each trip sets z
-            v = torch.zeros(B, Kz, dtype=model.phi.dtype).index_add(
-                0, trip[first_draw], model.phi[ix_rep.item[slots[first_draw]]])
-            z = v + torch.randn(v.shape, generator=generator, dtype=v.dtype)
-            continue
-        if recording and baskets_per_z > 1:
-            draws = conditional_slots_repeated(model, ix_rep, z, 1.0, baskets_per_z, generator)
-            states = [[d[t] for t in range(B)] for d in draws]
-        else:
-            states = [conditional_slots_levels(model, ix_rep, z.unsqueeze(0), [1.0], generator)[0]]
-        last = None
-        for state in states:
-            slots, trip = _flatten(state)
-            last = (slots, trip)
-            if recording:
-                items = ix_rep.item[slots]
-                base_trip = torch.as_tensor(np.asarray(base_of_rep), dtype=torch.long)[trip]
-                flat_slots.append(table[base_trip, items])
-                flat_basket.append(trip + count)
-                contexts.append(np.asarray(base_of_rep))
-                count += B
-        slots, trip = last
-        v = torch.zeros(B, Kz, dtype=model.phi.dtype).index_add(0, trip, model.phi[ix_rep.item[slots]])
+        k = baskets_per_z if recording else 1
+        log_g, centred, log_size = conditional_log_tables_levels(model, ix_rep, z.unsqueeze(0), [1.0])
+        slots, basket = compiled_draws(log_g, centred, log_size, ix_rep, k, generator)
+        trip = basket % B
+        if recording:
+            flat_slots.append(table[base_tensor[trip], ix_rep.item[slots]])
+            flat_basket.append(basket + count)
+            contexts.append(np.tile(np.asarray(base_of_rep), k))
+            count += k * B
+        first_draw = basket < B                       # the first draw of each trip sets z
+        v = torch.zeros(B, Kz, dtype=model.phi.dtype).index_add(
+            0, trip[first_draw], model.phi[ix_rep.item[slots[first_draw]]])
         z = v + torch.randn(v.shape, generator=generator, dtype=v.dtype)
     slots = torch.cat(flat_slots); basket = torch.cat(flat_basket)
     context = torch.as_tensor(np.concatenate(contexts), dtype=torch.long)
@@ -376,18 +322,13 @@ def round_designs(model, ix, observed: SlotBaskets, bank: SlotBaskets, U):
 
 def damped_round(model, obs_design: BankDesign, bank_design_: BankDesign, draws: int, U, C,
                  rank: int, trust_ladder, ess_rule, cycles: int, pool_prod: float,
-                 cap: float, log=print, frozen_names=(), trust_scale=None):
+                 cap: float, log=print):
     """One round: parent = current model; returns (accepted, record).
 
     The observed and bank baskets enter only through their designs (per-basket sufficient
     statistics), so the caller may build them chunk by chunk and memory does not grow with
-    contexts x assortment.
-
-    frozen_names: refined parameters to hold at their current values this round (e.g. "theta").
-    trust_scale: per-parameter multipliers on the trust penalty (e.g. {"theta": 10} shrinks the
-    household taste update ten times harder than the population parameters)."""
-    trust_scale = trust_scale or {}
-    names = tuple(n for n in ("lam", "theta", "rho_c", "rho_0_free") if n not in frozen_names)
+    contexts x assortment."""
+    names = ("lam", "theta", "rho_c", "rho_0_free")
     N = obs_design.frozen.numel()
     with torch.no_grad():
         E_obs0 = design_energy(model, obs_design, C)
@@ -408,12 +349,12 @@ def damped_round(model, obs_design: BankDesign, bank_design_: BankDesign, draws:
             dE_obs = design_energy(model, obs_design, Cs) - E_obs0
             dE_bank = (design_energy(model, bank_design_, Cs) - E_bank0).view(N, draws)
             fit = (dE_obs.sum() - (torch.logsumexp(dE_bank, 1) - math.log(draws)).sum()) / N
-            change = sum(trust_scale.get(k, 1.0) * (getattr(model, k) - start[k]).square().sum() for k in start) \
+            change = sum((getattr(model, k) - start[k]).square().sum() for k in start) \
                 + (Cv - C_start).square().sum()
             return -fit + pooling_penalty(model, pool_prod) + lam_trust * change / N
 
         block_a = [Cv] + [getattr(model, k) for k in names]
-        blocks = [block_a] + ([] if "alpha" in frozen_names else [[model.alpha]])
+        blocks = [block_a, [model.alpha]]
         for _ in range(cycles):
             for block in blocks:
                 others = [p for p in model.parameters() if all(p is not q for q in block)]

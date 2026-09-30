@@ -24,10 +24,6 @@ V4 = ROOT / "scripts" / "version4"
 ART = ROOT / "artifacts"
 REPORT = ROOT / "reports"
 OUT = ROOT / "out"
-RAW_DEFAULT = (ROOT.parent / "dunnhumby_The-Complete-Journey" /
-               "dunnhumby_The-Complete-Journey CSV")
-RAW_LOCAL = (ROOT / "dunnhumby_The-Complete-Journey" /
-             "dunnhumby_The-Complete-Journey CSV")
 STAGES = ("data", "initialize", "additive", "rank", "interaction",
           "refinement", "evaluation", "certification")
 RUN_MANIFEST = None
@@ -107,16 +103,6 @@ def price_configuration_from_evidence(status: int, report_path: Path,
 
 def stage_index(stage: str) -> int:
     return STAGES.index(stage)
-
-
-def resolve_raw_directory() -> Path:
-    configured = os.environ.get("NF_RAW_DIR")
-    if configured:
-        return Path(configured).expanduser().resolve()
-    for candidate in (RAW_DEFAULT, RAW_LOCAL):
-        if candidate.is_dir():
-            return candidate.resolve()
-    return RAW_DEFAULT.resolve()
 
 
 def runs_stage(start_at: str, stage: str) -> bool:
@@ -383,10 +369,10 @@ def validate_evaluation_outputs(*, profile: str, candidate: Path,
             f"cannot resurrect evaluation; invalid {assignments}: {exc}") from exc
 
 
-def preflight(*, from_raw: bool, stop_after: str) -> None:
+def preflight(*, stop_after: str) -> None:
     if sys.version_info < (3, 11):
         raise SystemExit("Python 3.11 or newer is required")
-    modules = ("numpy", "pandas", "pyarrow", "scipy", "sklearn", "torch", "setuptools")
+    modules = ("numpy", "pandas", "pyarrow", "scipy", "sklearn", "torch", "numba", "setuptools")
     missing_modules = [name for name in modules
                        if importlib.util.find_spec(name) is None]
     if missing_modules:
@@ -395,41 +381,20 @@ def preflight(*, from_raw: bool, stop_after: str) -> None:
             + "; run python -m pip install -r requirements.txt")
 
     data_root = model_data_root()
-    if from_raw:
-        if data_root != ROOT.resolve():
-            raise SystemExit(
-                "--from-raw invokes the Dunnhumby builders and therefore cannot be "
-                "combined with ENERGY_MODEL_DATA_ROOT; build an external dataset with "
-                "its canonical adapter, then start this pipeline at initialize")
-        raw = resolve_raw_directory()
-        missing_raw = [raw / name for name in (
-            "transaction_data.csv", "product.csv", "causal_data.csv")
-            if not (raw / name).is_file()]
-        if missing_raw:
-            raise SystemExit(
-                "raw dunnhumby input is incomplete; set NF_RAW_DIR to the directory "
-                "containing transaction_data.csv, product.csv and causal_data.csv; missing: "
-                + ", ".join(map(str, missing_raw)))
-
-    if not from_raw:
-        required = (
-            data_root / "data" / "price_week.parquet",
-            data_root / "data" / "build_meta.json",
-            data_root / "basket_input" / "meta.json",
-            data_root / "basket_input" / "items.parquet",
-            data_root / "basket_input" / "baskets.parquet",
-            data_root / "basket_input" / "promo.npz",
-        )
-        if data_root == ROOT.resolve():
-            required += (
-                data_root / "data" / "tx.parquet",
-                data_root / "data" / "price_store_week.parquet",
-            )
-        missing_derived = [path for path in required if not path.is_file()]
-        if missing_derived:
-            raise SystemExit(
-                "derived data are incomplete; rerun with --from-raw; missing: "
-                + ", ".join(map(str, missing_derived)))
+    required = (
+        data_root / "data" / "price_week.parquet",
+        data_root / "data" / "build_meta.json",
+        data_root / "basket_input" / "meta.json",
+        data_root / "basket_input" / "items.parquet",
+        data_root / "basket_input" / "baskets.parquet",
+        data_root / "basket_input" / "promo.npz",
+    )
+    missing_derived = [path for path in required if not path.is_file()]
+    if missing_derived:
+        raise SystemExit(
+            "the model-data bundle is incomplete; prepare it with "
+            "scripts/prepare_model_bundle.py; missing: "
+            + ", ".join(map(str, missing_derived)))
 
     if stop_after != "data" and not any(
             shutil.which(name) for name in ("c++", "clang++", "g++")):
@@ -453,7 +418,6 @@ class Driver:
         self.environment["PYTHONPATH"] = os.pathsep.join(
             [str(native), str(V4)] + ([old] if old else []))
         self.environment["V3_AFFINITY"] = "1"
-        self.environment["NF_RAW_DIR"] = str(resolve_raw_directory())
 
     def run(self, command: list[str], *, allow_failure: bool = False) -> int:
         self.commands.append(command)
@@ -557,9 +521,7 @@ def main() -> None:
     parser.add_argument(
         "--model-data-root", type=Path,
         help=("model-data bundle prepared by scripts/prepare_model_bundle.py; sets "
-              "ENERGY_MODEL_DATA_ROOT for every stage (the repository root holds Dunnhumby)"))
-    parser.add_argument("--from-raw", action="store_true",
-                        help="rebuild data/ and basket_input/ from dunnhumby CSVs")
+              "ENERGY_MODEL_DATA_ROOT for every stage (required unless that variable is set)"))
     parser.add_argument("--dry-run", action="store_true",
                         help="print the complete command graph without executing it")
     parser.add_argument("--profile", choices=("full", "smoke"), default="full")
@@ -598,6 +560,8 @@ def main() -> None:
         help=("Smolyak level = rank + offset for the likelihood, recommendation and "
               "population-size gates (use 3 where rank + 2 fails the audit bound)"))
     args = parser.parse_args()
+    if args.model_data_root is None and not os.environ.get("ENERGY_MODEL_DATA_ROOT"):
+        parser.error("--model-data-root is required (a bundle from scripts/prepare_model_bundle.py)")
     if args.model_data_root is not None:
         bundle = args.model_data_root.expanduser().resolve()
         if not (bundle / "basket_input" / "model_data_fingerprint.json").is_file():
@@ -629,10 +593,6 @@ def main() -> None:
                           "configuration": {k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()}}
             write_manifest(RUN_MANIFEST, RUN_STATUS)
     start_at = args.start_at or ("additive" if args.resume_additive else "data")
-    if args.from_raw and args.resume_additive is not None:
-        parser.error("--from-raw cannot be combined with --resume-additive")
-    if args.from_raw and start_at != "data":
-        parser.error("--from-raw requires --start-at data (or no --start-at)")
     if args.resume_additive is not None and start_at != "additive":
         parser.error("--resume-additive requires --start-at additive")
     if args.resume_additive is not None and args.price_coefficients is not None:
@@ -641,7 +601,7 @@ def main() -> None:
         parser.error("--stop-after must be the same as or later than --start-at")
     if args.threads < 0:
         parser.error("--threads cannot be negative")
-    preflight(from_raw=args.from_raw, stop_after=args.stop_after)
+    preflight(stop_after=args.stop_after)
     from runtime_capabilities import (detect_runtime, resolve_backend,
                                       write_runtime_report)
     if not args.dry_run:
@@ -682,23 +642,13 @@ def main() -> None:
     print(f"[pipeline] hardware report: {ART / 'runtime_capabilities.json'}", flush=True)
     driver = Driver(args.dry_run, log_dir if args.run_dir is not None and not args.dry_run else None)
 
-    if args.from_raw:
-        driver.run([PY, "-u", "scripts/data/01_build_base.py"])
-        driver.run([PY, "-u", "scripts/data/22_basket_data.py"])
-        driver.run([PY, "-u", "scripts/data/23_promo_data.py"])
     # Always fail closed on data integrity, including when reusing derived files.
     if start_at == "data":
-        if model_data_root() == ROOT.resolve():
-            driver.run([PY, "-u", "scripts/data/audit_preprocessing.py"])
-            driver.run(script("build_affinity_partition.py"))
-            driver.run(script("data.py", "--force"))
-            driver.run(script("provenance.py"))
-        else:
-            # External adapters own their preprocessing and immutable partition.  Running
-            # the Dunnhumby audit here would inspect ROOT rather than the selected bundle.
-            verify_data_bundle(dry_run=driver.dry_run)
-            print("[pipeline] verified canonical external model-data bundle", flush=True)
-            report_availability_contract()
+        # The bundle's adapter (scripts/prepare_model_bundle.py) owns preprocessing and the
+        # immutable partition; the pipeline re-verifies its fingerprint.
+        verify_data_bundle(dry_run=driver.dry_run)
+        print("[pipeline] verified canonical model-data bundle", flush=True)
+        report_availability_contract()
     else:
         # Reuse the audited input without overwriting shared historical artifacts.
         verify_data_bundle(dry_run=driver.dry_run)

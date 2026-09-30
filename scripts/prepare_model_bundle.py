@@ -13,7 +13,7 @@ ragged index and data fingerprint. Everything dataset-specific lives in the JSON
       "promotion_feature": "disabled | advertised | special_price",
       "model_price_sources": ["retail_aggregate"],
       "availability": {"rule": "disabled | retail_first_sale", "left_censor_periods": 13},
-      "affinity": {"partition": "affinity | category | finest_catalogue_level | catalogue_hierarchy | substitution_evidence",
+      "affinity": {"partition": "affinity | category | finest_catalogue_level | nested_catalogue | catalogue_hierarchy | substitution_evidence",
                    "minimum_pair_count": 8, "maximum_group_size": 128,
                    "minimum_group_products": 3, "minimum_group_training_lines": 300},
       "product_metadata": "optional parquet: product_id + subcategory/brand/manufacturer/department",
@@ -54,6 +54,7 @@ AFFINITY_KEYS = {
     "category": {"partition"},
     "catalogue_hierarchy": {"partition", "minimum_group_products", "minimum_group_training_lines"},
     "finest_catalogue_level": {"partition"},
+    "nested_catalogue": {"partition"},
     "substitution_evidence": {"partition", *EVIDENCE_DEFAULTS},
 }
 
@@ -158,6 +159,27 @@ def write_finest_level_partition(basket_input: Path) -> None:
           f"singletons {diagnostics['group_size']['singletons']}", flush=True)
 
 
+def write_nested_catalogue_partition(basket_input: Path) -> None:
+    """Nested groups from the declared catalogue: leaves are the finest declared level (one
+    group per (category, subcategory) path), parents are the categories.  The model then has one
+    penalty per subcategory and one per category."""
+    import numpy as np
+    import pandas as pd
+    items = pd.read_parquet(basket_input / "items.parquet").sort_values("item_id")
+    group_id, decisions = finest_level_groups(items)
+    diagnostics = validate_partition(items, group_id)            # every leaf nests in one category
+    category_code = pd.factorize(items.COMMODITY_DESC.astype(str), sort=True)[0]
+    group_parent = (pd.Series(category_code).groupby(np.asarray(group_id)).first()
+                    .sort_index().to_numpy())
+    manifest = write_partition(basket_input, items, group_id, {
+        "schema_version": 1, "training_only": True, "partition": "nested_catalogue",
+        "rule": "leaves: one group per declared (category, subcategory) path; parents: categories",
+        "validation": diagnostics, "categories": decisions}, group_parent=group_parent)
+    print(f"[prepare] nested catalogue partition: {manifest['n_groups']} leaf groups in "
+          f"{manifest['n_parents']} parents, largest leaf {manifest['maximum_group_size_observed']}",
+          flush=True)
+
+
 def run(command: list[str], root: Path) -> None:
     env = {**os.environ, "ENERGY_MODEL_DATA_ROOT": str(root), "V3_AFFINITY": "1"}
     print("[prepare] " + " ".join(map(str, command)), flush=True)
@@ -202,6 +224,8 @@ def main() -> None:
         write_category_partition(root / "basket_input")
     elif partition == "finest_catalogue_level":
         write_finest_level_partition(root / "basket_input")
+    elif partition == "nested_catalogue":
+        write_nested_catalogue_partition(root / "basket_input")
     elif partition == "substitution_evidence":
         write_evidence_partition(root / "basket_input", affinity)
     else:

@@ -76,6 +76,19 @@ def weighted_particle_expected_size(states: BasketParticles,
 
 
 @torch.no_grad()
+def rest_parent_penalty(model, slot_trip, slot_cat, old, B):
+    """Nested groups: rho_p[parent(j)] * (products of j's parent already in the rest), per slot.
+
+    The add-one log odds of product j given the rest of the basket carries this parent term in
+    addition to the leaf term rho_c[leaf(j)] * rest_leaf.  Zero for a flat model."""
+    if not getattr(model, "P", 0):
+        return 0.0
+    parent = model.group_parent[slot_cat]
+    counts = torch.zeros(B * model.P, dtype=old.dtype, device=old.device).index_add_(
+        0, slot_trip * model.P + parent, old).view(B, model.P)
+    return model.rho_p.detach()[parent] * (counts[slot_trip, parent] - old)
+
+
 def rao_blackwell_expected_size(model, ix, states: BasketParticles,
                                 log_weights: Optional[torch.Tensor] = None
                                 ) -> torch.Tensor:
@@ -125,6 +138,7 @@ def rao_blackwell_expected_size(model, ix, states: BasketParticles,
         rest_index = rest_n.to(torch.long)
         add_index = (rest_index + 1).clamp(max=model.nmax)
         logit = (slot_b + projection - model.rho_c[slot_cat] * rest_cat
+                 - rest_parent_penalty(model, slot_trip, slot_cat, old, ix.B)
                  - (rho0[add_index] - rho0[rest_index]))
         conditional = torch.sigmoid(logit)
         conditional = torch.where(rest_n == 0, torch.ones_like(conditional), conditional)
@@ -150,6 +164,12 @@ def differentiable_log_size_beta0(model, ix, slot_b: Optional[torch.Tensor] = No
         raise ValueError("slot_b must provide one utility for every assortment slot")
     scale = seg_max(slot_b.unsqueeze(0), ix.item_trip, ix.B)[0]
     centred = slot_b - scale[ix.item_trip]
+    if getattr(model, "P", 0):
+        from ragged import nested_log_coefficients
+        log_a = nested_log_coefficients(model, ix, centred.unsqueeze(0))
+        size_axis = torch.arange(log_a.shape[-1], dtype=slot_b.dtype, device=slot_b.device)
+        return (log_a[0] + size_axis * scale.unsqueeze(-1)
+                - model.rho_0()[:log_a.shape[-1]])[:, 1:]
     log_e = esp_log_bucketed(
         centred.unsqueeze(0), ix.row_of, ix.n_rows, model.R,
         ix.row_size, ix.item_pos)[0]
@@ -381,6 +401,7 @@ def rao_blackwell_particle_statistics(model, ix, states: BasketParticles,
         add_index = (rest_index + 1).clamp(max=model.nmax)
         size_increment = rho0[add_index] - rho0[rest_index]
         logit = (slot_b + projection - model.rho_c[slot_cat] * rest_cat
+                 - rest_parent_penalty(model, slot_trip, slot_cat, old, ix.B)
                  - size_increment)
         conditional = torch.sigmoid(logit)
         conditional = torch.where(rest_n == 0, torch.ones_like(conditional),
@@ -493,8 +514,14 @@ def rao_blackwell_selected_incidence(model, ix, states: BasketParticles,
             rest_cats = ix.row_cat[ix.row_of[rest]]
             rest_cat = (rest_cats == target_cat[b]).to(dt).sum()
             size_increment = rho0[rest_n+1]-rho0[rest_n]
+            parent_term = 0.0
+            if getattr(model, "P", 0):
+                parents = model.group_parent[rest_cats]
+                target_parent = model.group_parent[target_cat[b]]
+                parent_term = (model.rho_p.detach()[target_parent]
+                               * (parents == target_parent).to(dt).sum())
             logit = (slot_b[b]+projection-model.rho_c[target_cat[b]]*rest_cat
-                     -size_increment)
+                     -parent_term-size_increment)
             conditional[b] = torch.sigmoid(logit)
         answer += weight[p]*conditional
     return answer

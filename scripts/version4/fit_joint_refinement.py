@@ -172,8 +172,9 @@ def main():
     data = build()
     model, blob, meta = load_checkpoint(args.checkpoint, data)
     rank, nmax, J = int(blob["active_rank"]), int(meta["nmax"]), int(data["n_item"])
+    refined = REFINED + (("rho_p",) if getattr(model, "P", 0) else ())
     for name, parameter in model.named_parameters():
-        parameter.requires_grad_(name in REFINED)
+        parameter.requires_grad_(name in refined)
     batcher = Batcher(data, Features(J, int(data["n_store"]), include_recency=False), nmax,
                       include_recency=False)
     trips = choose_contexts(data, nmax, args.contexts_per_household, args.max_contexts, rng)
@@ -266,6 +267,7 @@ def main():
             return ok, record, C
         C_new = set_phi_from(model, U, record["C"], rank, args.cap)
         model.project_rho_c(-1.5)
+        model.project_rho_p()
         project_category_reward_(model, capacities, 1.5)
         model.project_context_gauges()
         return ok, record, C_new

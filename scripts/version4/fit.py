@@ -277,6 +277,11 @@ def _size_coeffs(m, z, ix):
     proj = (z[ix.item_trip] * phi_i.unsqueeze(1)).sum(-1)
     logw = (bt.unsqueeze(1) + proj).transpose(0, 1)
     M = seg_max(logw, ix.item_trip, ix.B)
+    if getattr(m, "P", 0):
+        from ragged import nested_log_coefficients
+        logA = nested_log_coefficients(m, ix, logw - M.index_select(-1, ix.item_trip))
+        n_ax = torch.arange(logA.shape[-1], dtype=logw.dtype)
+        return (logA + n_ax * M.unsqueeze(-1))[0].mean(0)
     w = torch.exp(logw - M.index_select(-1, ix.item_trip))
     e = esp_bucketed(w, ix.row_of, ix.n_rows, m.R, ix.row_size, ix.item_pos)
     r = torch.arange(m.R + 1, dtype=w.dtype)

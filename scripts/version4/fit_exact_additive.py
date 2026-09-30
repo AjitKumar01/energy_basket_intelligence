@@ -146,7 +146,8 @@ def load_model(artifact, data):
         K=int(meta["K"]), Kz=int(meta["Kz"]), nmax=int(meta["nmax"]),
         R=int(meta["R"]), seed=int(meta["seed"]), S=int(data["n_store"]),
         Kp=int(meta["Kp"]), phi_init=0.0,
-        household_size_rank1=bool(meta.get("household_size_rank1", False)))
+        household_size_rank1=bool(meta.get("household_size_rank1", False)),
+        group_parent=data["group_parent"] if "group_parent" in data else None)
     restored = load_sparse_initialization_artifact(artifact, model)
     with torch.no_grad():
         model.phi.zero_()
@@ -162,6 +163,8 @@ def fitted_parameters(model):
     # blocks are absent because this file fits incidence baskets, not line-unit counts.
     names = ("lam", "alpha", "theta", "rho_c", "rho_0_free", "price_kappa",
              "gamma", "beta", "w_dsp", "w_mlr", "mu", "delta", "zeta", "xi")
+    if getattr(model, "P", 0):
+        names = names + ("rho_p",)          # nested groups: parent penalties
     return [getattr(model, name) for name in names
             if getattr(model, name).requires_grad]
 
@@ -621,6 +624,7 @@ def main():
                 if float(spread) > args.lam_sd_max:
                     model.lam.mul_(args.lam_sd_max / spread.clamp_min(1e-12))
         model.project_rho_c(-1.5)
+        model.project_rho_p()
         category_safety = None
         if args.rho_c_max_category_reward > 0:
             category_safety = project_category_reward_(

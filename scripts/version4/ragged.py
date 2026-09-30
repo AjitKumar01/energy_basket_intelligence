@@ -909,25 +909,18 @@ def nested_layout(model, ix):
                 prow_trip=prow_trip, prow_parent=prow_parent, prow_pos=prow_pos, Ppad=Ppad)
 
 
-def log_f_nested(model, z, ix, drop_empty=False, return_terms=False):
-    """log f(z) for a model with nested groups.  z [B, D, Kz] -> [B, D].
+def nested_log_coefficients(model, ix, centred):
+    """Log generating-polynomial coefficients [D, B, nmax+1] of a nested-group model.
 
-    Exact program, all in log coordinates:
-      1. leaf row: log ESP of its products' weights exp(b_j - |phi_j|^2/2 + phi_j'z), times the
-         leaf potential exp(-rho_c C(t, 2));
-      2. parent row: product of its leaf polynomials, times exp(-rho_p C(t, 2));
-      3. trip: product of its parent polynomials, then exp(-rho_0(n)).
-    A conditional (revealed-basket) law shifts both potentials by the revealed counts, exactly
-    as the flat program does for categories."""
-    D = z.shape[1]
+    ``centred`` [D, T] are per-(draw, trip) centred log item weights.  Exact program in log
+    coordinates: leaf row = log ESP of its products' weights times exp(-rho_c C(t,2)); parent row
+    = product of its leaf polynomials times exp(-rho_p C(t,2)); trip = product of its parents.
+    With ``model._condition_cat_count`` (revealed leaf counts) both potentials are shifted by the
+    revealed counts, as the flat program does for categories.  Every exact computation of a
+    nested model (normaliser, size law, samplers) uses this one function."""
+    D = centred.shape[0]
     nmax, R = model.nmax, model.R
-    dt, dev = model.lam.dtype, model.lam.device
-    phi_i = model.phi[ix.item]
-    bt = model.b_flat(ix) - 0.5 * (phi_i ** 2).sum(-1)                              # [T]
-    proj = (z[ix.item_trip] * phi_i.unsqueeze(1)).sum(-1)                           # [T, D]
-    logw = (bt.unsqueeze(1) + proj).transpose(0, 1)                                 # [D, T]
-    M = seg_max(logw, ix.item_trip, ix.B)                                           # [D, B]
-    centred = logw - M.index_select(-1, ix.item_trip)
+    dt, dev = centred.dtype, centred.device
     logE = esp_log_bucketed(centred, ix.row_of, ix.n_rows, R, ix.row_size, ix.item_pos,
                             blocked=bool(getattr(model, "_esp_log_blocked", True)))  # [D, rows, R+1]
     r = torch.arange(R + 1, dtype=dt, device=dev)
@@ -942,7 +935,6 @@ def log_f_nested(model, z, ix, drop_empty=False, return_terms=False):
         log_leaf = torch.where(r <= (R - base_row).unsqueeze(-1), log_leaf,
                                torch.full_like(log_leaf, -float("inf")))
     logG_leaf = logE + log_leaf.unsqueeze(0)                                        # [D, rows, R+1]
-    # 2. parent rows
     width = max(R, nmax) + 1
     logL = torch.full((D, lay["n_prow"] * lay["Lpad"], width), -float("inf"), dtype=dt, device=dev)
     logL[..., 0] = 0.0
@@ -963,27 +955,42 @@ def log_f_nested(model, z, ix, drop_empty=False, return_terms=False):
             model.pair_feature(base_par.unsqueeze(-1) + rp) - model.pair_feature(base_par).unsqueeze(-1))
     logPar = logPar + log_par.unsqueeze(0)
     par_degree = leaf_degree.sum(1).clamp(max=nmax)
-    # 3. trips
     logT = torch.full((D, ix.B * lay["Ppad"], nmax + 1), -float("inf"), dtype=dt, device=dev)
     logT[..., 0] = 0.0
     flat_par = lay["prow_trip"] * lay["Ppad"] + lay["prow_pos"]
     logT[:, flat_par] = logPar
-    logT = logT.view(D, ix.B, lay["Ppad"], nmax + 1)
     trip_degree = torch.zeros(ix.B * lay["Ppad"], dtype=torch.long, device=dev)
     trip_degree[flat_par] = par_degree
-    logA = _log_product(logT.view(D, ix.B, lay["Ppad"], nmax + 1),
+    return _log_product(logT.view(D, ix.B, lay["Ppad"], nmax + 1),
                         trip_degree.view(ix.B, lay["Ppad"]), nmax)                  # [D, B, nmax+1]
+
+
+def nested_size_terms(model, logA, M):
+    """log mass of each size n from the coefficients: logA - rho_0(n) + n*M (conditional-aware)."""
+    dt, dev = logA.dtype, logA.device
+    nmax = model.nmax
     n = torch.arange(nmax + 1, dtype=dt, device=dev)
     rho0_all = model.rho_0()
     base_size = getattr(model, "_condition_size", None)
     if base_size is None:
-        lg = logA - rho0_all[:nmax + 1] + n * M.unsqueeze(-1)
-    else:
-        base_size = base_size.to(dtype=torch.long, device=dev)
-        total_n = base_size.unsqueeze(-1) + n.to(torch.long).unsqueeze(0)
-        valid = total_n < rho0_all.numel()
-        rho0 = rho0_all[total_n.clamp(max=rho0_all.numel() - 1)] - rho0_all[base_size].unsqueeze(-1)
-        lg = (logA - rho0 + n * M.unsqueeze(-1)).masked_fill(~valid.unsqueeze(0), -float("inf"))
+        return logA - rho0_all[:nmax + 1] + n * M.unsqueeze(-1)
+    base_size = base_size.to(dtype=torch.long, device=dev)
+    total_n = base_size.unsqueeze(-1) + n.to(torch.long).unsqueeze(0)
+    valid = total_n < rho0_all.numel()
+    rho0 = rho0_all[total_n.clamp(max=rho0_all.numel() - 1)] - rho0_all[base_size].unsqueeze(-1)
+    return (logA - rho0 + n * M.unsqueeze(-1)).masked_fill(~valid.unsqueeze(0), -float("inf"))
+
+
+def log_f_nested(model, z, ix, drop_empty=False, return_terms=False):
+    """log f(z) for a model with nested groups.  z [B, D, Kz] -> [B, D] (see
+    nested_log_coefficients for the exact program)."""
+    phi_i = model.phi[ix.item]
+    bt = model.b_flat(ix) - 0.5 * (phi_i ** 2).sum(-1)                              # [T]
+    proj = (z[ix.item_trip] * phi_i.unsqueeze(1)).sum(-1)                           # [T, D]
+    logw = (bt.unsqueeze(1) + proj).transpose(0, 1)                                 # [D, T]
+    M = seg_max(logw, ix.item_trip, ix.B)                                           # [D, B]
+    centred = logw - M.index_select(-1, ix.item_trip)
+    lg = nested_size_terms(model, nested_log_coefficients(model, ix, centred), M)
     if drop_empty:
         lg = lg[..., 1:]
     if return_terms:

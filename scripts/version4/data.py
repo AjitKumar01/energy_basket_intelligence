@@ -68,6 +68,7 @@ def build(force=False):
 
     meta = json.load(open(os.path.join(BI, "meta.json")))
     J, S, C = meta["n_items"], meta["n_stores"], meta["n_commodities"]
+    group_parent = None
     b = pd.read_parquet(os.path.join(BI, "baskets.parquet"))
     # The category partition is a modelling choice, not a fact about the data.  rho_c is
     # the model's EXACT dependence mechanism -- the convolution computes it with no draws
@@ -88,8 +89,16 @@ def build(force=False):
         log(f"category partition: {_part}, C = {C}, group size median "
             f"{int(_sz.median())} max {int(_sz.max())}")
     elif os.environ.get("V3_AFFINITY", "0") == "1" and os.path.exists(_aff):
-        it = pd.read_parquet(_aff)[["item_id", "cat_id"]]
+        it = pd.read_parquet(_aff)
         C = int(it.cat_id.max()) + 1        # the partition sets C, not meta.json
+        if "parent_id" in it:
+            # nested groups: every group (leaf) names one parent group
+            per_group = it.groupby("cat_id").parent_id.agg(["min", "max"])
+            if (per_group["min"] != per_group["max"]).any() or len(per_group) != C:
+                raise SystemExit("items_affinity.parquet: every group needs exactly one parent_id")
+            group_parent = per_group["min"].to_numpy(np.int64)
+            log(f"nested groups: {C} groups in {int(group_parent.max()) + 1} parents")
+        it = it[["item_id", "cat_id"]]
         log(f"category partition: AFFINITY groups from {os.path.basename(_aff)}, C = {C}")
     else:
         it = pd.read_parquet(os.path.join(BI, "items.parquet"))[["item_id", "cat_id"]]
@@ -182,6 +191,8 @@ def build(force=False):
                trip_split=split_code, trip_nlines=trips.n.to_numpy(np.int32),
                line_ptr=tptr, line_item=line_item, line_cat=line_cat,
                line_slot=line_slot.astype(np.int32), line_units=line_units)
+    if group_parent is not None:
+        out["group_parent"] = group_parent
     np.savez_compressed(CACHE, **out)
     log(f"wrote {CACHE}")
     return out

@@ -130,15 +130,25 @@ def validate_partition(items: pd.DataFrame, group_id, nest_in_category: bool = T
     return diagnostics
 
 
-def write_partition(output_dir: Path, items: pd.DataFrame, group_id, manifest: dict) -> dict:
-    """Write items_affinity.parquet and affinity_manifest.json in the format the model reads."""
+def write_partition(output_dir: Path, items: pd.DataFrame, group_id, manifest: dict,
+                    group_parent=None) -> dict:
+    """Write items_affinity.parquet and affinity_manifest.json in the format the model reads.
+
+    group_parent (optional, one entry per group) declares nested groups: the parquet then
+    carries each product's parent_id as well."""
     items = items.sort_values("item_id")
     output = Path(output_dir) / "items_affinity.parquet"
-    pd.DataFrame({"item_id": items.item_id.to_numpy(), "cat_id": np.asarray(group_id, dtype=np.int32)}
-                 ).to_parquet(output, index=False)
-    sizes = np.bincount(np.asarray(group_id))
+    group_id = np.asarray(group_id)
+    frame = pd.DataFrame({"item_id": items.item_id.to_numpy(), "cat_id": group_id.astype(np.int32)})
+    if group_parent is not None:
+        group_parent = np.asarray(group_parent)
+        frame["parent_id"] = group_parent[group_id].astype(np.int32)
+    frame.to_parquet(output, index=False)
+    sizes = np.bincount(group_id)
     manifest = {**manifest, "n_items": int(len(items)), "n_groups": int(len(sizes)),
                 "maximum_group_size_observed": int(sizes.max())}
+    if group_parent is not None:
+        manifest["n_parents"] = int(group_parent.max()) + 1
     categories = manifest.pop("categories", None)
     if categories is not None:
         manifest["categories"] = categories

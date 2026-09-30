@@ -116,6 +116,9 @@ def basket_energy(model, ix, baskets: SlotBaskets, basis=None, C=None, slot_b=No
     key = baskets.basket * model.C + category
     counts = torch.bincount(key, minlength=N * model.C).view(N, model.C).to(b.dtype)
     penalty = (model.rho_c.unsqueeze(0) * model.pair_feature(counts)).sum(-1)
+    if getattr(model, "P", 0):
+        parent_counts = torch.zeros(N, model.P, dtype=b.dtype).index_add_(1, model.group_parent, counts)
+        penalty = penalty + (model.rho_p.unsqueeze(0) * model.pair_feature(parent_counts)).sum(-1)
     size = torch.bincount(baskets.basket, minlength=N)
     return linear + pair - penalty - model.rho_0()[size]
 
@@ -139,6 +142,7 @@ class BankDesign:
     gram: torch.Tensor        # [N, r(r+1)/2]
     pairs: torch.Tensor       # sparse [N, n_cat]
     size: torch.Tensor        # [N]
+    parent_pairs: torch.Tensor | None = None   # sparse [N, n_parent] (nested groups only)
 
 
 def _upper(rank: int):
@@ -172,7 +176,16 @@ def bank_design(model, ix, baskets: SlotBaskets, basis: torch.Tensor, frozen_slo
     pairs = torch.sparse_coo_tensor(torch.stack([unique[keep] // model.C, unique[keep] % model.C]),
                                     feature[keep], (N, model.C)).coalesce()
     size = torch.bincount(baskets.basket, minlength=N)
-    return BankDesign(frozen, incidence, model.house[baskets.context], gram, pairs, size)
+    parent_pairs = None
+    if getattr(model, "P", 0):
+        pkey = baskets.basket * model.P + model.group_parent[category]
+        punique, pcounts = torch.unique(pkey, return_counts=True)
+        pfeature = model.pair_feature(pcounts.to(dtype))
+        pkeep = pfeature != 0
+        parent_pairs = torch.sparse_coo_tensor(
+            torch.stack([punique[pkeep] // model.P, punique[pkeep] % model.P]),
+            pfeature[pkeep], (N, model.P)).coalesce()
+    return BankDesign(frozen, incidence, model.house[baskets.context], gram, pairs, size, parent_pairs)
 
 
 def design_energy(model, design: BankDesign, C: torch.Tensor) -> torch.Tensor:
@@ -189,6 +202,8 @@ def design_energy(model, design: BankDesign, C: torch.Tensor) -> torch.Tensor:
     iu, weight = _upper(C.shape[0])
     pair = 0.5 * (design.gram @ (C[iu[0], iu[1]] * weight))
     penalty = torch.sparse.mm(design.pairs, model.rho_c.unsqueeze(1)).squeeze(1)
+    if design.parent_pairs is not None:
+        penalty = penalty + torch.sparse.mm(design.parent_pairs, model.rho_p.unsqueeze(1)).squeeze(1)
     return design.frozen + linear + taste + pair - penalty - model.rho_0()[design.size]
 
 
@@ -295,12 +310,15 @@ def bank_statistics(dE_bank: torch.Tensor):
 def concat_designs(parts) -> BankDesign:
     """Stack per-chunk designs (baskets in chunk order) into one design."""
     rows = 0
-    incidence, pairs = [], []
+    incidence, pairs, parent_pairs = [], [], []
     for d in parts:
         i = d.incidence.indices().clone(); i[0] += rows
         incidence.append((i, d.incidence.values()))
         i = d.pairs.indices().clone(); i[0] += rows
         pairs.append((i, d.pairs.values()))
+        if d.parent_pairs is not None:
+            i = d.parent_pairs.indices().clone(); i[0] += rows
+            parent_pairs.append((i, d.parent_pairs.values()))
         rows += d.frozen.numel()
     J, n_cat = parts[0].incidence.shape[1], parts[0].pairs.shape[1]
 
@@ -310,7 +328,9 @@ def concat_designs(parts) -> BankDesign:
 
     return BankDesign(torch.cat([d.frozen for d in parts]), sparse(incidence, J),
                       torch.cat([d.household for d in parts]), torch.cat([d.gram for d in parts]),
-                      sparse(pairs, n_cat), torch.cat([d.size for d in parts]))
+                      sparse(pairs, n_cat), torch.cat([d.size for d in parts]),
+                      sparse(parent_pairs, parts[0].parent_pairs.shape[1])
+                      if parts[0].parent_pairs is not None else None)
 
 
 def round_designs(model, ix, observed: SlotBaskets, bank: SlotBaskets, U):
@@ -328,7 +348,7 @@ def damped_round(model, obs_design: BankDesign, bank_design_: BankDesign, draws:
     The observed and bank baskets enter only through their designs (per-basket sufficient
     statistics), so the caller may build them chunk by chunk and memory does not grow with
     contexts x assortment."""
-    names = ("lam", "theta", "rho_c", "rho_0_free")
+    names = ("lam", "theta", "rho_c", "rho_0_free") + (("rho_p",) if getattr(model, "P", 0) else ())
     N = obs_design.frozen.numel()
     with torch.no_grad():
         E_obs0 = design_energy(model, obs_design, C)

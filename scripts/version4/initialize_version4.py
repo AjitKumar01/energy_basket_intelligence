@@ -117,7 +117,8 @@ def main() -> None:
     model = RaggedModel(products, households, categories, K=args.K, Kz=args.Kz,
                         nmax=nmax, R=category_cap, seed=args.seed, S=stores,
                         Kp=args.Kp, phi_init=0.0, taste_init=0.03,
-                        household_size_rank1=args.household_size_rank1)
+                        household_size_rank1=args.household_size_rank1,
+                        group_parent=data["group_parent"] if "group_parent" in data else None)
     category = torch.zeros(products, dtype=torch.long)
     category[torch.as_tensor(data["line_item"], dtype=torch.long)] = \
         torch.as_tensor(data["line_cat"], dtype=torch.long)

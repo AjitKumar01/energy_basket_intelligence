@@ -167,3 +167,63 @@ def test_parent_penalty_gradient_matches_finite_differences(native_dp):
         with torch.no_grad():
             model.rho_p[p] += eps
         assert abs(float(grad[p]) - (up - down) / (2 * eps)) < 1e-6
+
+
+def test_no_interaction_size_law_matches_enumeration(native_dp):
+    """differentiable_log_size_beta0 (the additive stage's exact normaliser) on a nested model."""
+    from interaction_particles import differentiable_log_size_beta0
+    model = nested_model()
+    with torch.no_grad():
+        model.phi.zero_()
+    ix = one_trip_index()
+    got = differentiable_log_size_beta0(model, ix)[0].detach().numpy()          # sizes 1..NMAX
+    terms = exact_terms(model)
+    sizes = np.asarray([len(b) for b in BASKETS])
+    want = np.asarray([np.logaddexp.reduce(terms[sizes == n]) for n in range(1, NMAX + 1)])
+    assert np.allclose(got, want, atol=1e-10)
+
+
+def test_add_one_log_odds_include_the_parent_term(native_dp):
+    """E(S + j) - E(S) = b_j + phi_j'sum phi_S - rho_c[leaf]*rest_leaf - rho_p[parent]*rest_parent
+    - (rho_0(|S|+1) - rho_0(|S|)), for every basket S and product j outside it."""
+    from interaction_particles import rest_parent_penalty
+    model = nested_model()
+    phi, lam = model.phi.detach(), model.lam.detach()
+    rho0, rhoc = model.rho_0().detach(), model.rho_c.detach()
+    slot_cat = torch.as_tensor(LEAF)
+
+    def energy(items):
+        items = torch.as_tensor(items)
+        return float(model.energy(items, torch.zeros(len(items), dtype=torch.long),
+                                  torch.as_tensor(LEAF)[items], 1))
+
+    for S in [(0,), (0, 2), (1, 4, 6), (2, 3)]:
+        old = torch.zeros(J)
+        old[list(S)] = 1.0
+        parent_pen = rest_parent_penalty(model, torch.zeros(J, dtype=torch.long), slot_cat, old, 1)
+        leaf_counts = torch.bincount(slot_cat[list(S)], minlength=4).double()
+        for j in set(range(J)) - set(S):
+            logit = (lam[j] + phi[j] @ phi[list(S)].sum(0) - rhoc[LEAF[j]] * leaf_counts[LEAF[j]]
+                     - parent_pen[j] - (rho0[len(S) + 1] - rho0[len(S)]))
+            assert abs(float(logit) - (energy(list(S) + [j]) - energy(list(S)))) < 1e-12
+
+
+def test_refinement_energy_and_design_include_the_parent_penalty(native_dp):
+    """basket_energy and the sufficient-statistic design_energy equal the enumerated energy."""
+    from joint_refinement import (bank_design, basket_energy, baskets_from_items, design_energy,
+                                  orthonormal_basis, slot_table, taste_utility)
+    model = nested_model()
+    ix = one_trip_index()
+    table = slot_table(ix, J)
+    items = [list(b) for b in BASKETS[::7]]
+    baskets = baskets_from_items(table, [0] * len(items), items)
+    lookup = {b: i for i, b in enumerate(BASKETS)}
+    want = exact_terms(model)[[lookup[tuple(b)] for b in items]]
+    with torch.no_grad():
+        got = basket_energy(model, ix, baskets).numpy()
+        U, C = orthonormal_basis(model.phi, 2)
+        frozen = model.b_flat(ix) - taste_utility(model, ix)
+        design = bank_design(model, ix, baskets, U, frozen)
+        via_design = design_energy(model, design, C).numpy()
+    assert np.allclose(got, want, atol=1e-10)
+    assert np.allclose(via_design, want, atol=1e-10)

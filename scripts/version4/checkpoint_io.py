@@ -86,7 +86,8 @@ def load_checkpoint(path: Path, data, *, required_capabilities=()):
         K=int(meta["K"]), Kz=int(meta["Kz"]), nmax=int(meta["nmax"]),
         R=int(meta["R"]), seed=int(meta["seed"]), S=int(data["n_store"]),
         Kp=int(meta["Kp"]), phi_init=0.0,
-        household_size_rank1=bool(meta.get("household_size_rank1", False)))
+        household_size_rank1=bool(meta.get("household_size_rank1", False)),
+        group_parent=data["group_parent"] if "group_parent" in data else None)
     # Match the artifact before loading it.  Otherwise load_state_dict silently
     # casts float64 tensors into a float32 model when an evaluator has not set the
     # global default dtype, and the subsequent integrity digest correctly fails.

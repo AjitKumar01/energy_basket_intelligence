@@ -123,6 +123,12 @@ def locked_add_one(model, batcher, data, trips, seed, parent=None):
             gram = model.phi[available] @ model.phi[remainder].sum(0)
             category = (-model.rho_c[candidate_category]
                         * category_count[candidate_category])
+            if getattr(model, "P", 0):
+                # nested groups: the add-one score also carries the parent penalty
+                candidate_parent = model.group_parent[candidate_category]
+                parent_count = torch.bincount(model.group_parent[model.cat_of[remainder]],
+                                              minlength=model.P)
+                category = category - model.rho_p[candidate_parent] * parent_count[candidate_parent]
             additive = utility[slots]
             structured = additive + category
             scores = {
@@ -132,8 +138,14 @@ def locked_add_one(model, batcher, data, trips, seed, parent=None):
                 "full_interaction": (structured + gram).numpy(),
             }
             if parent is not None:
-                scores["additive_parent"] = (parent_utility[slots]
-                    - parent.rho_c[candidate_category] * category_count[candidate_category]).numpy()
+                parent_score = (parent_utility[slots]
+                    - parent.rho_c[candidate_category] * category_count[candidate_category])
+                if getattr(parent, "P", 0):
+                    candidate_parent = parent.group_parent[candidate_category]
+                    parent_count = torch.bincount(parent.group_parent[parent.cat_of[remainder]],
+                                                  minlength=parent.P)
+                    parent_score = parent_score - parent.rho_p[candidate_parent] * parent_count[candidate_parent]
+                scores["additive_parent"] = parent_score.numpy()
             for name, score in scores.items():
                 ranks[name].append(midrank(score, position))
             candidate_counts.append(available.numel())

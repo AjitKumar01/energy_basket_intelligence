@@ -23,6 +23,8 @@ import hashlib
 import json
 import math
 import os
+import subprocess
+import sys
 import time
 from pathlib import Path
 
@@ -125,6 +127,12 @@ def main():
     p.add_argument("--serial-sampler", action="store_true", help="single-threaded compiled backtrack")
     p.add_argument("--freeze", nargs="*", default=[], choices=["lam", "theta", "alpha", "rho_c", "rho_0_free"],
                    help="refined parameters to hold at the staged values")
+    p.add_argument("--size-gate", action="store_true",
+                   help="accept a round only if it also passes audit_population_size.py (the certification gate)")
+    p.add_argument("--size-gate-contexts", type=int, default=0, help="0 = every training context")
+    p.add_argument("--size-gate-confirm-contexts", type=int, default=2048)
+    p.add_argument("--size-gate-calibration-contexts", type=int, default=2048)
+    p.add_argument("--size-gate-chunk", type=int, default=48)
     p.add_argument("--train-probe", type=int, default=0,
                    help="also score the exact likelihood on this many training contexts every round")
     p.add_argument("--mixing-check", action="store_true")
@@ -229,7 +237,9 @@ def main():
     start_valid = validation(level)
     start_probe = validation(level, probe) if probe is not None else None
     select_score = float(validation(level, select).mean()) if select is not None else None
-    best_valid, best_round, best_state = start_valid, 0, None
+    best_valid, best_round = start_valid, 0
+    round_states = []                     # (round, validation per trip, state) for every completed round
+    progress_path = args.output.with_name(args.output.stem + "_progress.pt")
     U, C = orthonormal_basis(model.phi.detach(), rank)
     t0 = time.time()
     parts = []
@@ -344,34 +354,80 @@ def main():
               f"trust {record['trust']:g}, ESS {record['ess']}, bank {draw_seconds:.0f}s"
               f", solve {solve_seconds:.0f}s, validation {entry['validation_seconds']:.0f}s, "
               f"{entry['round_seconds']:.0f}s", flush=True)
+        round_states.append((rnd, v, {k: t.detach().clone() for k, t in model.state_dict().items()}))
         if v.mean() > best_valid.mean() + 1e-5:
             best_valid, best_round = v, rnd
-            best_state = {k: t.detach().clone() for k, t in model.state_dict().items()}
             payload = dict(blob)
-            payload["model"] = best_state
+            payload["model"] = round_states[-1][2]
             payload["joint_refinement"] = {"round": rnd, "rounds": rounds, "accepted": None}
-            torch.save(payload, args.output.with_suffix(".tmp")); os.replace(args.output.with_suffix(".tmp"), args.output)
+            torch.save(payload, progress_path.with_suffix(".tmp")); os.replace(progress_path.with_suffix(".tmp"), progress_path)
         if select is None and record["bank_gain"] < args.round_tolerance:
             break
 
-    decision = {"accepted": False, "reason": "no round improved validation"}
-    if best_state is not None:
-        model.load_state_dict(best_state)
-        gain = paired_score_summary(best_valid - start_valid, valid_households)
-        audit = validation(level + 1)
-        audit_gap = float(abs(audit.mean() - best_valid.mean()))
-        accepted = bool(gain["95_interval"][0] > 0 and audit_gap <= 0.01)
-        decision = {"accepted": accepted, "best_round": best_round,
-                    "validation_gain": {"mean": gain["mean"], "95_interval": gain["95_interval"]},
-                    "audit_level": level + 1, "audit_gap": audit_gap,
-                    "reason": "positive paired gain and numerical audit passed" if accepted else
-                    "gain interval or numerical audit failed"}
+    # Acceptance: rounds are tried in order of held-out validation; the first that has a positive
+    # paired gain interval, passes the numerical audit one level finer and (with --size-gate) the
+    # pipeline's population-size safety audit is the output.  None passing keeps the staged model.
+    def save(state, path, decision):
         payload = dict(blob)
-        payload["model"] = best_state
+        payload["model"] = state
         payload["joint_refinement"] = {"decision": decision, "rounds": rounds, "contexts": int(len(trips)),
                                        "draws_per_context": draws, "evaluation_level": level,
                                        "frozen": "price, promotion, season, store blocks; Phi basis"}
-        torch.save(payload, args.output.with_suffix(".tmp")); os.replace(args.output.with_suffix(".tmp"), args.output)
+        torch.save(payload, path.with_suffix(".tmp")); os.replace(path.with_suffix(".tmp"), path)
+
+    def size_gate(state, rnd, attempt):
+        path = args.output.with_name(f"{args.output.stem}_round{rnd}.pt")
+        save(state, path, attempt)
+        report_path = (args.report or args.output).with_name(
+            f"{args.output.stem}_round{rnd}_population_size.json")
+        command = [sys.executable, "-u", str(Path(__file__).with_name("audit_population_size.py")),
+                   "--checkpoint", str(path), "--rank", str(rank), "--screen-level", str(level - 1),
+                   "--confirm-level", str(level), "--contexts", str(args.size_gate_contexts),
+                   "--confirm-contexts", str(args.size_gate_confirm_contexts),
+                   "--calibration-contexts", str(args.size_gate_calibration_contexts),
+                   "--chunk", str(args.size_gate_chunk), "--threads", str(args.threads),
+                   "--output", str(report_path)]
+        code = subprocess.run(command, check=False).returncode
+        try:
+            audit_report = json.loads(report_path.read_text())
+            passed, gates = bool(audit_report.get("passed")), audit_report.get("gates")
+        except Exception:
+            passed, gates = False, None
+        path.unlink(missing_ok=True)
+        return passed, {"exit_code": code, "passed": passed, "gates": gates, "report": str(report_path)}
+
+    decision = {"accepted": False, "reason": "no round improved validation", "attempts": []}
+    ordered = sorted((r for r in round_states if r[1].mean() > start_valid.mean() + 1e-5),
+                     key=lambda r: -float(r[1].mean()))
+    for rnd, v, state in ordered:
+        model.load_state_dict(state)
+        gain = paired_score_summary(v - start_valid, valid_households)
+        attempt = {"round": rnd, "validation_gain": {"mean": gain["mean"], "95_interval": gain["95_interval"]}}
+        if not gain["95_interval"][0] > 0:
+            decision["attempts"].append({**attempt, "result": "gain interval includes zero"})
+            continue
+        audit_gap = float(abs(validation(level + 1).mean() - v.mean()))
+        attempt.update(audit_level=level + 1, audit_gap=audit_gap)
+        if audit_gap > 0.01:
+            decision["attempts"].append({**attempt, "result": "numerical audit failed"})
+            continue
+        if args.size_gate:
+            passed, size = size_gate(state, rnd, attempt)
+            attempt["population_size"] = size
+            print(f"[joint-refinement] round {rnd}: population-size gate {'passed' if passed else 'FAILED'} "
+                  f"{size['gates']}", flush=True)
+            if not passed:
+                decision["attempts"].append({**attempt, "result": "population-size gate failed"})
+                continue
+        decision = {**attempt, "accepted": True, "best_round": rnd,
+                    "attempts": decision["attempts"] + [{**attempt, "result": "accepted"}],
+                    "reason": "positive paired gain, numerical audit"
+                              + (" and population-size gate" if args.size_gate else "") + " passed"}
+        save(state, args.output, decision)
+        break
+    else:
+        if ordered:
+            decision["reason"] = "no improving round passed every acceptance gate"
     print(f"[joint-refinement] decision {json.dumps(decision)} ({time.time() - started:.0f}s)", flush=True)
     if args.report is not None:
         def digest(path):

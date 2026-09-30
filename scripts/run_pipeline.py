@@ -903,6 +903,12 @@ def main() -> None:
                 "--validation-trips", 1024 if full else 64,
                 "--selection-trips", 1024 if full else 64,
                 "--level-offset", args.evaluation_level_offset,
+                # the certification stage's population-size audit is also an acceptance gate here
+                "--size-gate",
+                "--size-gate-contexts", 0 if full else 128,
+                "--size-gate-confirm-contexts", 2048 if full else 8,
+                "--size-gate-calibration-contexts", 2048 if full else 16,
+                "--size-gate-chunk", 48 if full else 8,
                 "--threads", cpu_threads))
         candidate = refined_candidate(staged_candidate, refined, refinement_report,
                                       dry_run=driver.dry_run)

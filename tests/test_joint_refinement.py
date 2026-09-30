@@ -287,3 +287,39 @@ def test_chunked_designs_equal_the_whole_design(native_dp):
     chunked = concat_designs(parts)
     assert torch.allclose(design_energy(model, chunked, C), design_energy(model, whole, C), atol=1e-12)
     assert torch.equal(chunked.incidence.to_dense(), whole.incidence.to_dense())
+
+
+def test_household_size_shift_tilts_each_household_size_law_exactly(native_dp):
+    """apply_household_size_shift (the household-size stage's update) multiplies household h's
+    size law by exp(n kappa_h) and renormalizes, leaving fixed-size composition unchanged."""
+    from fit_joint_refinement import apply_household_size_shift
+    model = toy_model()
+    model.household_size_rank1 = True
+    g = torch.Generator().manual_seed(12)
+    households = 3
+    with torch.no_grad():
+        model.theta = torch.nn.Parameter(0.3 * torch.randn(households, model.alpha.shape[1], generator=g))
+        model.alpha.copy_(0.3 * torch.randn(model.alpha.shape, generator=g))
+    model.house = torch.arange(households)
+    ix = replicated_index(households)
+    table = slot_table(ix, J)
+    sizes = np.asarray([len(b) for b in BASKETS])
+
+    def laws():
+        out = []
+        for h in range(households):
+            baskets = baskets_from_items(table, [h] * len(BASKETS), [list(b) for b in BASKETS])
+            with torch.no_grad():
+                energy = basket_energy(model, ix, baskets).numpy()
+            p = np.exp(energy - np.logaddexp.reduce(energy))
+            out.append(p)
+        return out
+
+    before = laws()
+    kappa = np.asarray([0.2, -0.1, 0.05])
+    apply_household_size_shift(model, kappa)
+    after = laws()
+    for h in range(households):
+        expected = before[h] * np.exp(kappa[h] * sizes)
+        expected /= expected.sum()
+        assert np.allclose(after[h], expected, atol=1e-12)

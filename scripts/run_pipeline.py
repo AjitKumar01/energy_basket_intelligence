@@ -853,6 +853,9 @@ def main() -> None:
                 "--validation-trips", 1024 if full else 64,
                 "--selection-trips", 1024 if full else 64,
                 "--level-offset", args.evaluation_level_offset,
+                # keep the household-size stage's contract (same cap and screen) in every round
+                "--household-size-cap", 0.35,
+                "--household-size-chunk", 48 if full else 8,
                 # the certification stage's population-size audit is also an acceptance gate here
                 "--size-gate",
                 "--size-gate-contexts", 0 if full else 128,

@@ -10,6 +10,10 @@ when the selection score stops improving.  See joint_refinement.py and
 docs/JOINT_REFINEMENT_STAGE.md.
 
 Frozen: the certified price component, promotion, season and store blocks, and Phi's basis.
+After each round's step, the household-size stage's safety projection is re-applied (with
+--household-size-cap): every household's size coordinate kappa_h is lowered, if needed, until
+none of its training contexts puts more than the cap on baskets at or above the tail threshold,
+exactly as fit_household_size_rank1.py does for the staged model.
 Kept from the staged model: its energy, its Phi contract (0 <= C <= cap), its rho_c clamps and its
 pooling term.  Rounds are tried in order of held-out validation; the first with a positive
 paired 95% gain interval that passes the one-level-finer numerical audit and (with --size-gate)
@@ -39,7 +43,9 @@ from features import Features
 from fit import Batcher
 from joint_refinement import (SlotBaskets, bank_design, baskets_from_items, concat_designs, damped_round,
                               draw_bank, orthonormal_basis, set_phi_from, slot_table, taste_utility)
-from pipeline_support import install_quadrature, smolyak_rule, supported_trips
+from audit_population_size import collect_resilient_size_law
+from fit_household_size_rank1 import cap_households
+from pipeline_support import install_quadrature, size_tail_threshold, smolyak_rule, supported_trips
 from uncertainty import paired_score_summary
 
 torch.set_default_dtype(torch.float64)
@@ -88,6 +94,19 @@ def draw_all(model, batcher, trips, table, chains, draws_per_chain, burn, batch,
     return SlotBaskets(torch.cat(slots), torch.cat(basket), torch.cat(context))
 
 
+@torch.no_grad()
+def apply_household_size_shift(model, kappa: np.ndarray) -> None:
+    """Add kappa_h to every product's utility for household h, as fit_household_size_rank1.py does.
+
+    theta_c subtracts the unweighted household mean, so the removed global shift is moved into
+    rho_0; the implemented law then tilts household h's size law by exactly exp(n kappa_h)."""
+    if not np.any(kappa != 0.0):
+        return
+    model.theta[:, -1].add_(torch.as_tensor(kappa, dtype=model.theta.dtype))
+    model.project_context_gauges()
+    model.rho_0_free.sub_(float(kappa.mean()) * torch.arange(1, model.nmax + 1, dtype=model.rho_0_free.dtype))
+
+
 def file_digest(path: Path) -> str:
     h = hashlib.sha256()
     with open(path, "rb") as f:
@@ -127,6 +146,11 @@ def main():
     p.add_argument("--level-offset", type=int, default=2, help="evaluation level = rank + offset")
     p.add_argument("--node-item-trips", type=int, default=16_000_000,
                    help="quadrature nodes x products x trips per validation batch (memory-bound above this)")
+    p.add_argument("--household-size-cap", type=float, default=0.0,
+                   help="re-apply the household-size stage's screen-tail cap (e.g. 0.35) after every round; 0 = off")
+    p.add_argument("--household-size-screen-offset", type=int, default=1,
+                   help="screen level for the household-size cap = rank + offset (the stage's own setting)")
+    p.add_argument("--household-size-chunk", type=int, default=48)
     p.add_argument("--size-gate", action="store_true",
                    help="accept a round only if it also passes audit_population_size.py (the certification gate)")
     p.add_argument("--size-gate-contexts", type=int, default=0, help="0 = every training context")
@@ -246,6 +270,30 @@ def main():
         model.project_context_gauges()
         return ok, record, C_new
 
+    population = supported_trips(data, 0, nmax)
+    population_household = np.asarray(data["trip_user"])[population].astype(np.int64)
+    tail_threshold = size_tail_threshold(data, nmax)
+
+    def household_size_projection():
+        """The household-size stage's safety projection on the current model.
+
+        Screens the size law of every supported training context, lowers kappa_h (the reserved
+        theta coordinate) until each household's worst tail P(N >= tail threshold) is at most
+        the cap (fit_household_size_rank1.cap_households), and moves the mean shift into rho_0
+        exactly as that stage does, so the implemented law receives exactly kappa_h."""
+        screen = rank + args.household_size_screen_offset
+        levels = [screen, screen + 1, screen + 2]
+        rules = [smolyak_rule(model, rank, level) for level in levels]
+        _observed, log_probability, _used = collect_resilient_size_law(
+            model, batcher, population, rules, levels, args.household_size_chunk, "household-size cap")
+        n_household = int(data["n_user"])
+        kappa, upper_bound = cap_households(np.asarray(log_probability), population_household,
+                                            np.zeros(n_household), n_household,
+                                            args.household_size_cap, tail_threshold)
+        apply_household_size_shift(model, kappa)
+        return {"capped_households": int(np.isfinite(upper_bound).sum()),
+                "largest_decrease": float(-kappa.min()) if len(kappa) else 0.0}
+
     rounds = []
     print(f"[joint-refinement] staged start: validation {start_valid.mean():.5f} at level {level} "
           f"({time.time() - started:.0f}s)", flush=True)
@@ -282,10 +330,18 @@ def main():
         model.load_state_dict(best[1])
         C, record = best[2], best[3]
         solve_seconds = time.time() - t1
+        size_cap = None
+        if args.household_size_cap > 0:
+            t_cap = time.time()
+            size_cap = household_size_projection()
+            print(f"[joint-refinement] round {rnd}: household-size cap {args.household_size_cap:g} "
+                  f"lowered {size_cap['capped_households']} households' kappa (largest decrease "
+                  f"{size_cap['largest_decrease']:.4f}) ({time.time() - t_cap:.0f}s)", flush=True)
         t2 = time.time()
         v = validation(level, valid)
         entry = {"round": rnd, "trust": record["trust"], "selection": record["selection"],
                  "bank_gain": record["bank_gain"], "ess": record["ess"], "validation": float(v.mean()),
+                 "household_size_cap": size_cap,
                  "draw_seconds": draw_seconds, "solve_seconds": solve_seconds,
                  "validation_seconds": time.time() - t2, "round_seconds": time.time() - t0}
         rounds.append(entry)

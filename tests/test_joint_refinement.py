@@ -7,7 +7,8 @@ import pytest
 import torch
 
 from joint_refinement import (SlotBaskets, bank_design, baskets_from_items, basket_energy, damped_round,
-                              design_energy, draw_bank, orthonormal_basis, slot_table, taste_utility)
+                              design_energy, draw_bank, orthonormal_basis, round_designs, slot_table,
+                              taste_utility)
 from ragged import RaggedIndex, RaggedModel
 
 torch.set_default_dtype(torch.float64)
@@ -145,7 +146,7 @@ def test_one_damped_round_raises_the_exact_likelihood(native_dp):
 
     before = exact_loglik(model)
     U, C = orthonormal_basis(model.phi.detach(), 2)
-    ok, record = damped_round(model, ix, observed, bank, draws, U, C, 2, [1, 10, 100, 1000],
+    ok, record = damped_round(model, *round_designs(model, ix, observed, bank, U), draws, U, C, 2, [1, 10, 100, 1000],
                               lambda ess: (float(ess.quantile(0.05)) >= 0.3, float(ess.quantile(0.05))),
                               cycles=2, pool_prod=0.0, cap=10.0, log=lambda *_: None)
     assert ok
@@ -288,3 +289,26 @@ def test_parallel_compiled_draws_do_not_depend_on_the_thread_count(native_dp):
         results.append(compiled_draws(*tables, index, 50, torch.Generator().manual_seed(9), parallel=True))
     numba.set_num_threads(numba.config.NUMBA_NUM_THREADS)
     assert torch.equal(results[0][0], results[1][0]) and torch.equal(results[0][1], results[1][1])
+
+
+def test_chunked_designs_equal_the_whole_design(native_dp):
+    """Designs built per context chunk and stacked equal the design over all contexts at once."""
+    from joint_refinement import concat_designs
+    model = toy_model()
+    contexts = 9
+    model.house = torch.zeros(contexts, dtype=torch.long)
+    g = torch.Generator().manual_seed(11)
+    items = [list(BASKETS[i]) for i in torch.randint(len(BASKETS), (contexts,), generator=g).tolist()]
+    U, C = orthonormal_basis(model.phi.detach(), 2)
+    ix = replicated_index(contexts)
+    whole, _ = round_designs(model, ix, baskets_from_items(slot_table(ix, J), list(range(contexts)), items),
+                             baskets_from_items(slot_table(ix, J), list(range(contexts)), items), U)
+    parts = []
+    for c0, c1 in ((0, 4), (4, 9)):
+        sub = replicated_index(c1 - c0)
+        model.house = torch.zeros(c1 - c0, dtype=torch.long)
+        obs = baskets_from_items(slot_table(sub, J), list(range(c1 - c0)), items[c0:c1])
+        parts.append(round_designs(model, sub, obs, obs, U)[0])
+    chunked = concat_designs(parts)
+    assert torch.allclose(design_energy(model, chunked, C), design_energy(model, whole, C), atol=1e-12)
+    assert torch.equal(chunked.incidence.to_dense(), whole.incidence.to_dense())

@@ -35,7 +35,8 @@ from checkpoint_io import load_checkpoint
 from data import build
 from features import Features
 from fit import Batcher
-from joint_refinement import (SlotBaskets, baskets_from_items, damped_round, draw_bank_fast,
+from joint_refinement import (SlotBaskets, bank_design, baskets_from_items, concat_designs, damped_round,
+                              draw_bank_fast,
                               orthonormal_basis, set_phi_from, slot_table, taste_utility)
 from pipeline_support import install_quadrature, smolyak_rule, supported_trips
 from uncertainty import paired_score_summary
@@ -98,6 +99,8 @@ def main():
     p.add_argument("--burn", type=int, default=3)
     p.add_argument("--baskets-per-z", type=int, default=2)
     p.add_argument("--batch-contexts", type=int, default=128)
+    p.add_argument("--chunk-contexts", type=int, default=1024,
+                   help="contexts whose assortments are held in memory at once (multiple of --batch-contexts)")
     p.add_argument("--rounds", type=int, default=10)
     p.add_argument("--round-tolerance", type=float, default=1e-4)
     p.add_argument("--trust-ladder", type=float, nargs="+", default=[1, 10, 100, 1e3, 1e4, 1e5])
@@ -137,36 +140,43 @@ def main():
     features = Features(J, int(data["n_store"]), include_recency=False)
     batcher = Batcher(data, features, nmax, include_recency=False)
     trips = choose_contexts(data, nmax, args.contexts_per_household, args.max_contexts, rng)
-    ix, ctx, _lc, house, *_ = batcher.make(trips)
-    full = (house, ctx)
-    model.house, model.ctx = full
-    table = slot_table(ix, J)
     observed_items = observed_items_of(data, trips)
-    observed = baskets_from_items(table, list(range(len(trips))), observed_items)
+    if args.chunk_contexts % args.batch_contexts:
+        raise ValueError("--chunk-contexts must be a multiple of --batch-contexts")
+    chunks = [(a, min(a + args.chunk_contexts, len(trips))) for a in range(0, len(trips), args.chunk_contexts)]
+
+    def chunk_index(a, b):
+        """Assortment index of contexts a..b; installs their household/context arrays."""
+        ixc, ctxc, _lc, housec, *_ = batcher.make(trips[a:b])
+        model.house, model.ctx = housec, ctxc
+        return ixc, slot_table(ixc, J), (housec, ctxc)
+
     draws = args.chains * args.draws_per_chain * args.baskets_per_z
     households = np.asarray(data["trip_user"])[trips]
     print(f"[joint-refinement] {len(trips)} contexts from {len(np.unique(households))} households "
           f"(<= {args.contexts_per_household} each), {draws} draws per context, rank {rank}", flush=True)
 
     # the frozen/refined utility split must reproduce b_flat exactly under a parameter move
+    ix, table, _ = chunk_index(*chunks[0])
     with torch.no_grad():
         frozen = model.b_flat(ix) - taste_utility(model, ix)
         saved = model.lam.clone(); model.lam.add_(0.01 * torch.randn(J, generator=generator))
         split_error = float((model.b_flat(ix) - frozen - taste_utility(model, ix)).abs().max())
         model.lam.copy_(saved)
+    del ix, table, frozen
     if split_error > 1e-10:
         raise RuntimeError(f"utility split does not reproduce b_flat (max error {split_error:.2e})")
 
     if args.mixing_check:
         sample = np.sort(rng.choice(len(trips), size=min(200, len(trips)), replace=False))
         t0 = time.time()
-        banks = [draw_all(model, batcher, trips[sample], slot_table(batcher.make(trips[sample])[0], J),
+        sub_ix, sub_ctx, _lc, sub_house, *_ = batcher.make(trips[sample])
+        banks = [draw_all(model, batcher, trips[sample], slot_table(sub_ix, J),
                           args.chains, args.draws_per_chain, args.burn, args.batch_contexts,
-                          torch.Generator().manual_seed(args.seed + k), full,
+                          torch.Generator().manual_seed(args.seed + k), (sub_house, sub_ctx),
                           [observed_items[i] for i in sample], args.baskets_per_z, not args.serial_sampler)
                  for k in range(4)]
         bank_seconds = (time.time() - t0) / 4
-        sub_ix = batcher.make(trips[sample])[0]
         sizes = [torch.bincount(b.basket, minlength=b.n).double().mean().item() for b in banks]
         incidence = []
         for b in banks:
@@ -206,7 +216,6 @@ def main():
                 vix, vctx, vline, vhouse, li, lt, lc, _lq = batcher.make(subset[s:s + batch])
                 model.house, model.ctx = vhouse, vctx
                 out.append(model.energy(li, lt, lc, vix.B, vline) - model.log_Z(vix, drop_empty=True))
-        model.house, model.ctx = full
         model.quad = None
         return torch.cat(out).numpy()
 
@@ -216,6 +225,33 @@ def main():
     select_score = float(validation(level, select).mean()) if select is not None else None
     best_valid, best_round, best_state = start_valid, 0, None
     U, C = orthonormal_basis(model.phi.detach(), rank)
+    t0 = time.time()
+    parts = []
+    for a, b in chunks:
+        ixc, tablec, _ = chunk_index(a, b)
+        with torch.no_grad():
+            frozen = model.b_flat(ixc) - taste_utility(model, ixc)
+            observed_c = baskets_from_items(tablec, list(range(b - a)), observed_items[a:b])
+            parts.append(bank_design(model, ixc, observed_c, U, frozen))
+    obs_design = concat_designs(parts)
+    del parts, ixc, tablec, frozen
+    print(f"[joint-refinement] observed design for {len(trips)} contexts in {len(chunks)} chunks "
+          f"({time.time() - t0:.0f}s)", flush=True)
+
+    def bank_designs_for_round():
+        """Draw the bank chunk by chunk and keep only its per-basket statistics."""
+        parts = []
+        for a, b in chunks:
+            ixc, tablec, chunk_full = chunk_index(a, b)
+            bank_c = draw_all(model, batcher, trips[a:b], tablec, args.chains, args.draws_per_chain, args.burn,
+                              args.batch_contexts, generator, chunk_full, observed_items[a:b],
+                              args.baskets_per_z, not args.serial_sampler)
+            with torch.no_grad():
+                model.house, model.ctx = chunk_full
+                frozen = model.b_flat(ixc) - taste_utility(model, ixc)
+                parts.append(bank_design(model, ixc, bank_c, U, frozen))
+        return concat_designs(parts)
+
     capacities = category_capacities(data, int(data["n_cat"]), nmax)
 
     def ess_rule(ess):
@@ -228,14 +264,12 @@ def main():
           f"({time.time() - started:.0f}s)", flush=True)
     for rnd in range(1, args.rounds + 1):
         t0 = time.time()
-        bank = draw_all(model, batcher, trips, table, args.chains, args.draws_per_chain, args.burn,
-                        args.batch_contexts, generator, full, observed_items, args.baskets_per_z,
-                        not args.serial_sampler)
+        bank_design_ = bank_designs_for_round()
         draw_seconds = time.time() - t0
         t1 = time.time()
 
         def step(trust_levels, theta_scale):
-            ok, record = damped_round(model, ix, observed, bank, draws, U, C, rank, trust_levels, ess_rule,
+            ok, record = damped_round(model, obs_design, bank_design_, draws, U, C, rank, trust_levels, ess_rule,
                                       args.cycles, args.pool_prod, args.cap,
                                       log=lambda m: print(m, flush=True), frozen_names=tuple(args.freeze),
                                       trust_scale={"theta": theta_scale})

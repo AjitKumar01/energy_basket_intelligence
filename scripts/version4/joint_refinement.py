@@ -346,21 +346,50 @@ def bank_statistics(dE_bank: torch.Tensor):
     return (1.0 / w.square().sum(1)) / dE_bank.shape[1]
 
 
-def damped_round(model, ix, observed: SlotBaskets, bank: SlotBaskets, draws: int, U, C,
+def concat_designs(parts) -> BankDesign:
+    """Stack per-chunk designs (baskets in chunk order) into one design."""
+    rows = 0
+    incidence, pairs = [], []
+    for d in parts:
+        i = d.incidence.indices().clone(); i[0] += rows
+        incidence.append((i, d.incidence.values()))
+        i = d.pairs.indices().clone(); i[0] += rows
+        pairs.append((i, d.pairs.values()))
+        rows += d.frozen.numel()
+    J, n_cat = parts[0].incidence.shape[1], parts[0].pairs.shape[1]
+
+    def sparse(chunks, width):
+        return torch.sparse_coo_tensor(torch.cat([c[0] for c in chunks], 1), torch.cat([c[1] for c in chunks]),
+                                       (rows, width)).coalesce()
+
+    return BankDesign(torch.cat([d.frozen for d in parts]), sparse(incidence, J),
+                      torch.cat([d.household for d in parts]), torch.cat([d.gram for d in parts]),
+                      sparse(pairs, n_cat), torch.cat([d.size for d in parts]))
+
+
+def round_designs(model, ix, observed: SlotBaskets, bank: SlotBaskets, U):
+    """Designs of the observed and bank baskets over one assortment index (all contexts at once)."""
+    with torch.no_grad():
+        frozen = model.b_flat(ix) - taste_utility(model, ix)
+        return bank_design(model, ix, observed, U, frozen), bank_design(model, ix, bank, U, frozen)
+
+
+def damped_round(model, obs_design: BankDesign, bank_design_: BankDesign, draws: int, U, C,
                  rank: int, trust_ladder, ess_rule, cycles: int, pool_prod: float,
                  cap: float, log=print, frozen_names=(), trust_scale=None):
     """One round: parent = current model; returns (accepted, record).
+
+    The observed and bank baskets enter only through their designs (per-basket sufficient
+    statistics), so the caller may build them chunk by chunk and memory does not grow with
+    contexts x assortment.
 
     frozen_names: refined parameters to hold at their current values this round (e.g. "theta").
     trust_scale: per-parameter multipliers on the trust penalty (e.g. {"theta": 10} shrinks the
     household taste update ten times harder than the population parameters)."""
     trust_scale = trust_scale or {}
     names = tuple(n for n in ("lam", "theta", "rho_c", "rho_0_free") if n not in frozen_names)
-    N = observed.n
+    N = obs_design.frozen.numel()
     with torch.no_grad():
-        frozen = model.b_flat(ix) - taste_utility(model, ix)
-        obs_design = bank_design(model, ix, observed, U, frozen)
-        bank_design_ = bank_design(model, ix, bank, U, frozen)
         E_obs0 = design_energy(model, obs_design, C)
         E_bank0 = design_energy(model, bank_design_, C)
     start = {name: getattr(model, name).detach().clone() for name in names + ("alpha",)}

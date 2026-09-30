@@ -865,15 +865,153 @@ def log_f_ragged(model, z, ix, drop_empty=False, return_terms=False,
     return torch.logsumexp(lg, dim=-1).transpose(0, 1)              # [B, D]
 
 
+def _log_product(log_factors, degree, nmax):
+    """Log coefficients of the product of polynomials along axis -2, truncated at nmax.
+
+    log_factors [D, B, F, W] (W >= nmax + 1 after padding), degree [B, F].  One linear degree
+    tilt per (D, B) keeps every coefficient <= 1 before the native product; it is an exact
+    generating-polynomial identity and is added back afterwards."""
+    from poly_degree_native import log_poly_tree_degree_native
+    D, B, F, W = log_factors.shape
+    if W < nmax + 1:
+        pad = torch.full((D, B, F, nmax + 1 - W), -float("inf"),
+                         dtype=log_factors.dtype, device=log_factors.device)
+        log_factors = torch.cat([log_factors, pad], dim=-1)
+        W = nmax + 1
+    axis = torch.arange(W, dtype=log_factors.dtype, device=log_factors.device)
+    slope = (log_factors[..., 1:] / axis[1:]).amax(dim=(2, 3)).clamp_min(0.0)       # [D, B]
+    slope = torch.nan_to_num(slope, nan=0.0, neginf=0.0)
+    tilted = log_factors - slope[:, :, None, None] * axis
+    out = log_poly_tree_degree_native(tilted.contiguous(), degree.contiguous(), nmax)
+    return out + slope.unsqueeze(-1) * axis[:nmax + 1]
+
+
+def nested_layout(model, ix):
+    """Integer bookkeeping for the parent level of a batch: parent rows (trip, parent) with
+    the position of every leaf row inside its parent row and of every parent row in its trip."""
+    row_parent = model.group_parent[ix.row_cat]
+    key = ix.row_trip * model.P + row_parent
+    pkey, row_prow = torch.unique(key, return_inverse=True)                      # parent rows
+    prow_trip, prow_parent = pkey // model.P, pkey % model.P
+    order = torch.argsort(row_prow * (ix.n_rows + 1) + torch.arange(ix.n_rows, device=key.device))
+    counts = torch.bincount(row_prow, minlength=len(pkey))
+    start = torch.zeros(len(pkey), dtype=torch.long, device=key.device)
+    start[1:] = torch.cumsum(counts, 0)[:-1]
+    leaf_pos = torch.empty(ix.n_rows, dtype=torch.long, device=key.device)
+    leaf_pos[order] = torch.arange(ix.n_rows, device=key.device) - start[row_prow[order]]
+    Lpad = int(counts.max()) if len(counts) else 1
+    pcount = torch.bincount(prow_trip, minlength=ix.B)
+    pstart = torch.zeros(ix.B, dtype=torch.long, device=key.device)
+    pstart[1:] = torch.cumsum(pcount, 0)[:-1]
+    prow_pos = torch.arange(len(pkey), device=key.device) - pstart[prow_trip]    # pkey sorted by trip
+    Ppad = int(pcount.max()) if len(pcount) else 1
+    return dict(row_prow=row_prow, leaf_pos=leaf_pos, Lpad=Lpad, n_prow=len(pkey),
+                prow_trip=prow_trip, prow_parent=prow_parent, prow_pos=prow_pos, Ppad=Ppad)
+
+
+def log_f_nested(model, z, ix, drop_empty=False, return_terms=False):
+    """log f(z) for a model with nested groups.  z [B, D, Kz] -> [B, D].
+
+    Exact program, all in log coordinates:
+      1. leaf row: log ESP of its products' weights exp(b_j - |phi_j|^2/2 + phi_j'z), times the
+         leaf potential exp(-rho_c C(t, 2));
+      2. parent row: product of its leaf polynomials, times exp(-rho_p C(t, 2));
+      3. trip: product of its parent polynomials, then exp(-rho_0(n)).
+    A conditional (revealed-basket) law shifts both potentials by the revealed counts, exactly
+    as the flat program does for categories."""
+    D = z.shape[1]
+    nmax, R = model.nmax, model.R
+    dt, dev = model.lam.dtype, model.lam.device
+    phi_i = model.phi[ix.item]
+    bt = model.b_flat(ix) - 0.5 * (phi_i ** 2).sum(-1)                              # [T]
+    proj = (z[ix.item_trip] * phi_i.unsqueeze(1)).sum(-1)                           # [T, D]
+    logw = (bt.unsqueeze(1) + proj).transpose(0, 1)                                 # [D, T]
+    M = seg_max(logw, ix.item_trip, ix.B)                                           # [D, B]
+    centred = logw - M.index_select(-1, ix.item_trip)
+    logE = esp_log_bucketed(centred, ix.row_of, ix.n_rows, R, ix.row_size, ix.item_pos,
+                            blocked=bool(getattr(model, "_esp_log_blocked", True)))  # [D, rows, R+1]
+    r = torch.arange(R + 1, dtype=dt, device=dev)
+    lay = nested_layout(model, ix)
+    base_cat = getattr(model, "_condition_cat_count", None)
+    if base_cat is None:
+        log_leaf = -model.rho_c[ix.row_cat].unsqueeze(-1) * model.pair_feature(r)
+    else:
+        base_row = base_cat[ix.row_trip, ix.row_cat].to(dt)
+        log_leaf = -model.rho_c[ix.row_cat].unsqueeze(-1) * (
+            model.pair_feature(base_row.unsqueeze(-1) + r) - model.pair_feature(base_row).unsqueeze(-1))
+        log_leaf = torch.where(r <= (R - base_row).unsqueeze(-1), log_leaf,
+                               torch.full_like(log_leaf, -float("inf")))
+    logG_leaf = logE + log_leaf.unsqueeze(0)                                        # [D, rows, R+1]
+    # 2. parent rows
+    width = max(R, nmax) + 1
+    logL = torch.full((D, lay["n_prow"] * lay["Lpad"], width), -float("inf"), dtype=dt, device=dev)
+    logL[..., 0] = 0.0
+    flat_leaf = lay["row_prow"] * lay["Lpad"] + lay["leaf_pos"]
+    logL[:, flat_leaf, :R + 1] = logG_leaf
+    logL = logL.view(D, lay["n_prow"], lay["Lpad"], width)
+    leaf_degree = torch.zeros(lay["n_prow"] * lay["Lpad"], dtype=torch.long, device=dev)
+    leaf_degree[flat_leaf] = ix.row_size.clamp(max=R)
+    leaf_degree = leaf_degree.view(lay["n_prow"], lay["Lpad"])
+    logPar = _log_product(logL, leaf_degree, nmax)                                  # [D, prows, nmax+1]
+    rp = torch.arange(nmax + 1, dtype=dt, device=dev)
+    if base_cat is None:
+        log_par = -model.rho_p[lay["prow_parent"]].unsqueeze(-1) * model.pair_feature(rp)
+    else:
+        base_par = torch.zeros(ix.B, model.P, dtype=dt, device=dev).index_add_(
+            1, model.group_parent, base_cat.to(dt))[lay["prow_trip"], lay["prow_parent"]]
+        log_par = -model.rho_p[lay["prow_parent"]].unsqueeze(-1) * (
+            model.pair_feature(base_par.unsqueeze(-1) + rp) - model.pair_feature(base_par).unsqueeze(-1))
+    logPar = logPar + log_par.unsqueeze(0)
+    par_degree = leaf_degree.sum(1).clamp(max=nmax)
+    # 3. trips
+    logT = torch.full((D, ix.B * lay["Ppad"], nmax + 1), -float("inf"), dtype=dt, device=dev)
+    logT[..., 0] = 0.0
+    flat_par = lay["prow_trip"] * lay["Ppad"] + lay["prow_pos"]
+    logT[:, flat_par] = logPar
+    logT = logT.view(D, ix.B, lay["Ppad"], nmax + 1)
+    trip_degree = torch.zeros(ix.B * lay["Ppad"], dtype=torch.long, device=dev)
+    trip_degree[flat_par] = par_degree
+    logA = _log_product(logT.view(D, ix.B, lay["Ppad"], nmax + 1),
+                        trip_degree.view(ix.B, lay["Ppad"]), nmax)                  # [D, B, nmax+1]
+    n = torch.arange(nmax + 1, dtype=dt, device=dev)
+    rho0_all = model.rho_0()
+    base_size = getattr(model, "_condition_size", None)
+    if base_size is None:
+        lg = logA - rho0_all[:nmax + 1] + n * M.unsqueeze(-1)
+    else:
+        base_size = base_size.to(dtype=torch.long, device=dev)
+        total_n = base_size.unsqueeze(-1) + n.to(torch.long).unsqueeze(0)
+        valid = total_n < rho0_all.numel()
+        rho0 = rho0_all[total_n.clamp(max=rho0_all.numel() - 1)] - rho0_all[base_size].unsqueeze(-1)
+        lg = (logA - rho0 + n * M.unsqueeze(-1)).masked_fill(~valid.unsqueeze(0), -float("inf"))
+    if drop_empty:
+        lg = lg[..., 1:]
+    if return_terms:
+        return lg
+    return torch.logsumexp(lg, dim=-1).transpose(0, 1)
+
+
 class RaggedModel(torch.nn.Module):
     """Same parameters and the same three quantities as core.Model, ragged over items."""
 
     def __init__(self, J, N, C, K=8, Kz=3, nmax=24, R=4, seed=0,
                  S=1, Kp=8, Kt=8, Ks=4, n_week=53, phi_init=0.03,
-                 taste_init=0.3, household_size_rank1=False):
+                 taste_init=0.3, household_size_rank1=False, group_parent=None):
         super().__init__()
         g = torch.Generator().manual_seed(seed)
         self.J, self.N, self.C, self.S = J, N, C, S
+        # Optional nested substitution groups.  The C groups (rows of the exact program) are
+        # the leaves; ``group_parent[c]`` names the parent group of leaf c.  The energy then
+        # has one penalty per leaf AND one per parent:
+        #     - sum_c rho_c C(n_c, 2) - sum_p rho_p C(n_p, 2),   n_p = sum_{c in p} n_c.
+        # A model without parents registers neither parameter nor buffer, so flat
+        # checkpoints and the flat law are exactly unchanged.
+        self.P = 0
+        if group_parent is not None:
+            group_parent = torch.as_tensor(group_parent, dtype=torch.long)
+            if group_parent.shape != (C,) or bool((group_parent < 0).any()):
+                raise ValueError("group_parent must give a nonnegative parent for every group")
+            self.P = int(group_parent.max()) + 1
         self.K, self.Kz, self.nmax, self.R = K, Kz, nmax, R
         if household_size_rank1 and K < 2:
             raise ValueError("household-size rank-one decomposition requires K >= 2")
@@ -898,6 +1036,10 @@ class RaggedModel(torch.nn.Module):
         # rather than converges.  0.03 puts ||phi|| at 0.10, half the cap.
         self.phi = torch.nn.Parameter(torch.randn(J, Kz, generator=g) * phi_init)
         self.rho_c = torch.nn.Parameter(torch.zeros(C))
+        if self.P:
+            self.register_buffer("group_parent", group_parent.clone())
+            # substitution between leaves of one parent: rho_p >= 0 (project_rho_p)
+            self.rho_p = torch.nn.Parameter(torch.zeros(self.P))
         # Version-4's foundational energy uses rho_c*k(k-1)/2 on the ENTIRE declared
         # support.  Saturating at the historical R=23 implementation limit changes the
         # joint law and its conditional logits.  Keep the original quadratic through
@@ -1137,12 +1279,17 @@ class RaggedModel(torch.nn.Module):
         # masked-in phi (6.9e-14); the only difference is that phi_j = 0 products get no
         # gradient, and fit.py re-applies the mask every step so those are discarded anyway.
         # 83.7x at a 24-product mask, 7.0x at 400.
-        _C = sparse_prepare(self, ix)
-        if return_size:
-            lg = log_f_sparse(self, zs, ix, _C, drop_empty, return_terms=True)   # [P, B, n]
+        if self.P:
+            # nested groups: one exact log-space path (log_f_nested)
+            lg = log_f_nested(self, zs, ix, drop_empty, return_terms=True)       # [P, B, n]
             lf = torch.logsumexp(lg, dim=-1).transpose(0, 1)                     # [B, P]
         else:
-            lf = log_f_sparse(self, zs, ix, _C, drop_empty)                      # [B, P]
+            _C = sparse_prepare(self, ix)
+            if return_size:
+                lg = log_f_sparse(self, zs, ix, _C, drop_empty, return_terms=True)   # [P, B, n]
+                lf = torch.logsumexp(lg, dim=-1).transpose(0, 1)                     # [B, P]
+            else:
+                lf = log_f_sparse(self, zs, ix, _C, drop_empty)                      # [B, P]
         lz, sign, log_condition = signed_log_integral(lf, w, dim=1)
         self._last_quad_log_condition = log_condition.detach()
         if bool((sign != 1).any()) or not bool(torch.isfinite(lz).all()):
@@ -1189,10 +1336,11 @@ class RaggedModel(torch.nn.Module):
         B = ix.B
         with torch.no_grad():
             z = torch.zeros(B, 1, self.Kz, dtype=self.lam.dtype, device=self.lam.device)
+            log_f = log_f_nested if self.P else log_f_ragged
             for _ in range(mode_steps):
                 zz = z.detach().requires_grad_(True)
                 with torch.enable_grad():
-                    lf = log_f_ragged(self, zz, ix, drop_empty).sum()
+                    lf = log_f(self, zz, ix, drop_empty).sum()
                 z = torch.autograd.grad(lf, zz)[0]
             zh = z.detach()
             noise = torch.randn(B, n_draws, self.Kz, dtype=zh.dtype, device=zh.device,
@@ -1203,10 +1351,10 @@ class RaggedModel(torch.nn.Module):
         if return_size:
             # The per-size terms are already formed inside log f; taking them here shares
             # the draws with the normaliser, so the size law costs nothing extra.
-            lg = log_f_ragged(self, zs, ix, drop_empty, return_terms=True)   # [D, B, n]
+            lg = log_f(self, zs, ix, drop_empty, return_terms=True)          # [D, B, n]
             lf = torch.logsumexp(lg, dim=-1).transpose(0, 1)                 # [B, D]
         else:
-            lf = log_f_ragged(self, zs, ix, drop_empty)
+            lf = log_f(self, zs, ix, drop_empty)
         base = -0.5 * self.Kz * L2P - 0.5 * (zs ** 2).sum(-1)
         lw = base + lf - log_q
         lz = torch.logsumexp(lw, dim=1) - math.log(n_draws)
@@ -1235,6 +1383,10 @@ class RaggedModel(torch.nn.Module):
         key = line_trip * self.C + line_cat
         nc = torch.bincount(key, minlength=B * self.C).view(B, self.C).to(dt)
         pen_c = (self.rho_c.unsqueeze(0) * self.pair_feature(nc)).sum(-1)
+        if self.P:
+            np_ = torch.zeros(B, self.P, dtype=dt, device=dev).index_add_(
+                1, self.group_parent, nc)
+            pen_c = pen_c + (self.rho_p.unsqueeze(0) * self.pair_feature(np_)).sum(-1)
         n = torch.bincount(line_trip, minlength=B)
         if B and int(n.max()) > self.nmax:
             # The law is declared on 1 <= |S| <= nmax.  Clamping would silently score an
@@ -1295,6 +1447,12 @@ class RaggedModel(torch.nn.Module):
             res.append(self.factored_size_log_p.exp().unsqueeze(0).expand(ix.B, -1)
                        if factored else pn_internal)
         return res[0] if len(res) == 1 else tuple(res)
+
+    @torch.no_grad()
+    def project_rho_p(self):
+        """Parent penalties express substitution only: rho_p >= 0 (complements stay in phi)."""
+        if self.P:
+            self.rho_p.clamp_(min=0.0)
 
     @torch.no_grad()
     def project_rho_c(self, floor=-1.5):

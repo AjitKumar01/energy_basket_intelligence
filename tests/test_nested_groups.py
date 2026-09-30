@@ -308,3 +308,13 @@ def test_nested_gibbs_bank_draws_the_joint_law(native_dp):
     law = np.exp(terms - np.logaddexp.reduce(terms))
     tv, floor = _tv_against(law, members, bank.n, np.random.default_rng(14))
     assert tv < 1.5 * floor + 0.01
+
+
+def test_embedding_audit_pair_penalty_includes_the_parent(native_dp):
+    from audit_interaction_embeddings import group_pair_penalty
+    group = np.asarray([0, 0, 1, 2])
+    rho, parent, rho_parent = np.asarray([0.3, 0.5, 0.2]), np.asarray([0, 0, 1]), np.asarray([0.4, 0.9])
+    assert group_pair_penalty(0, 1, group, rho, parent, rho_parent) == -(0.3 + 0.4)   # same leaf
+    assert group_pair_penalty(0, 2, group, rho, parent, rho_parent) == -0.4           # same parent
+    assert group_pair_penalty(0, 3, group, rho, parent, rho_parent) == 0.0            # different
+    assert group_pair_penalty(0, 1, group, rho) == -0.3                               # flat model

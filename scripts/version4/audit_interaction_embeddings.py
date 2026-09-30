@@ -162,6 +162,7 @@ def group_pair_penalty(left, right, group, rho, parent=None, rho_parent=None):
 
 def pair_record(pair, position, metadata, observed, expected, lift, rho, parent=None, rho_parent=None):
     gram, left, right = pair
+    same = int(metadata.cat_id[left]) == int(metadata.cat_id[right])
     category_term = group_pair_penalty(left, right, metadata.cat_id.to_numpy(), rho, parent, rho_parent)
     def item_record(item):
         return {

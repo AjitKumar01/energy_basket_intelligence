@@ -19,6 +19,7 @@ the one-level-finer numerical audit; the output checkpoint records the decision.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import os
@@ -92,6 +93,7 @@ def main():
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     p.add_argument("--checkpoint", type=Path, required=True, help="staged final checkpoint")
     p.add_argument("--output", type=Path, required=True)
+    p.add_argument("--report", type=Path, help="JSON decision report (always written)")
     p.add_argument("--contexts-per-household", type=int, default=10)
     p.add_argument("--max-contexts", type=int, default=0, help="0 = no cap beyond per-household")
     p.add_argument("--chains", type=int, default=16)
@@ -129,6 +131,8 @@ def main():
     args = p.parse_args()
     torch.set_num_threads(args.threads)
     started = time.time()
+    for stale in (args.output, args.output.with_suffix(".tmp")):
+        stale.unlink(missing_ok=True)          # this run owns its output; never report an old file
     rng = np.random.default_rng(args.seed)
     generator = torch.Generator().manual_seed(args.seed)
 
@@ -362,6 +366,21 @@ def main():
                                        "frozen": "price, promotion, season, store blocks; Phi basis"}
         torch.save(payload, args.output.with_suffix(".tmp")); os.replace(args.output.with_suffix(".tmp"), args.output)
     print(f"[joint-refinement] decision {json.dumps(decision)} ({time.time() - started:.0f}s)", flush=True)
+    if args.report is not None:
+        def digest(path):
+            h = hashlib.sha256()
+            with open(path, "rb") as f:
+                for block in iter(lambda: f.read(1 << 20), b""):
+                    h.update(block)
+            return h.hexdigest()
+        report = {"decision": decision, "rounds": rounds, "contexts": int(len(trips)),
+                  "draws_per_context": draws, "evaluation_level": level,
+                  "parent": str(args.checkpoint), "parent_sha256": digest(args.checkpoint),
+                  "output": str(args.output) if args.output.is_file() else None,
+                  "output_sha256": digest(args.output) if args.output.is_file() else None,
+                  "seconds": time.time() - started}
+        args.report.parent.mkdir(parents=True, exist_ok=True)
+        args.report.write_text(json.dumps(report, indent=2, default=float))
 
 
 if __name__ == "__main__":

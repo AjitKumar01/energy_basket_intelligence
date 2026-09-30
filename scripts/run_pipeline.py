@@ -29,7 +29,7 @@ RAW_DEFAULT = (ROOT.parent / "dunnhumby_The-Complete-Journey" /
 RAW_LOCAL = (ROOT / "dunnhumby_The-Complete-Journey" /
              "dunnhumby_The-Complete-Journey CSV")
 STAGES = ("data", "initialize", "additive", "rank", "interaction",
-          "evaluation", "certification")
+          "refinement", "evaluation", "certification")
 RUN_MANIFEST = None
 RUN_STATUS = None
 
@@ -258,6 +258,26 @@ def validate_candidate(path: Path, initialization: Path, *, final: bool,
             f"{path} belongs to a different profile; expected additive batch "
             f"{expected_batch} for --profile {profile}")
     return blob
+
+
+def refined_candidate(staged: Path, refined: Path, report: Path, *, dry_run: bool) -> Path:
+    """The refined checkpoint when its held-out gate accepted it, else the staged one."""
+    if dry_run:
+        return refined
+    require_files("refinement", (report,), dry_run=False)
+    try:
+        payload = json.loads(report.read_text())
+    except Exception as exc:
+        raise SystemExit(f"cannot read refinement report {report}: {exc}") from exc
+    if payload.get("parent_sha256") != file_sha256(staged):
+        raise SystemExit(f"{report} was not built from {staged}")
+    if not payload.get("decision", {}).get("accepted"):
+        print(f"[pipeline] joint refinement not accepted ({payload.get('decision', {}).get('reason')}); "
+              "evaluating the staged candidate", flush=True)
+        return staged
+    if payload.get("output_sha256") != file_sha256(refined):
+        raise SystemExit(f"{refined} does not match its refinement report")
+    return refined
 
 
 def selected_rank_from_report(basis: Path, *, maximum_rank: int,
@@ -568,6 +588,15 @@ def main() -> None:
     parser.add_argument(
         "--rebuild-interaction-bank", action="store_true",
         help="resample the stratified estimator's derived draw cache")
+    parser.add_argument(
+        "--joint-refinement", action="store_true",
+        help=("after the staged fit, refine taste, utility, penalty and interaction-strength "
+              "parameters jointly (fit_joint_refinement.py); the refined checkpoint replaces "
+              "the staged one only if its held-out gate accepts it"))
+    parser.add_argument(
+        "--evaluation-level-offset", type=int, default=2,
+        help=("Smolyak level = rank + offset for the likelihood, recommendation and "
+              "population-size gates (use 3 where rank + 2 fails the audit bound)"))
     args = parser.parse_args()
     if args.model_data_root is not None:
         bundle = args.model_data_root.expanduser().resolve()
@@ -849,12 +878,36 @@ def main() -> None:
             rank = int(final_blob["active_rank"])
         else:
             rank = 8 if full else 4
-        if start_at == "evaluation":
+        if start_at in ("refinement", "evaluation"):
             basis = basis_from_candidate_report(
                 interaction_candidate, dry_run=driver.dry_run, profile=args.profile)
         print(f"[pipeline] resurrected final candidate: rank={rank}, "
               f"checkpoint={candidate}", flush=True)
     if args.stop_after == "interaction":
+        return
+
+    level = rank + args.evaluation_level_offset
+    staged_candidate = candidate
+    refined = ART / "candidate_refined.pt"
+    refinement_report = REPORT / "joint_refinement.json"
+    if args.joint_refinement:
+        if runs_stage(start_at, "refinement"):
+            driver.run(script(
+                "fit_joint_refinement.py", "--checkpoint", staged_candidate,
+                "--output", refined, "--report", refinement_report,
+                "--contexts-per-household", 10,
+                *(() if full else ("--max-contexts", 256)),
+                "--chains", 4, "--draws-per-chain", 4, "--burn", 3, "--baskets-per-z", 2,
+                "--rounds", 5 if full else 1,
+                "--select-trust", 300, 1000,
+                "--validation-trips", 1024 if full else 64,
+                "--selection-trips", 1024 if full else 64,
+                "--level-offset", args.evaluation_level_offset,
+                "--threads", cpu_threads))
+        candidate = refined_candidate(staged_candidate, refined, refinement_report,
+                                      dry_run=driver.dry_run)
+        print(f"[pipeline] evaluation candidate after refinement: {candidate}", flush=True)
+    if args.stop_after == "refinement":
         return
 
     # All claims use fixed panels and complete support; recommendation is read-only.
@@ -863,7 +916,7 @@ def main() -> None:
             "compare_rank8_parent_likelihood.py", "--parent", additive,
             "--child", candidate, "--split", "validation",
             "--trips", 4096 if full else 16,
-            "--rank", rank, "--target-level", rank + 2,
+            "--rank", rank, "--target-level", level,
             "--audit-trips", 128 if full else 4,
             "--threads", cpu_threads,
             *(('--maximum-audit-error-bound', 0.01, '--require-certified-gain')
@@ -873,7 +926,7 @@ def main() -> None:
             "compare_rank8_parent_likelihood.py", "--parent", additive,
             "--child", candidate, "--split", "test",
             "--trips", 4096 if full else 16,
-            "--rank", rank, "--target-level", rank + 2,
+            "--rank", rank, "--target-level", level,
             "--audit-trips", 128 if full else 4,
             "--threads", cpu_threads,
             *(('--maximum-audit-error-bound', 0.01)
@@ -883,7 +936,7 @@ def main() -> None:
             "eval_smolyak_rank8_mrr.py", "--ckpt", candidate, "--split", "test",
             "--parent", additive,
             "--trips", 2000 if full else 16, "--rank", rank,
-            "--level", rank + 2, "--threads", cpu_threads,
+            "--level", level, "--threads", cpu_threads,
             "--output", REPORT / "recommendation.json"))
         driver.run(script(
             "audit_particle_counterfactual_generation.py", "--ckpt", candidate,
@@ -917,8 +970,8 @@ def main() -> None:
 
     tail_status = driver.run(script(
         "audit_population_size.py", "--checkpoint", candidate,
-        "--rank", rank, "--screen-level", rank + 1,
-        "--confirm-level", rank + 2,
+        "--rank", rank, "--screen-level", level - 1,
+        "--confirm-level", level,
         "--contexts", 0 if full else 128,
         "--confirm-contexts", 2048 if full else 8,
         "--calibration-contexts", 2048 if full else 16,

@@ -152,10 +152,17 @@ def summarize_pair_panel(observed, expected, lift):
     }
 
 
-def pair_record(pair, position, metadata, observed, expected, lift, rho):
+def group_pair_penalty(left, right, group, rho, parent=None, rho_parent=None):
+    """-(rho_c of a shared group) - (rho_p of a shared parent, for nested groups)."""
+    term = -float(rho[int(group[left])]) if int(group[left]) == int(group[right]) else 0.0
+    if parent is not None and int(parent[group[left]]) == int(parent[group[right]]):
+        term -= float(rho_parent[int(parent[group[left]])])
+    return term
+
+
+def pair_record(pair, position, metadata, observed, expected, lift, rho, parent=None, rho_parent=None):
     gram, left, right = pair
-    same = int(metadata.cat_id[left]) == int(metadata.cat_id[right])
-    category_term = -float(rho[int(metadata.cat_id[left])]) if same else 0.0
+    category_term = group_pair_penalty(left, right, metadata.cat_id.to_numpy(), rho, parent, rho_parent)
     def item_record(item):
         return {
             "item_id": int(item),
@@ -283,6 +290,8 @@ def main(args):
     if inactive_max != 0.0:
         raise RuntimeError("checkpoint has nonzero interaction columns outside active rank")
     rho = state["rho_c"].double().numpy()
+    parent = state["group_parent"].numpy() if "group_parent" in state else None
+    rho_parent = state["rho_p"].double().numpy() if "rho_p" in state else None
     metadata = pd.read_parquet(Path(BI) / "items.parquet").sort_values(
         "item_id").reset_index(drop=True)
     if len(metadata) != len(phi) or not np.array_equal(metadata.item_id, np.arange(len(phi))):
@@ -315,19 +324,19 @@ def main(args):
     row_mass = np.square(phi).sum(1)
     listed = min(args.listed_pairs, len(pairs))
     pair_rows = [pair_record(pair, k, metadata, heldout["observed"],
-                             heldout["expected"], heldout["lift"], rho)
+                             heldout["expected"], heldout["lift"], rho, parent, rho_parent)
                  for k, pair in enumerate(pairs[:listed])]
     # Highest cross-department subset is often easier to interpret operationally.
     departments = metadata.DEPARTMENT.astype(str).to_numpy()
     cross_department_positions = [k for k, (_, i, j) in enumerate(pairs)
                                   if departments[i] != departments[j]][:listed]
     cross_department = [pair_record(pairs[k], k, metadata, heldout["observed"],
-                                    heldout["expected"], heldout["lift"], rho)
+                                    heldout["expected"], heldout["lift"], rho, parent, rho_parent)
                         for k in cross_department_positions]
     same_pairs = top_pairs(phi, category, eligible, listed, relation="same")
     same_records = []
     for position, (gram, left, right) in enumerate(same_pairs):
-        category_term = -float(rho[int(category[left])])
+        category_term = group_pair_penalty(left, right, category, rho, parent, rho_parent)
         same_records.append({
             "rank": position + 1,
             "left_product_id": int(metadata.PRODUCT_ID[left]),

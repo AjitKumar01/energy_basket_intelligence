@@ -909,7 +909,7 @@ def nested_layout(model, ix):
                 prow_trip=prow_trip, prow_parent=prow_parent, prow_pos=prow_pos, Ppad=Ppad)
 
 
-def nested_log_coefficients(model, ix, centred):
+def nested_log_coefficients(model, ix, centred, return_parts=False):
     """Log generating-polynomial coefficients [D, B, nmax+1] of a nested-group model.
 
     ``centred`` [D, T] are per-(draw, trip) centred log item weights.  Exact program in log
@@ -961,8 +961,11 @@ def nested_log_coefficients(model, ix, centred):
     logT[:, flat_par] = logPar
     trip_degree = torch.zeros(ix.B * lay["Ppad"], dtype=torch.long, device=dev)
     trip_degree[flat_par] = par_degree
-    return _log_product(logT.view(D, ix.B, lay["Ppad"], nmax + 1),
+    logA = _log_product(logT.view(D, ix.B, lay["Ppad"], nmax + 1),
                         trip_degree.view(ix.B, lay["Ppad"]), nmax)                  # [D, B, nmax+1]
+    if return_parts:
+        return logA, dict(leaf=logG_leaf, parent=logPar, layout=lay)
+    return logA
 
 
 def nested_size_terms(model, logA, M):

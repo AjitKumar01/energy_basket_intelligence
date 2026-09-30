@@ -128,6 +128,114 @@ def _exact_conditional_bernoulli(
     return selected
 
 
+class NestedLogG:
+    """Exact forward tables of a nested-group model: leaf-row log polynomials (leaf penalty
+    included) [L, rows, R+1], parent-row log polynomials (product of their leaves, parent penalty
+    included) [L, parent rows, nmax+1], and the parent layout of ragged.nested_layout.  Returned
+    in place of the flat category table; every reverse sampler dispatches on it."""
+
+    def __init__(self, leaf, parent, layout):
+        self.leaf, self.parent, self.layout = leaf, parent, layout
+
+    @property
+    def shape(self):
+        return self.leaf.shape
+
+
+def _log_probabilities(values: np.ndarray) -> np.ndarray:
+    finite = np.isfinite(values)
+    if not finite.any():
+        raise RuntimeError("reverse sampler received an empty categorical law")
+    p = np.zeros_like(values, dtype=np.float64)
+    top = float(np.max(values[finite]))
+    p[finite] = np.exp(values[finite] - top)
+    return p / p.sum()
+
+
+def _allocate_counts(log_polys: Sequence[np.ndarray], totals: np.ndarray,
+                     rng: np.random.Generator) -> np.ndarray:
+    """Exact reverse allocation of ``totals[d]`` among factors with log polynomials
+    ``log_polys``: counts[d, k] with probability prop. to prod_k poly_k[counts[d, k]].
+    Draws sharing a remaining degree share one categorical law (one RNG call)."""
+    totals = np.asarray(totals, dtype=np.int64)
+    counts = np.zeros((len(totals), len(log_polys)), dtype=np.int64)
+    if not len(log_polys) or not totals.any():
+        if totals.any():
+            raise RuntimeError("positive total with no factor to allocate it to")
+        return counts
+    prefix = _numpy_log_prefix(log_polys, int(totals.max()))
+    left = totals.copy()
+    for k in range(len(log_polys) - 1, -1, -1):
+        active = np.flatnonzero(left > 0)
+        if not len(active):
+            break
+        for remaining in np.unique(left[active]):
+            group = active[left[active] == remaining]
+            probability = _log_probabilities(
+                _numpy_log_reverse_weights(log_polys[k], prefix[k], int(remaining)))
+            take = rng.choice(len(probability), size=len(group), p=probability)
+            counts[group, k] = take
+            left[group] -= take
+    if np.any(left):
+        raise RuntimeError("nested reverse sampler left counts unallocated")
+    return counts
+
+
+def _nested_backtrack(tables: NestedLogG, centred: torch.Tensor, log_size: torch.Tensor,
+                      ix, draws: int, generator, fixed_sizes: Optional[np.ndarray] = None):
+    """Exact reverse draws from a nested-group law; result[level][draw][trip] = slot tensor.
+
+    Size (from the size law, or ``fixed_sizes[draw, trip]``), then parent counts from the parent
+    polynomials, then leaf counts within each parent from its leaf polynomials (the parent
+    penalty is constant given the parent count), then the products of each leaf by exact
+    fixed-cardinality sampling proportional to their weights."""
+    dev = centred.device
+    seed = int(torch.randint(2**63 - 1, (), generator=generator, device=dev))
+    rng = np.random.default_rng(seed)
+    leaf = tables.leaf.detach().cpu().numpy()
+    parent = tables.parent.detach().cpu().numpy()
+    lay = {k: (v.detach().cpu().numpy() if torch.is_tensor(v) else v) for k, v in tables.layout.items()}
+    cw = centred.detach().cpu().numpy()
+    ls = log_size.detach().cpu().numpy()
+    row_size = ix.row_size.detach().cpu().numpy()
+    row_end = np.cumsum(row_size, dtype=np.int64)
+    row_start = row_end - row_size
+    L, draws = leaf.shape[0], int(draws)
+    prows_of_trip = [np.flatnonzero(lay["prow_trip"] == b) for b in range(ix.B)]
+    for b, prows in enumerate(prows_of_trip):
+        prows_of_trip[b] = prows[np.argsort(lay["prow_pos"][prows])]
+    leaves_of_prow = [None] * lay["n_prow"]
+    order = np.lexsort((lay["leaf_pos"], lay["row_prow"]))
+    bounds = np.searchsorted(lay["row_prow"][order], np.arange(lay["n_prow"] + 1))
+    for k in range(lay["n_prow"]):
+        leaves_of_prow[k] = order[bounds[k]:bounds[k + 1]]
+    result = [[[None] * ix.B for _ in range(draws)] for _ in range(L)]
+    for level in range(L):
+        for b in range(ix.B):
+            if fixed_sizes is None:
+                sizes = rng.choice(ls.shape[-1], size=draws, p=_log_probabilities(ls[level, b])) + 1
+            else:
+                sizes = np.asarray(fixed_sizes[:, b], dtype=np.int64)
+            prows = prows_of_trip[b]
+            parent_counts = _allocate_counts([parent[level, k] for k in prows], sizes, rng)
+            chosen = [[] for _ in range(draws)]
+            for j, k in enumerate(prows):
+                leaves = leaves_of_prow[k]
+                leaf_counts = _allocate_counts([leaf[level, row] for row in leaves],
+                                               parent_counts[:, j], rng)
+                for i, row in enumerate(leaves):
+                    slots = np.arange(row_start[row], row_end[row], dtype=np.int64)
+                    requested = leaf_counts[:, i]
+                    for take in np.unique(requested[requested > 0]):
+                        group = np.flatnonzero(requested == take)
+                        selected = _exact_conditional_bernoulli(cw[level, slots], int(take), len(group), rng)
+                        for column, draw in enumerate(group):
+                            chosen[draw].extend(slots[selected[:, column]].tolist())
+            for draw in range(draws):
+                result[level][draw][b] = torch.as_tensor(sorted(chosen[draw]), dtype=torch.long, device=dev)
+    return result
+
+
 def _numpy_backtrack(log_g: torch.Tensor, centred: torch.Tensor,
                      log_size: torch.Tensor, ix, generator
                      ) -> List[List[torch.Tensor]]:
@@ -139,6 +247,8 @@ def _numpy_backtrack(log_g: torch.Tensor, centred: torch.Tensor,
     common odds shift and leaves probability proportional to the product of item
     weights.
     """
+    if isinstance(log_g, NestedLogG):
+        return [level[0] for level in _nested_backtrack(log_g, centred, log_size, ix, 1, generator)]
     dev = log_g.device
     seed = int(torch.randint(2**63 - 1, (), generator=generator, device=dev))
     rng = np.random.default_rng(seed)
@@ -260,6 +370,8 @@ def _numpy_backtrack_repeated(log_g: torch.Tensor, centred: torch.Tensor,
     draws = int(draws)
     if draws < 1:
         raise ValueError("draws must be positive")
+    if isinstance(log_g, NestedLogG):
+        return _nested_backtrack(log_g, centred, log_size, ix, draws, generator, fixed_sizes)[0]
     dev = log_g.device
     seed = int(torch.randint(2**63 - 1, (), generator=generator, device=dev))
     rng = np.random.default_rng(seed)
@@ -433,6 +545,11 @@ def conditional_log_tables_levels(model, ix, z: torch.Tensor,
                  + beta.sqrt().unsqueeze(0) * projection)             # [T,L]
     scale = seg_max(slot_logw.transpose(0, 1), ix.item_trip, ix.B)    # [L,B]
     centred = slot_logw.transpose(0, 1) - scale[:, ix.item_trip]      # [L,T]
+    if getattr(model, "P", 0):
+        from ragged import nested_log_coefficients, nested_size_terms
+        log_a, parts = nested_log_coefficients(model, ix, centred, return_parts=True)
+        log_size = nested_size_terms(model, log_a, scale)[..., 1:]
+        return NestedLogG(parts["leaf"], parts["parent"], parts["layout"]), centred, log_size
     log_e = esp_log_bucketed(
         centred, ix.row_of, ix.n_rows, model.R, ix.row_size, ix.item_pos)
     r = torch.arange(model.R + 1, dtype=phi.dtype, device=phi.device)
@@ -676,6 +793,8 @@ def conditional_slots(model, ix, z: torch.Tensor, beta: float,
         raise ValueError(f"z must have shape {(ix.B, model.Kz)}, got {tuple(z.shape)}")
     if not 0.0 <= float(beta) <= 1.0:
         raise ValueError("beta must lie in [0,1]")
+    if getattr(model, "P", 0):
+        return conditional_slots_levels(model, ix, z.unsqueeze(0), [float(beta)], generator)[0]
     sb = math.sqrt(float(beta))
     phi = model.phi[ix.item]
     slot_logw = (model.b_flat(ix) - 0.5 * float(beta) * phi.square().sum(-1)

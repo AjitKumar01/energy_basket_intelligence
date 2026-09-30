@@ -227,3 +227,84 @@ def test_refinement_energy_and_design_include_the_parent_penalty(native_dp):
         via_design = design_energy(model, design, C).numpy()
     assert np.allclose(got, want, atol=1e-10)
     assert np.allclose(via_design, want, atol=1e-10)
+
+
+def _tv_against(law, members, draws, rng):
+    lookup = {b: i for i, b in enumerate(BASKETS)}
+    counts = np.bincount([lookup[tuple(sorted(m))] for m in members], minlength=len(BASKETS))
+    tv = 0.5 * np.abs(counts / counts.sum() - law).sum()
+    floor = np.mean([0.5 * np.abs(np.bincount(rng.choice(len(BASKETS), size=draws, p=law),
+                                              minlength=len(BASKETS)) / draws - law).sum()
+                     for _ in range(20)])
+    return tv, floor
+
+
+def test_nested_conditional_sampler_draws_the_exact_law(native_dp):
+    from tempered_block_gibbs import conditional_slots_repeated
+    model = nested_model()
+    ix = one_trip_index()
+    z = np.asarray([0.6, -0.3])
+    draws = 40000
+    states = conditional_slots_repeated(model, ix, torch.tensor([z]), 1.0, draws,
+                                        torch.Generator().manual_seed(7))
+    members = [[int(ix.item[s]) for s in states[d][0]] for d in range(draws)]
+    terms = exact_terms(model, z)
+    law = np.exp(terms - np.logaddexp.reduce(terms))
+    tv, floor = _tv_against(law, members, draws, np.random.default_rng(8))
+    assert tv < 1.5 * floor + 0.005
+
+
+def test_nested_fixed_size_sampler_draws_the_size_conditional_law(native_dp):
+    from tempered_block_gibbs import conditional_slots_fixed_sizes
+    model = nested_model()
+    ix = one_trip_index()
+    z = np.asarray([-0.4, 0.5])
+    draws = 30000
+    states = conditional_slots_fixed_sizes(model, ix, torch.tensor([z]), 1.0,
+                                           np.full((draws, 1), 3), torch.Generator().manual_seed(9))
+    members = [[int(ix.item[s]) for s in states[d][0]] for d in range(draws)]
+    assert all(len(m) == 3 for m in members)
+    terms = exact_terms(model, z)
+    sizes = np.asarray([len(b) for b in BASKETS])
+    terms = np.where(sizes == 3, terms, -np.inf)
+    law = np.exp(terms - np.logaddexp.reduce(terms))
+    tv, floor = _tv_against(law, members, draws, np.random.default_rng(10))
+    assert tv < 1.5 * floor + 0.005
+
+
+def test_nested_compiled_entry_point_draws_the_exact_law(native_dp):
+    from compiled_backtrack import compiled_draws
+    from tempered_block_gibbs import conditional_log_tables_levels
+    model = nested_model()
+    ix = one_trip_index()
+    z = np.asarray([0.2, 0.9])
+    tables = conditional_log_tables_levels(model, ix, torch.tensor([[z]]), [1.0])
+    draws = 30000
+    slots, basket = compiled_draws(*tables, ix, draws, torch.Generator().manual_seed(11))
+    members = [[] for _ in range(draws)]
+    for s, b in zip(slots.tolist(), basket.tolist()):
+        members[b].append(int(ix.item[s]))
+    terms = exact_terms(model, z)
+    law = np.exp(terms - np.logaddexp.reduce(terms))
+    tv, floor = _tv_against(law, members, draws, np.random.default_rng(12))
+    assert tv < 1.5 * floor + 0.005
+
+
+def test_nested_gibbs_bank_draws_the_joint_law(native_dp):
+    """Blocked Gibbs on (S, z) with the nested S | z sampler targets the joint law with phi."""
+    from joint_refinement import draw_bank, slot_table
+    model = nested_model()
+    chains = 3000
+    item = np.tile(np.arange(J), chains)
+    row_of = np.concatenate([LEAF + 4 * c for c in range(chains)])
+    ix_rep = RaggedIndex(item, row_of, np.repeat(np.arange(chains), 4), np.tile(np.arange(4), chains), chains)
+    model.house = torch.zeros(chains, dtype=torch.long)
+    bank = draw_bank(model, ix_rep, np.zeros(chains, dtype=int), slot_table(one_trip_index(), J), 3, 10,
+                     torch.Generator().manual_seed(13))
+    members = [[] for _ in range(bank.n)]
+    for s, b in zip(bank.slots.tolist(), bank.basket.tolist()):
+        members[b].append(int(s))                                    # base-table slot == product
+    terms = exact_terms(model)
+    law = np.exp(terms - np.logaddexp.reduce(terms))
+    tv, floor = _tv_against(law, members, bank.n, np.random.default_rng(14))
+    assert tv < 1.5 * floor + 0.01

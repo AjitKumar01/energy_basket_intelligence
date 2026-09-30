@@ -174,6 +174,14 @@ def _backtrack_parallel(lg, cw, ls, trip_rows_ptr, trip_rows, row_start, row_end
 def compiled_draws(log_g, centred, log_size, ix, draws: int, generator: torch.Generator):
     """Exact reverse draws from one forward table (level 0): returns flat (slot, basket) arrays,
     basket = draw * B + trip."""
+    from tempered_block_gibbs import NestedLogG, _nested_backtrack
+    if isinstance(log_g, NestedLogG):
+        # nested groups: exact NumPy nested sampler (no compiled kernel yet)
+        states = _nested_backtrack(log_g, centred, log_size, ix, int(draws), generator)[0]
+        slot = [s for d in range(int(draws)) for b in range(ix.B) for s in [states[d][b]]]
+        basket = [torch.full((len(states[d][b]),), d * ix.B + b, dtype=torch.long)
+                  for d in range(int(draws)) for b in range(ix.B)]
+        return torch.cat(slot), torch.cat(basket)
     lg = log_g[0].detach().cpu().numpy().astype(np.float64)
     cw = centred[0].detach().cpu().numpy().astype(np.float64)
     ls = log_size[0].detach().cpu().numpy().astype(np.float64)

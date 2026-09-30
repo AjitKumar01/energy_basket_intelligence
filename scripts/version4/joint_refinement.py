@@ -348,10 +348,13 @@ def bank_statistics(dE_bank: torch.Tensor):
 
 def damped_round(model, ix, observed: SlotBaskets, bank: SlotBaskets, draws: int, U, C,
                  rank: int, trust_ladder, ess_rule, cycles: int, pool_prod: float,
-                 cap: float, log=print, frozen_names=()):
+                 cap: float, log=print, frozen_names=(), trust_scale=None):
     """One round: parent = current model; returns (accepted, record).
 
-    frozen_names: refined parameters to hold at their current values this round (e.g. "theta")."""
+    frozen_names: refined parameters to hold at their current values this round (e.g. "theta").
+    trust_scale: per-parameter multipliers on the trust penalty (e.g. {"theta": 10} shrinks the
+    household taste update ten times harder than the population parameters)."""
+    trust_scale = trust_scale or {}
     names = tuple(n for n in ("lam", "theta", "rho_c", "rho_0_free") if n not in frozen_names)
     N = observed.n
     with torch.no_grad():
@@ -376,7 +379,7 @@ def damped_round(model, ix, observed: SlotBaskets, bank: SlotBaskets, draws: int
             dE_obs = design_energy(model, obs_design, Cs) - E_obs0
             dE_bank = (design_energy(model, bank_design_, Cs) - E_bank0).view(N, draws)
             fit = (dE_obs.sum() - (torch.logsumexp(dE_bank, 1) - math.log(draws)).sum()) / N
-            change = sum((getattr(model, k) - start[k]).square().sum() for k in start) \
+            change = sum(trust_scale.get(k, 1.0) * (getattr(model, k) - start[k]).square().sum() for k in start) \
                 + (Cv - C_start).square().sum()
             return -fit + pooling_penalty(model, pool_prod) + lam_trust * change / N
 

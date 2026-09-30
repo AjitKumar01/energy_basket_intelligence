@@ -108,8 +108,13 @@ def main():
     p.add_argument("--cap", type=float, default=1.0, help="Phi contract: C <= cap * I")
     p.add_argument("--validation-trips", type=int, default=1024)
     p.add_argument("--level-offset", type=int, default=2, help="evaluation level = rank + offset")
-    p.add_argument("--node-trips", type=int, default=141_440,
-                   help="quadrature nodes x trips per validation batch (128 trips at rank 8, level 11)")
+    p.add_argument("--node-item-trips", type=int, default=16_000_000,
+                   help="quadrature nodes x products x trips per validation batch (memory-bound above this)")
+    p.add_argument("--select-trust", type=float, nargs="*", default=[],
+                   help="choose each round's step among these trust levels on held-out selection trips")
+    p.add_argument("--select-theta-scale", type=float, nargs="+", default=[1.0],
+                   help="with --select-trust: extra trust multipliers on the household tastes theta")
+    p.add_argument("--selection-trips", type=int, default=1024)
     p.add_argument("--serial-sampler", action="store_true", help="single-threaded compiled backtrack")
     p.add_argument("--freeze", nargs="*", default=[], choices=["lam", "theta", "alpha", "rho_c", "rho_0_free"],
                    help="refined parameters to hold at the staged values")
@@ -185,6 +190,8 @@ def main():
     valid_all = supported_trips(data, 1, nmax)
     valid = np.sort(valid_all[rng.permutation(len(valid_all))[:args.validation_trips]])
     valid_households = np.asarray(data["trip_user"])[valid]
+    rest = np.setdiff1d(valid_all, valid)
+    select = np.sort(rest[rng.permutation(len(rest))[:args.selection_trips]]) if args.select_trust else None
 
     probe = np.sort(trips[rng.permutation(len(trips))[:args.train_probe]]) if args.train_probe else None
 
@@ -192,7 +199,7 @@ def main():
         subset = valid if subset is None else subset
         rule = smolyak_rule(model, rank, level)
         install_quadrature(model, rule)
-        batch = max(4, min(128, args.node_trips // len(rule[1])))   # bound nodes x trips per batch
+        batch = max(1, min(128, args.node_item_trips // (len(rule[1]) * J)))   # bound nodes x items x trips
         out = []
         with torch.no_grad():
             for s in range(0, len(subset), batch):
@@ -206,6 +213,7 @@ def main():
     level = rank + args.level_offset
     start_valid = validation(level)
     start_probe = validation(level, probe) if probe is not None else None
+    select_score = float(validation(level, select).mean()) if select is not None else None
     best_valid, best_round, best_state = start_valid, 0, None
     U, C = orthonormal_basis(model.phi.detach(), rank)
     capacities = category_capacities(data, int(data["n_cat"]), nmax)
@@ -225,23 +233,59 @@ def main():
                         not args.serial_sampler)
         draw_seconds = time.time() - t0
         t1 = time.time()
-        ok, record = damped_round(model, ix, observed, bank, draws, U, C, rank, ladder, ess_rule,
-                                  args.cycles, args.pool_prod, args.cap,
-                                  log=lambda m: print(m, flush=True), frozen_names=tuple(args.freeze))
-        if ok:
-            ladder = [t for t in args.trust_ladder if t >= record["trust"] / 10] or list(args.trust_ladder)
+
+        def step(trust_levels, theta_scale):
+            ok, record = damped_round(model, ix, observed, bank, draws, U, C, rank, trust_levels, ess_rule,
+                                      args.cycles, args.pool_prod, args.cap,
+                                      log=lambda m: print(m, flush=True), frozen_names=tuple(args.freeze),
+                                      trust_scale={"theta": theta_scale})
+            if not ok:
+                return ok, record, C
+            C_new = set_phi_from(model, U, record["C"], rank, args.cap)
+            model.project_rho_c(-1.5)
+            project_category_reward_(model, capacities, 1.5)
+            model.project_context_gauges()
+            return ok, record, C_new
+
+        if select is None:
+            ok, record, C_next = step(ladder, 1.0)
+            if ok:
+                ladder = [t for t in args.trust_ladder if t >= record["trust"] / 10] or list(args.trust_ladder)
+        else:
+            parent_state = {k: t.detach().clone() for k, t in model.state_dict().items()}
+            best = None
+            for trust in args.select_trust:
+                for theta_scale in args.select_theta_scale:
+                    model.load_state_dict(parent_state)
+                    ok_c, rec_c, C_c = step([trust], theta_scale)
+                    if not ok_c:
+                        print(f"[joint-refinement]   candidate trust {trust:g}, theta x{theta_scale:g}: ESS rule failed",
+                              flush=True)
+                        continue
+                    score = float(validation(level, select).mean())
+                    print(f"[joint-refinement]   candidate trust {trust:g}, theta x{theta_scale:g}: selection "
+                          f"{score:.5f} ({score - select_score:+.5f} vs parent)", flush=True)
+                    if best is None or score > best[0]:
+                        best = (score, {k: t.detach().clone() for k, t in model.state_dict().items()}, C_c,
+                                {**rec_c, "theta_scale": theta_scale, "selection": score})
+            model.load_state_dict(parent_state)
+            ok = best is not None and best[0] > select_score + args.round_tolerance
+            if ok:
+                select_score = best[0]
+                model.load_state_dict(best[1])
+                C_next, record = best[2], best[3]
+            else:
+                record = {"status": "no candidate improved the selection trips"}
         if not ok:
             rounds.append({"round": rnd, **record})
             print(f"[joint-refinement] round {rnd}: {record['status']}; stopping", flush=True)
             break
+        C = C_next
         solve_seconds = time.time() - t1
-        C = set_phi_from(model, U, record["C"], rank, args.cap)
-        model.project_rho_c(-1.5)
-        project_category_reward_(model, capacities, 1.5)
-        model.project_context_gauges()
         t2 = time.time()
         v = validation(level)
-        entry = {"round": rnd, "trust": record["trust"], "bank_gain": record["bank_gain"], "ess": record["ess"],
+        entry = {"round": rnd, "trust": record["trust"], "theta_scale": record.get("theta_scale", 1.0),
+                 "selection": record.get("selection"), "bank_gain": record["bank_gain"], "ess": record["ess"],
                  "validation": float(v.mean()), "draw_seconds": draw_seconds, "solve_seconds": solve_seconds,
                  "trust_seconds": record["trust_seconds"], "validation_seconds": time.time() - t2,
                  "round_seconds": time.time() - t0}
@@ -262,7 +306,7 @@ def main():
             payload["model"] = best_state
             payload["joint_refinement"] = {"round": rnd, "rounds": rounds, "accepted": None}
             torch.save(payload, args.output.with_suffix(".tmp")); os.replace(args.output.with_suffix(".tmp"), args.output)
-        if record["bank_gain"] < args.round_tolerance:
+        if select is None and record["bank_gain"] < args.round_tolerance:
             break
 
     decision = {"accepted": False, "reason": "no round improved validation"}

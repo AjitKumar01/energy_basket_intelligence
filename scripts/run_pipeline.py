@@ -548,6 +548,9 @@ def main() -> None:
         help=("execution policy; auto preserves the exact CPU backend even when an "
               "accelerator is present"))
     parser.add_argument(
+        "--nmax", type=int, default=0,
+        help="declared maximum basket size for initialization (0 = largest training basket)")
+    parser.add_argument(
         "--threads", type=int, default=0,
         help="CPU intra-op threads; zero selects a hardware-aware value capped at 8")
     parser.add_argument("--resume-additive", type=Path,
@@ -680,7 +683,8 @@ def main() -> None:
     if runs_stage(start_at, "initialize"):
         driver.run(script("initialize_version4.py", "--output", initialization,
                           "--manifest", ART / "initialization.json",
-                          "--household-size-rank1", "--threads", cpu_threads))
+                          "--household-size-rank1", "--threads", cpu_threads,
+                          *(("--nmax", args.nmax) if args.nmax else ())))
         initialization_blob = validate_initialization(
             initialization, dry_run=driver.dry_run)
     else:

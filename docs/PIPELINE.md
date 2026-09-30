@@ -206,7 +206,8 @@ large-basket phase.
 
 With `--joint-refinement`, a stage between E and F moves \(\lambda,\theta,\alpha,\rho_c,\rho_0\) and
 \(C\) jointly from the staged optimum by iterated Monte Carlo maximum likelihood, choosing each
-step on held-out selection trips. The refined checkpoint replaces the staged one only if it has a
+step on held-out selection trips, and re-applies Stage E's household-size cap after every round.
+The refined checkpoint replaces the staged one only if it has a
 positive paired validation gain, passes a numerical audit one level finer, and passes the
 population-size audit below. See `JOINT_REFINEMENT_STAGE.md`.
 

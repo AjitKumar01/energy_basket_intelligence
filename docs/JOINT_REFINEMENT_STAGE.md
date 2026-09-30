@@ -5,7 +5,7 @@ enabled in the pipeline with `run_pipeline.py --joint-refinement`.
 
 **Status:** the full pipeline, with refinement, passes every certification gate on the
 476-product synthetic stress world. The refined model beats the staged model on held-out test
-likelihood by **+0.087 nats per basket** (95% interval [0.075, 0.099]). Recommendation, generation
+likelihood by **+0.113 nats per basket** (95% interval [0.092, 0.134]). Recommendation, generation
 and price counterfactuals are unchanged. On seven exact-likelihood test worlds, refinement never
 made a model worse and correctly refused the world with no interaction signal (6 of 6).
 Real-data efficacy is not established.
@@ -79,6 +79,14 @@ survivors, the one with the best exact log-likelihood on held-out **selection** 
 neither passes the ESS rule, \(\tau=10^4\) and then \(10^5\) are tried. Rounds stop when the
 selection score stops improving. Selection trips are disjoint from the gate's validation trips.
 
+**Household-size contract.** The household-size stage (`fit_household_size_rank1.py`) lowers
+each household's size coordinate \(\kappa_h\) (the reserved \(\theta\) coordinate) until none of
+its training contexts puts more than 35% of its mass on baskets at or above the tail threshold.
+Refinement re-fits \(\theta\), so after every round it re-applies that stage's projection, with
+the same cap and screen, on every training context: \(\kappa_h\) is lowered only where needed,
+and the mean shift moves into \(\rho_0\), so each household's size law is tilted by exactly
+\(e^{n\kappa_h}\) and fixed-size composition is unchanged (`--household-size-cap`).
+
 **Acceptance.** Rounds are tried from best validation score down. The first that satisfies all
 three conditions is the output; if none does, the staged model stays:
 1. the paired validation gain has a 95% interval above zero (household-clustered);
@@ -103,14 +111,15 @@ needs rank + 3.
 
 ### 3.1 Exactness
 
-`tests/test_joint_refinement.py`, 12 tests on an enumerable model with \(\Phi\neq0\):
+`tests/test_joint_refinement.py`, on an enumerable model with \(\Phi\neq0\):
 - basket energy equals enumeration;
-- reference, NumPy and compiled samplers (serial and parallel) draw the exact law, and parallel
-  output does not depend on thread count;
+- the bank sampler (blocked Gibbs with warm starts) and the compiled \(S\mid z\) sampler draw the
+  exact law, and the parallel sampler's output does not depend on thread count;
 - the bank's log-ratio converges to the exact normalizer ratio;
 - the sufficient-statistic energy equals the slot-level energy in value and gradient (1e-10);
 - chunked statistics equal the whole-index statistics;
-- a round raises the exact likelihood.
+- a round raises the exact likelihood;
+- the household-size shift tilts each household's size law exactly as intended.
 
 On the stress world, a fresh bank estimated the exact change of \(\log Z\) between two
 checkpoints to within 0.01 nats (1–2 standard errors), and the energy formulas agreed exactly.
@@ -142,21 +151,23 @@ procedural shopping model (missions, nested choice, loyalty, stockpiling, loss-a
 prices) that is **not** the Version-4 model, with declared price scenarios whose causal effects
 come from re-simulation with common random numbers.
 
-| Check | Staged | Refined (round 1) | |
+| Check | Staged | Refined (round 4) | |
 |---|---|---|---|
-| Test log-likelihood, 4,096 trips, paired | −29.036 | −28.949 | **+0.087** [0.075, 0.099] |
+| Validation log-likelihood gain (refinement gate) | — | +0.097 [0.058, 0.136] | accepted |
+| Test log-likelihood, 4,096 trips, paired | −29.036 | −28.923 | **+0.113** [0.092, 0.134] |
 | Numerical audit (level 11 vs 12) | pass | 0.003, pass | |
-| Recommendation MRR / recall@10, 1,996 test baskets | 0.237 / 46.4% | 0.239 / 46.7% | same |
-| Price scenarios vs truth, own effect: corr / MAE | 0.875 / 0.152 | 0.875 / 0.152 | same |
-| same subcategory: corr / MAE | 0.488 / 0.061 | 0.491 / 0.061 | same |
-| rest of category: corr / MAE | 0.871 / 0.034 | 0.862 / 0.034 | same |
-| Generation: mean size (observed 9.0), category TV, invalid baskets | — | 9.65, 0.088, 0 | pass |
-| Population-size certification (26,140 contexts) | pass | pass | |
+| Recommendation MRR / recall@10, 1,996 test baskets | 0.237 / 46.4% | 0.240 / 46.9% | same |
+| Price scenarios vs truth, own effect: corr / MAE | 0.875 / 0.152 | 0.875 / 0.153 | same |
+| same subcategory: corr / MAE | 0.488 / 0.061 | 0.494 / 0.061 | same |
+| rest of category: corr / MAE | 0.871 / 0.034 | 0.852 / 0.034 | same |
+| Generation: mean size (observed 9.0), category TV, invalid baskets | — | 9.70, 0.087, 0 | pass |
+| Population size (26,140 contexts): worst low-observed context's P(20+ items) | 48.3% | 47.1% | pass (< 50%) |
 | Certification (all stages) | — | **pass** | |
 
-Wall time on a 15-core laptop, sharing the machine with another job: staged stages 18 min;
-refinement with gates 26 min; evaluation and certification 16 min. The commands to reproduce
-the run are in the repository `README.md`.
+Refinement ran 5 rounds; the household-size projection lowered \(\kappa_h\) for 4–7 of 2,802
+households per round (largest decrease 0.03, 12 s per round), and round 4 was accepted. Wall time
+on a 15-core laptop: staged stages 18 min; refinement with gates 16 min; evaluation and
+certification 20 min. The commands to reproduce the run are in the repository `README.md`.
 
 ### 3.4 Cost and scaling
 
@@ -190,21 +201,19 @@ These shaped the stage. The experiment code is not part of this repository.
 2. **Bank reuse gives nothing.** The chosen step always uses up the bank's headroom, so a
    reweighted old bank never qualified for the next round. Removed.
 3. **Extra shrinkage on \(\theta\) never won** a selection.
-4. **The population-size gate costs accuracy.** Rounds 2–4 (+0.092 to +0.097 on validation) put
-   more than half of one or two contexts' mass on baskets of 20+ items, where the household
-   bought fewer. Round 1 (+0.077) passes.
+4. **Refinement undid the household-size stage's cap.** Without the household-size projection,
+   rounds 2–4 (+0.092 to +0.097 on validation) put more than half of one or two contexts' mass on
+   baskets of 20+ items where the household bought fewer, failed certification, and only round 1
+   (+0.077; +0.087 on test) could be accepted. Re-applying the stage's cap every round keeps the
+   same validation gains and round 4 passes (§3.3).
 5. **Clipping \(C\) after the solve discards most of a step.** The solve wants eigenvalues of
    \(C\) up to 2.8, against the contract \(0\preceq C\preceq I\). Clipping afterwards removed 59% of
    the step's bank gain and shrank baskets by 0.41 items, because the other parameters had been
    fitted for the unclipped \(C\). Enforcing the cap inside the solve removed the clip effect and
-   cut the size drift to 0.09 items. It still failed the size gate after round 1 and was accepted
-   at +0.067, so it was not adopted.
+   cut the size drift to 0.09 items, but without the household-size cap it still failed the size
+   gate after round 1 and was accepted at +0.067, so it was not adopted.
 6. **A size anchor did not help.** A penalty keeping each context's expected size and tail
    probability at the staged values was accepted at +0.071 (round 2), not better than +0.077.
-
-Finding 5 with the size gate still failing suggests a specific cause, **not yet verified**.
-Stage E caps each household's size coordinate \(\kappa_h\) (the reserved \(\theta\) coordinate) to
-prevent a localized large-basket phase, and refinement re-fits \(\theta\) without that cap.
 
 ## 5. Limits
 
@@ -221,13 +230,9 @@ prevent a localized large-basket phase, and refinement re-fits \(\theta\) withou
 
 ## 6. Open decisions
 
-1. **Apply Stage E's \(\kappa_h\) cap inside refinement.** This is expected to let later rounds
-   pass the size gate. It is a refinement fix, not a model change.
-2. **Model form** (each needs approval as a model change): subcategory substitution, a larger
-   interaction cap audited by the finer quadrature rule, and asymmetric price response.
-3. **Cleanup:** remove options kept only for comparison (the ESS-ladder path without selection,
-   `--freeze`, `--train-probe`).
-4. **Real data:** none of this has been run on Dunnhumby or ERIM.
+1. **Model form** (each is a model change): subcategory substitution, a larger interaction cap
+   audited by the finer quadrature rule, and asymmetric price response.
+2. **Real data:** none of this has been run on a real retailer's data.
 
 ## References
 

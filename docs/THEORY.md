@@ -852,8 +852,8 @@ Phases B--D3 are a staged (block-wise) estimator. The optional refinement stage 
 \(\lambda,\theta,\alpha,\rho_c,\rho_0\) and \(C\) jointly from the staged optimum by iterated
 Monte Carlo maximum likelihood: each round draws baskets from the current law, maximises the
 fixed-bank likelihood ratio (linear minus log-sum-exp in each block), chooses the step size on
-held-out selection trips, and redraws. It is accepted only through the gates of Phase E and
-the population-size audit. Theory, evidence and limits: `JOINT_REFINEMENT_STAGE.md`.
+held-out selection trips, re-applies the Phase D3 cap on \(\kappa_h\), and redraws. It is
+accepted only through the gates of Phase E and the population-size audit. Theory, evidence and limits: `JOINT_REFINEMENT_STAGE.md`.
 
 ### Phase E — convergence and test
 

@@ -220,7 +220,14 @@ These shaped the stage. The experiment code is not part of this repository.
 - **Counterfactuals are unchanged by refinement.** Price parameters are frozen, and the largest
   counterfactual errors come from the model form:
   - substitution within a subcategory is not represented (\(\Phi\) only expresses complements;
-    \(\rho_c\) acts per merchandise category), giving correlation 0.49 and a predicted mean of 0;
+    \(\rho_c\) acts per merchandise category), giving correlation 0.49 and a predicted mean of 0.
+    Finer groups do not fix it: with subcategory groups the sibling correlation fell to 0.20 and
+    test likelihood by 0.17 nats, and nested category + subcategory penalties were implemented
+    and tested but parked (branch `nested-substitution`). A price change moves demand to product
+    \(j\) only through co-purchase penalties (\(\partial\Pr(j\in S)/\partial b_k=
+    \operatorname{Cov}(1_j,1_k)\)), and here siblings are not co-bought less than other
+    category-mates; the true sibling switching comes from choice and is visible only in responses
+    to price variation, which the model does not learn from;
   - price response is symmetric in log-price, so price rises are under-predicted (true −28% for
     ×1.2, predicted −20%).
 - **Rank-8 interactions are capped at \(C\preceq I\)** for normalizer accuracy, and the data
@@ -230,7 +237,8 @@ These shaped the stage. The experiment code is not part of this repository.
 
 ## 6. Open decisions
 
-1. **Model form** (each is a model change): subcategory substitution, a larger interaction cap
+1. **Model form** (each is a model change): cross-price substitution learned from price
+   variation (finer or nested groups do not provide it, see §5), a larger interaction cap
    audited by the finer quadrature rule, and asymmetric price response.
 2. **Real data:** none of this has been run on a real retailer's data.
 

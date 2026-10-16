@@ -2,7 +2,7 @@
 """Prepare a model-data bundle from any canonical basket directory and a dataset config.
 
 One command replaces the per-dataset sequence of bundle build, affinity partition,
-ragged index and data fingerprint. Everything dataset-specific lives in the JSON config:
+and ragged index. Everything dataset-specific lives in the JSON config:
 
     {
       "schema_version": 1,
@@ -27,7 +27,6 @@ Relative paths are resolved against the repository root. Run the pipeline afterw
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import os
 from pathlib import Path
@@ -207,21 +206,17 @@ def main() -> None:
     else:
         write_catalogue_hierarchy_partition(root / "basket_input", affinity)
     run([sys.executable, "-u", V4 / "data.py", "--force"], root)
-    run([sys.executable, "-u", V4 / "provenance.py"], root)
-    fingerprint = json.loads((root / "basket_input" / "model_data_fingerprint.json").read_text())
     record = {
         "schema_version": 1,
         "status": "passed",
         "dataset_name": config["dataset_name"],
         "dataset_config": str(config_path),
-        "dataset_config_sha256": hashlib.sha256(config_path.read_bytes()).hexdigest(),
         "canonical_dir": str(canonical),
         "model_data_root": str(root),
         "contract_summary": builder.contract_summary,
         "availability": result.manifest["availability"],
         **({"product_metadata": str(resolve(config["product_metadata"]))}
            if config.get("product_metadata") else {}),
-        "data_fingerprint_sha256": fingerprint["fingerprint_sha256"],
         "next_command": (f"python -u scripts/run_pipeline.py --model-data-root {root} "
                          "--run-dir <new run directory> --profile full"),
     }

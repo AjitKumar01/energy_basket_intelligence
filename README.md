@@ -25,7 +25,7 @@ same law. The theory is in [`docs/THEORY.md`](docs/THEORY.md); the documentation
 
 | Stage | What it does |
 |---|---|
-| `data` | verifies the bundle's fingerprint |
+| `data` | checks the model-data bundle and the environment |
 | `initialize` | fresh, seeded initialization |
 | `additive` | price-response evidence, then exact maximum likelihood without interactions |
 | `rank` | chooses the interaction directions and rank from the additive model's pair residual |
@@ -34,8 +34,8 @@ same law. The theory is in [`docs/THEORY.md`](docs/THEORY.md); the documentation
 | `evaluation` | validation and test likelihood, recommendation, generation and counterfactual audit, customer segments, interaction audit |
 | `certification` | population basket-size safety audit, size diagnostic, promotion-budget MDP |
 
-Every stage writes durable artifacts, so a run can be resumed or moved
-([`docs/STAGEWISE_RESURRECTION.md`](docs/STAGEWISE_RESURRECTION.md)).
+Every run starts from scratch in a new run directory and executes the stages in order
+([`docs/RUNS.md`](docs/RUNS.md)).
 
 ## Requirements
 

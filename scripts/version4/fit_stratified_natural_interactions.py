@@ -10,7 +10,6 @@ remain mandatory before a resulting checkpoint can be certified.
 from __future__ import annotations
 
 import argparse
-import json
 import os
 from pathlib import Path
 
@@ -20,12 +19,12 @@ import numpy as np
 import torch
 from scipy import sparse
 
-from checkpoint_io import ROOT, load_checkpoint
+from model_io import ROOT, load_model
 from data import build
 from features import Features
 from fit import Batcher
 from pipeline_support import supported_trips
-from provenance import file_sha256, strict_json_dumps
+from io_utils import strict_json_dumps
 from stratified_natural import (
     StratifiedNaturalBank,
     alternating_solve,
@@ -120,49 +119,6 @@ def sparse_rows(indices: list[np.ndarray], values: list[np.ndarray], columns: in
         (np.concatenate(values) if values else np.empty(0, dtype=np.float64),
          np.concatenate(indices) if indices else np.empty(0, dtype=np.int32),
          indptr), shape=(len(indices), columns))
-
-
-def save_bank(path: Path, bank: StratifiedNaturalBank, trips: np.ndarray,
-              half: np.ndarray, band_of_draw: np.ndarray, metadata: dict) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    np.savez(
-        path, observed_pair=bank.observed_pair, draw_pair=bank.draw_pair,
-        observed_size=bank.observed_size, draw_size=bank.draw_size,
-        observed_category_data=bank.observed_category.data,
-        observed_category_indices=bank.observed_category.indices,
-        observed_category_indptr=bank.observed_category.indptr,
-        observed_category_shape=np.asarray(bank.observed_category.shape),
-        draw_category_data=bank.draw_category.data,
-        draw_category_indices=bank.draw_category.indices,
-        draw_category_indptr=bank.draw_category.indptr,
-        draw_category_shape=np.asarray(bank.draw_category.shape),
-        log_draw_weight=bank.log_draw_weight, n_size=np.asarray(bank.n_size),
-        size_basis=bank.size_basis, trips=trips, half=half,
-        band_of_draw=band_of_draw,
-        metadata=np.asarray(json.dumps(metadata, sort_keys=True)))
-
-
-def load_bank(path: Path, expected: dict, trips: np.ndarray, half: np.ndarray
-              ) -> tuple[StratifiedNaturalBank, np.ndarray]:
-    value = np.load(path, allow_pickle=False)
-    metadata = json.loads(str(value["metadata"].item()))
-    if json.dumps(metadata, sort_keys=True) != json.dumps(expected, sort_keys=True):
-        raise RuntimeError("stratified bank metadata does not match this fit request")
-    if not np.array_equal(value["trips"], trips) or not np.array_equal(value["half"], half):
-        raise RuntimeError("stratified bank context manifest or cross-fit split differs")
-    observed_category = sparse.csr_matrix(
-        (value["observed_category_data"], value["observed_category_indices"],
-         value["observed_category_indptr"]),
-        shape=tuple(value["observed_category_shape"].tolist()))
-    draw_category = sparse.csr_matrix(
-        (value["draw_category_data"], value["draw_category_indices"],
-         value["draw_category_indptr"]),
-        shape=tuple(value["draw_category_shape"].tolist()))
-    bank = StratifiedNaturalBank(
-        value["observed_pair"], value["draw_pair"], value["observed_size"],
-        value["draw_size"], observed_category, draw_category,
-        value["log_draw_weight"], int(value["n_size"]), value["size_basis"])
-    return bank, np.asarray(value["band_of_draw"], dtype=np.int64)
 
 
 @torch.no_grad()
@@ -282,14 +238,6 @@ def main() -> None:
     parser.add_argument("--threads", type=int, default=8)
     parser.add_argument("--output", type=Path,
                         default=Path("artifacts/candidate_stratified.pt"))
-    parser.add_argument("--bank-cache", type=Path,
-                        help="fixed draw-bank cache; defaults beside --output")
-    parser.add_argument(
-        "--reuse-bank", action="store_true",
-        help="require an existing compatible bank; fail instead of rebuilding")
-    parser.add_argument(
-        "--rebuild-bank", action="store_true",
-        help="ignore any compatible cache and resample the fixed bank")
     args = parser.parse_args()
     if args.contexts < 4:
         raise ValueError("at least four contexts are required")
@@ -297,22 +245,15 @@ def main() -> None:
         raise ValueError("interaction ridges must be finite and positive")
     if args.category_bound < 0:
         raise ValueError("--category-bound must be nonnegative")
-    if args.reuse_bank and args.rebuild_bank:
-        raise ValueError("--reuse-bank and --rebuild-bank are mutually exclusive")
     torch.set_num_threads(args.threads)
     data = build()
     parent = args.parent if args.parent.is_absolute() else ROOT / args.parent
     spectral_path = args.spectral if args.spectral.is_absolute() else ROOT / args.spectral
-    model, parent_blob, _meta = load_checkpoint(
+    model, parent_blob, _meta = load_model(
         parent, data, required_capabilities=("conditional_nonempty_incidence",))
     if float(model.phi.detach().abs().max()) != 0.0:
         raise RuntimeError("stratified proposal must be the exact Phi=0 additive parent")
     basis_np, keep_count = spectral_basis(spectral_path, args.rank, args.score_mass)
-    spectral_report = json.loads(spectral_path.with_suffix(".json").read_text())
-    if spectral_report.get("basis_sha256") != file_sha256(spectral_path):
-        raise RuntimeError("spectral basis failed its report content digest")
-    if spectral_report.get("parent_sha256") != file_sha256(parent):
-        raise RuntimeError("spectral basis and additive parent do not share lineage")
     basis = torch.as_tensor(basis_np, dtype=model.phi.dtype)
     bands = default_size_bands(model.nmax)
     if args.size_knots is None:
@@ -334,40 +275,13 @@ def main() -> None:
     if half.all() or (~half).all():
         raise RuntimeError("degenerate cross-fit split")
     output = args.output if args.output.is_absolute() else ROOT / args.output
-    cache = (args.bank_cache if args.bank_cache is not None
-             else output.with_suffix(".bank.npz"))
-    cache = cache if cache.is_absolute() else ROOT / cache
-    bank_metadata = {
-        "parent_sha256": file_sha256(parent),
-        "spectral_sha256": file_sha256(spectral_path),
-        "contexts": args.contexts, "rank": args.rank,
-        "score_mass": args.score_mass,
-        "bands": bands, "draws_per_band": args.band_draws,
-        "size_knots": args.size_knots, "seed": args.seed,
-        "fit_categories": bool(args.category_bound > 0),
-    }
-    bank = band_of_draw = None
-    if cache.exists() and not args.rebuild_bank:
-        try:
-            bank, band_of_draw = load_bank(cache, bank_metadata, trips, half)
-            print(f"[stratified-natural] reused fixed bank: {cache}", flush=True)
-        except RuntimeError as error:
-            if args.reuse_bank:
-                raise
-            print(f"[stratified-natural] incompatible cache will be rebuilt: "
-                  f"{error}", flush=True)
-    elif args.reuse_bank:
-        raise FileNotFoundError(f"required stratified bank does not exist: {cache}")
-    if bank is None:
-        batcher = Batcher(
-            data, Features(int(data["n_item"]), int(data["n_store"]),
-                           include_recency=False), model.nmax, include_recency=False)
-        bank, band_of_draw = build_bank(
-            model, batcher, trips, basis, bands, args.band_draws, args.batch,
-            torch.Generator().manual_seed(args.seed + 1), size_basis,
-            fit_categories=args.category_bound > 0)
-        save_bank(cache, bank, trips, half, band_of_draw, bank_metadata)
-        print(f"[stratified-natural] cached fixed bank: {cache}", flush=True)
+    batcher = Batcher(
+        data, Features(int(data["n_item"]), int(data["n_store"]),
+                       include_recency=False), model.nmax, include_recency=False)
+    bank, band_of_draw = build_bank(
+        model, batcher, trips, basis, bands, args.band_draws, args.batch,
+        torch.Generator().manual_seed(args.seed + 1), size_basis,
+        fit_categories=args.category_bound > 0)
     bank_a = bank.subset(np.flatnonzero(half))
     bank_b = bank.subset(np.flatnonzero(~half))
     rows, candidates = [], {}
@@ -458,10 +372,9 @@ def main() -> None:
     phi = basis_np @ factor
     report = {
         "method": "size_stratified_sparse_natural_mcle",
-        "parent": str(parent), "parent_sha256": file_sha256(parent),
+        "parent": str(parent),
         "parent_iteration": int(parent_blob["iter"]),
-        "data_fingerprint_sha256": parent_blob["data_fingerprint_sha256"],
-        "spectral": str(spectral_path), "spectral_sha256": file_sha256(spectral_path),
+        "spectral": str(spectral_path),
         "rank": args.rank, "active_rank": int(positive.sum()),
         "interaction_products": keep_count, "contexts": args.contexts,
         "size_bands": bands, "draws_per_band": args.band_draws,
@@ -474,7 +387,6 @@ def main() -> None:
             "pair_bytes": int(bank.observed_pair.nbytes + bank.draw_pair.nbytes),
             "category_nonzeros": int(bank.observed_category.nnz + bank.draw_category.nnz),
             "size_representation": "integer lookup indices",
-            "bank_cache": str(cache), "bank_cache_sha256": file_sha256(cache),
         },
         "ridge_audit": rows, "selected_ridge": selected["ridge"],
         "ridge_selection_rule": "maximum cross-fit gain among candidates passing both halves and full-fit ESS/convergence gates",
@@ -519,14 +431,10 @@ def main() -> None:
         "format": 3,
         "estimator": "size_stratified_sparse_natural_mcle_version4",
         "iter": 0, "model": model.state_dict(),
-        "fresh_artifact_digest": parent_blob["fresh_artifact_digest"],
-        "data_fingerprint_sha256": parent_blob["data_fingerprint_sha256"],
         "price_response_estimator": parent_blob.get("price_response_estimator"),
         "supported_price_component": parent_blob.get("supported_price_component"),
         "config": parent_blob["config"], "parent": str(parent),
         "parent_iteration": int(parent_blob["iter"]),
-        "parent_sha256": file_sha256(parent),
-        "spectral_sha256": file_sha256(spectral_path),
         "active_rank": int(phi.shape[1]), "interaction_products": keep_count,
         "best_validation": None, "best_iteration": 0,
         "evaluations": [], "records": [],

@@ -3,8 +3,6 @@
 from __future__ import annotations
 
 import argparse
-import hashlib
-import json
 import os
 from pathlib import Path
 
@@ -13,14 +11,14 @@ import torch
 
 os.environ.setdefault("V3_AFFINITY", "1")
 
-from checkpoint_io import ROOT, load_checkpoint
+from model_io import ROOT, load_model
 from data import build
 from features import Features
 from fit import Batcher
 from pipeline_support import (TAIL_THRESHOLD_SELECTION, collect_size_law,
                               install_quadrature, size_tail_threshold, smolyak_rule,
                               supported_trips)
-from provenance import file_sha256, strict_json_dumps
+from io_utils import strict_json_dumps
 from uncertainty import household_cluster_se
 
 
@@ -120,92 +118,23 @@ def level_usage(levels: np.ndarray) -> dict[str, int]:
             for level, count in zip(unique, counts)}
 
 
-def implementation_signature():
-    """Bind resumable numerical caches to the complete Version-4 implementation."""
-    digest = hashlib.sha256()
-    source_root = Path(__file__).resolve().parent
-    for path in sorted(source_root.glob("*.py")) + sorted(source_root.glob("*.cpp")):
-        digest.update(path.name.encode())
-        digest.update(path.read_bytes())
-    return digest.hexdigest()
-
-
-def screen_signature(checkpoint, population, rank, levels, data_fingerprint):
-    digest = hashlib.sha256()
-    with checkpoint.open("rb") as stream:
-        for block in iter(lambda: stream.read(1024 * 1024), b""):
-            digest.update(block)
-    digest.update(np.ascontiguousarray(population, dtype=np.int64).tobytes())
-    digest.update(f"rank={rank};levels={levels}".encode())
-    digest.update(str(data_fingerprint).encode())
-    digest.update(implementation_signature().encode())
-    return digest.hexdigest()
-
-
-def resumable_screen(model, batcher, population, checkpoint, rank, levels,
-                     chunk, output, label, data_fingerprint):
-    """Checkpoint the population panel and resume after interruption or cancellation."""
-    signature = screen_signature(
-        checkpoint, population, rank, levels, data_fingerprint)
-    prefix = output.with_name(f"{output.stem}.screen-{signature[:12]}")
-    probability_path = Path(str(prefix) + ".log_probability.npy")
-    observed_path = Path(str(prefix) + ".observed.npy")
-    level_path = Path(str(prefix) + ".level.npy")
-    progress_path = Path(str(prefix) + ".progress.json")
-    shape = (len(population), int(model.nmax))
-    expected = {
-        "signature": signature, "contexts": len(population),
-        "rank": rank, "levels": levels,
-    }
-    start = 0
-    if progress_path.exists():
-        progress = json.loads(progress_path.read_text())
-        cache_exists = all(path.exists() for path in (
-            probability_path, observed_path, level_path))
-        if (cache_exists
-                and all(progress.get(key) == value
-                        for key, value in expected.items())):
-            candidate = int(progress.get("completed_contexts", 0))
-            if 0 <= candidate <= len(population):
-                start = candidate
-    mode = "r+" if start > 0 else "w+"
-    probability = np.lib.format.open_memmap(
-        probability_path, mode=mode, dtype=np.float64, shape=shape)
-    observed = np.lib.format.open_memmap(
-        observed_path, mode=mode, dtype=np.int16, shape=(len(population),))
-    used_level = np.lib.format.open_memmap(
-        level_path, mode=mode, dtype=np.int16, shape=(len(population),))
+def population_screen(model, batcher, population, rank, levels, chunk, label):
+    """Size law of every population context at ``levels[0]``, escalating only failures."""
     rules = [smolyak_rule(model, rank, level) for level in levels]
-    for position in range(start, len(population), chunk):
-        stop = min(position + chunk, len(population))
-        got_observed, got_probability, got_level = resilient_size_panel(
-            model, batcher, population[position:stop], rules, levels)
-        observed[position:stop] = got_observed
-        probability[position:stop] = got_probability
-        used_level[position:stop] = got_level
-        if ((position // chunk + 1) % 20 == 0 or stop == len(population)):
-            probability.flush(); observed.flush(); used_level.flush()
-            progress = {**expected, "completed_contexts": stop,
-                        "complete": stop == len(population)}
-            temporary = Path(str(progress_path) + ".tmp")
-            temporary.write_text(strict_json_dumps(progress))
-            temporary.replace(progress_path)
-            print(f"[population-screen] {label} {stop}/{len(population)}",
-                  flush=True)
-    levels_used, counts = np.unique(np.asarray(used_level), return_counts=True)
-    escalated = np.flatnonzero(np.asarray(used_level) > levels[0])
-    provenance = {
-        "signature": signature,
-        "cache_prefix": str(prefix),
-        "resumed_from_context": start,
+    observed, probability, used_level = collect_resilient_size_law(
+        model, batcher, population, rules, levels, chunk, label)
+    observed = observed.astype(np.int16, copy=False)
+    used_level = used_level.astype(np.int16, copy=False)
+    levels_used, counts = np.unique(used_level, return_counts=True)
+    escalated = np.flatnonzero(used_level > levels[0])
+    summary = {
         "level_counts": {str(int(level)): int(count)
                          for level, count in zip(levels_used, counts)},
         "escalated_contexts": int(len(escalated)),
         "escalated_trip_ids_first_100": population[escalated[:100]].tolist(),
         "escalated_trip_ids_truncated": bool(len(escalated) > 100),
     }
-    return (np.asarray(observed), np.asarray(probability),
-            np.asarray(used_level), provenance)
+    return observed, probability, used_level, summary
 
 
 def main() -> None:
@@ -251,7 +180,7 @@ def main() -> None:
     split_code = {"train": 0, "validation": 1, "test": 2}[args.split]
     checkpoint = args.checkpoint if args.checkpoint.is_absolute() \
         else ROOT / args.checkpoint
-    model, blob, meta = load_checkpoint(
+    model, blob, meta = load_model(
         checkpoint, data,
         required_capabilities=("conditional_nonempty_incidence", "gram_interactions"))
     training_population = supported_trips(data, 0, int(meta["nmax"]))
@@ -278,10 +207,9 @@ def main() -> None:
     output.parent.mkdir(parents=True, exist_ok=True)
     screen_levels = [args.screen_level, args.confirm_level,
                      args.confirm_level + 1]
-    observed, q8, used_level, screen_provenance = resumable_screen(
-        model, batcher, population, checkpoint, args.rank, screen_levels,
-        args.chunk, output, f"{args.split}-q{args.screen_level}",
-        blob["data_fingerprint_sha256"])
+    observed, q8, used_level, screen_summary = population_screen(
+        model, batcher, population, args.rank, screen_levels,
+        args.chunk, f"{args.split}-q{args.screen_level}")
     screen = metrics(q8, observed, tail_threshold, low_observed_threshold)
     probability = np.exp(q8)
     size = np.arange(1, probability.shape[1] + 1, dtype=np.float64)
@@ -503,8 +431,6 @@ def main() -> None:
     }
     result = {
         "checkpoint": str(checkpoint), "split": args.split,
-        "checkpoint_sha256": file_sha256(checkpoint),
-        "data_fingerprint_sha256": blob["data_fingerprint_sha256"],
         "trained_capabilities": blob["trained_capabilities"],
         "full_population_contexts": int(full_population_size),
         "screened_complete_population": bool(len(population) == full_population_size),
@@ -520,7 +446,7 @@ def main() -> None:
             "policy": ("use the requested screen level when every signed size mass is "
                        "positive; bisect invalid batches and escalate only invalid "
                        "contexts through confirm_level and confirm_level+1"),
-            **screen_provenance,
+            **screen_summary,
         },
         "screen": screen, "high_risk_confirmation": confirm,
         "high_risk_per_trip_output": str(confirm_output),
@@ -559,8 +485,7 @@ def main() -> None:
             f"the highest-risk contexts. A random q{args.confirm_level} panel corrects "
             f"aggregate q{args.screen_level} tail bias. The screen/confirm mean gap "
             f"remains a diagnostic; safety uses confirmed q{args.confirm_level} tails "
-            "and an explicit error envelope. Failure blocks production certification "
-            "but preserves resumable state."),
+            "and an explicit error envelope. Failure blocks production certification."),
     }
     output.write_text(strict_json_dumps(result))
     print(strict_json_dumps(result), end="")

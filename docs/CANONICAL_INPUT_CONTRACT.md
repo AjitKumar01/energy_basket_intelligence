@@ -73,7 +73,7 @@ Columns: `customer_id`, `store_id`, `period`.
 
 ### `build_audit.json`
 
-It must contain `source_sha256` and `audit.cohort_policy.minimum_product_training_lines`.
+It must contain `audit.cohort_policy.minimum_product_training_lines`.
 
 ### Limits
 
@@ -116,11 +116,7 @@ python -u scripts/run_pipeline.py --model-data-root <model_data_root> --run-dir 
 1. contract validation (after merging any `product_metadata`);
 2. bundle build;
 3. partition (model-free, before training);
-4. ragged index;
-5. data fingerprint.
-
-`run_pipeline.py` re-verifies the fingerprint and re-hashes every model-facing file before
-any stage runs.
+4. ragged index.
 
 ## 4. Choosing the partition
 

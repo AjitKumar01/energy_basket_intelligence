@@ -79,7 +79,7 @@ SCHEMA: dict[str, dict[str, Any]] = {
         "optional_table": True,
     },
 }
-BUILD_AUDIT_REQUIRED = ("source_sha256", "audit.cohort_policy.minimum_product_training_lines")
+BUILD_AUDIT_REQUIRED = ("audit.cohort_policy.minimum_product_training_lines",)
 
 
 class CanonicalContractError(ValueError):
@@ -210,8 +210,6 @@ def validate_canonical_tables(tables: dict[str, Any]) -> dict[str, Any]:
             _fail("store_week_prices units and revenue must be positive")
 
     audit = tables["build_audit"]
-    if "source_sha256" not in audit:
-        _fail("build_audit.json must record source_sha256")
     try:
         minimum = int(audit["audit"]["cohort_policy"]["minimum_product_training_lines"])
     except (KeyError, TypeError, ValueError):

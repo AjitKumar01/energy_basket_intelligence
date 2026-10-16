@@ -911,7 +911,7 @@ class RaggedModel(torch.nn.Module):
         # model self-describing in a checkpoint and add no fitted parameters.
         self.register_buffer("factored_size_enabled", torch.tensor(False))
         self.register_buffer("factored_size_log_p", torch.full((nmax,), -math.log(nmax)))
-        # softplus(0.5413) = 1.0: starts as the un-split model, so a resumed run is unchanged
+        # softplus(0.5413) = 1.0: starts as the un-split model
         self.price_kappa = torch.nn.Parameter(torch.tensor(0.5413))
         self.quad = None        # (nodes, weights) -> deterministic log Z
         # --- conditioning blocks (Eq. 7) -------------------------------------------------

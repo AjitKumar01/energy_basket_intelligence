@@ -31,7 +31,6 @@ data as arrays), truth.json, and counterfactual_truth.json.
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import time
 from pathlib import Path
@@ -335,17 +334,14 @@ def main():
                                   "period": period.astype(np.int16)}).drop_duplicates()
     canonical = args.output / "canonical"
     canonical.mkdir(parents=True, exist_ok=False)
-    digests = {}
     for name, frame in {"transactions": transactions, "products": products,
                         "store_week_prices": store_week_prices, "promotions": promotions,
                         "shopping_opportunities": opportunities}.items():
         path = canonical / f"{name}.parquet"
         frame.to_parquet(path, index=False)
-        digests[name] = hashlib.sha256(path.read_bytes()).hexdigest()
     sizes = np.array([len(b) for b in baskets])
     (canonical / "build_audit.json").write_text(json.dumps({
         "schema_version": 1, "status": "passed", "generator": "scripts/synthetic/generate_stress_world.py",
-        "source_sha256": digests,
         "audit": {"cohort_policy": {"minimum_product_training_lines": 1}, "trips": int(len(baskets)),
                   "lines": int(len(transactions)), "mean_basket_size": float(sizes.mean())}}, indent=2) + "\n")
     memberships = np.zeros((len(baskets), J), dtype=bool)

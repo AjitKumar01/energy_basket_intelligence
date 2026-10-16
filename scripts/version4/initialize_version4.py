@@ -1,16 +1,14 @@
 #!/usr/bin/env python3
 """Create the untrained, reproducible Version-4 initialization artifact.
 
-This stage performs no optimizer update and loads no checkpoint.  The additive fit that
+This stage performs no optimizer update and loads no fitted model.  The additive fit that
 follows is exact, so constructing an adaptive quadrature rule here would add cost without
-changing its objective.  The artifact uses the existing checksummed container format; its
-single placeholder index is compatibility metadata and is never used by the staged
-pipeline.
+changing its objective.  The file's single placeholder index is compatibility metadata
+and is never used by the staged pipeline.
 """
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import os
 from pathlib import Path
@@ -25,7 +23,7 @@ from features import Features
 from fit import (Batcher, calibrate_size_ipf, initialize_size_potential,
                  initialize_taste_moments, popularity_logits)
 from ragged import RaggedModel
-from provenance import load_data_fingerprint, strict_json_dumps
+from io_utils import strict_json_dumps
 from sparse_artifact import (initialize_nested_trace_class_phi,
                              save_sparse_initialization_artifact)
 
@@ -89,20 +87,17 @@ def main() -> None:
     torch.set_num_threads(args.threads)
     torch.manual_seed(args.seed)
     data = build()
-    data_fingerprint = load_data_fingerprint(Path(__file__).resolve().parents[2])
+    price_basis = json.loads((Path(BI) / "meta.json").read_text()).get("price_basis")
     dimensions = tuple(int(data[key]) for key in
                        ("n_item", "n_user", "n_cat", "n_store"))
     products, households, categories, stores = dimensions
-    affinity_path = Path(BI) / "items_affinity.parquet"
     affinity_manifest_path = Path(BI) / "affinity_manifest.json"
     if not affinity_manifest_path.exists():
         raise RuntimeError("missing affinity_manifest.json; rebuild the training-only partition")
     affinity_manifest = json.loads(affinity_manifest_path.read_text())
     if (not affinity_manifest.get("training_only") or
             int(affinity_manifest.get("n_items", -1)) != products or
-            int(affinity_manifest.get("n_groups", -1)) != categories or
-            affinity_manifest.get("partition_sha256") !=
-            hashlib.sha256(affinity_path.read_bytes()).hexdigest()):
+            int(affinity_manifest.get("n_groups", -1)) != categories):
         raise RuntimeError("affinity partition does not match its training-only manifest")
     training = np.flatnonzero(data["trip_split"] == 0)
     nmax, category_cap = resolve_basket_support(
@@ -153,8 +148,7 @@ def main() -> None:
         "active_rank": args.active_rank, "affinity_partition": True,
         "initialization_only": True, "no_rec": True,
         "household_size_rank1": bool(args.household_size_rank1),
-        "data_fingerprint_sha256": data_fingerprint["fingerprint_sha256"],
-        "price_basis": data_fingerprint["price_basis"],
+        "price_basis": price_basis,
         "trained_capabilities": {
             "conditional_nonempty_incidence": False,
             "gram_interactions": False,

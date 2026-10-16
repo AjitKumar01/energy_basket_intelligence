@@ -34,7 +34,7 @@ def tiny_tables():
                            "price_source": ["retail_aggregate", "retail_aggregate"]})
     promotions = pd.DataFrame(columns=["product_id", "store_id", "period", "display",
                                        "advertised", "special_price"])
-    audit = {"source_sha256": {}, "audit": {"cohort_policy": {"minimum_product_training_lines": 1}}}
+    audit = {"audit": {"cohort_policy": {"minimum_product_training_lines": 1}}}
     return {"transactions": tx, "products": products, "store_week_prices": prices,
             "promotions": promotions, "build_audit": audit, "shopping_opportunities": None}
 
@@ -126,9 +126,6 @@ def test_category_partition_writes_a_manifest_the_initializer_accepts(tmp_path):
     manifest = json.loads((tmp_path / "affinity_manifest.json").read_text())
     assert partition.item_id.tolist() == [0, 1, 2] and partition.cat_id.tolist() == [0, 1, 1]
     assert manifest["training_only"] and manifest["n_groups"] == 2 and manifest["n_items"] == 3
-    import hashlib
-    assert manifest["partition_sha256"] == hashlib.sha256(
-        (tmp_path / "items_affinity.parquet").read_bytes()).hexdigest()
 
 
 def load_prepare_module(name):

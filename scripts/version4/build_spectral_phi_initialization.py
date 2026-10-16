@@ -23,13 +23,13 @@ os.environ.setdefault("V3_AFFINITY", "1")
 import numpy as np
 import torch
 
-from checkpoint_io import ROOT, load_checkpoint
+from model_io import ROOT, load_model
 from data import build
 from features import Features
 from fit import Batcher
 from basket_incidence import incidence, off_diagonal_operator
 from pipeline_support import supported_trips
-from provenance import file_sha256, strict_json_dumps
+from io_utils import strict_json_dumps
 from tempered_block_gibbs import conditional_slots_repeated
 
 
@@ -78,7 +78,7 @@ def main():
     torch.set_num_threads(args.threads)
     data = build()
     parent = args.parent if args.parent.is_absolute() else ROOT / args.parent
-    model, blob, meta = load_checkpoint(
+    model, blob, meta = load_model(
         parent, data, required_capabilities=("conditional_nonempty_incidence",))
     if float(model.phi.detach().abs().max()) != 0.0:
         raise RuntimeError("spectral score initialization requires an exact Phi=0 parent")
@@ -175,16 +175,10 @@ def main():
     np.savez_compressed(
         output, eigenvalues=selected_values, eigenvectors=selected_vectors,
         row_mass=row_mass, trips=trips, half_a=half_a,
-        parent=np.asarray(str(parent)), parent_iteration=np.asarray(int(blob["iter"])),
-        parent_sha256=np.asarray(file_sha256(parent)),
-        data_fingerprint_sha256=np.asarray(blob["data_fingerprint_sha256"]))
-    basis_digest = file_sha256(output)
+        parent=np.asarray(str(parent)), parent_iteration=np.asarray(int(blob["iter"])))
     report = {
         "parent": str(parent),
         "parent_iteration": int(blob["iter"]),
-        "parent_sha256": file_sha256(parent),
-        "data_fingerprint_sha256": blob["data_fingerprint_sha256"],
-        "basis_sha256": basis_digest,
         "contexts": int(args.trips),
         "model_draws_per_context": int(args.draws),
         "context_seed": args.seed, "draw_seed": draw_seed,

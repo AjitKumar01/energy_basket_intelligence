@@ -10,7 +10,6 @@ zero.
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 from pathlib import Path
 
@@ -92,7 +91,6 @@ def main() -> None:
     # the exact within-category convolution has the declared complexity.
     if groups > 1 and int(sizes[1:].max()) > args.maximum_group_size:
         raise RuntimeError("a non-residual affinity group exceeds the complexity cap")
-    digest = hashlib.sha256(output.read_bytes()).hexdigest()
     manifest = {
         "schema_version": 1,
         "training_only": True,
@@ -103,7 +101,6 @@ def main() -> None:
         "maximum_non_residual_group_size": int(sizes[1:].max()) if groups > 1 else 0,
         "minimum_pair_count": args.minimum_pair_count,
         "maximum_group_size": args.maximum_group_size,
-        "partition_sha256": digest,
     }
     output.with_name("affinity_manifest.json").write_text(
         json.dumps(manifest, indent=2) + "\n")

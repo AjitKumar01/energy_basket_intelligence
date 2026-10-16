@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-import hashlib
 import json
 from pathlib import Path
 from typing import Any
@@ -13,14 +12,6 @@ import pandas as pd
 from canonical_contract import validate_canonical_tables
 
 DEFAULT_METADATA = {"MANUFACTURER": "UNKNOWN", "DEPARTMENT": "UNKNOWN"}
-
-
-def sha256(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as stream:
-        for block in iter(lambda: stream.read(1024 * 1024), b""):
-            digest.update(block)
-    return digest.hexdigest()
 
 
 @dataclass(frozen=True)
@@ -165,7 +156,6 @@ class CanonicalBasketModelInputBuilder:
             "median_repurchase_gap_days": state_audit["median_gap_days"],
             "promotion_contract": promotion_audit,
             "availability_contract": availability_audit,
-            "canonical_build_audit_sha256": sha256(required["build_audit"]),
         }
         meta_path = basket_input / "meta.json"
         meta_path.write_text(json.dumps(meta, indent=2, sort_keys=True) + "\n")
@@ -175,25 +165,10 @@ class CanonicalBasketModelInputBuilder:
             "price_basis": self.price_basis,
             "model_price_sources": list(self.model_price_sources),
             "canonical_directory": str(canonical),
-            "canonical_build_audit_sha256": sha256(required["build_audit"]),
         }
         build_meta_path = data_directory / "build_meta.json"
         build_meta_path.write_text(json.dumps(build_meta, indent=2, sort_keys=True) + "\n")
 
-        # Hash only the files produced above.  Iterating an existing output directory
-        # would pull stale downstream artifacts (or the prior manifest itself) into the
-        # preprocessing identity and create a non-verifiable self-reference.
-        derived_paths = {
-            name: basket_input / name for name in (
-                "items.parquet", "baskets.parquet", "log_price.npy",
-                "log_price_dev.npy", "store_price.npz", "promo.npz",
-                "promo_observed.npz", "state.npz", "meta.json")
-        }
-        if availability_audit["enabled"]:
-            derived_paths["availability.npz"] = basket_input / "availability.npz"
-        derived_paths["data/price_week.parquet"] = (
-            data_directory / "price_week.parquet")
-        derived = {name: sha256(path) for name, path in derived_paths.items()}
         preprocessing = {
             "schema_version": 1,
             "dataset": "canonical_external_basket",
@@ -211,11 +186,6 @@ class CanonicalBasketModelInputBuilder:
                     source_audit["audit"]["cohort_policy"][
                         "minimum_product_training_lines"]),
             },
-            "raw_sha256": source_audit["source_sha256"],
-            "canonical_sha256": {
-                name: sha256(path) for name, path in required.items()
-            },
-            "derived_sha256": derived,
         }
         preprocessing_path = basket_input / "preprocessing_manifest.json"
         preprocessing_path.write_text(
@@ -247,10 +217,8 @@ class CanonicalBasketModelInputBuilder:
         The file supplies optional product columns of the canonical contract; it may not
         change identifiers or categories, and it names each product at most once. Products it
         omits keep their canonical values, and missing values fall back to the contract
-        defaults in ``_items``. The audit records the file by name and content hash only, so
-        the bundle identity does not depend on where the repository lives.
+        defaults in ``_items``. The audit records the file by name.
         """
-        import hashlib
         if not path.is_file():
             raise FileNotFoundError(f"product metadata file is missing: {path}")
         extra = pd.read_parquet(path)
@@ -274,8 +242,7 @@ class CanonicalBasketModelInputBuilder:
             mapped = products.product_id.map(lookup[column].astype(str))
             products[column] = (mapped.where(mapped.notna(), products[column]) if column in products
                                 else mapped)
-        audit = {"file": path.name, "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
-                 "columns": columns, "products_covered": int(len(extra))}
+        audit = {"file": path.name, "columns": columns, "products_covered": int(len(extra))}
         return products, audit
 
     @staticmethod

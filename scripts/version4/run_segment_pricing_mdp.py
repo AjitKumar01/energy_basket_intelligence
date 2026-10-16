@@ -40,7 +40,7 @@ from scipy.stats import norm
 
 os.environ.setdefault("V3_AFFINITY", "1")
 
-from checkpoint_io import ROOT, load_checkpoint
+from model_io import ROOT, load_model
 from data import build
 from features import Features
 from fit import Batcher
@@ -49,7 +49,7 @@ from pipeline_support import (TAIL_THRESHOLD_SELECTION, particle_delta,
                               size_tail_threshold)
 from price_response import changed_price_context
 from tempered_ais import annealed_smc_logz
-from provenance import file_sha256, model_data_root, strict_json_dumps
+from io_utils import model_data_root, strict_json_dumps
 from uncertainty import paired_score_summary
 
 
@@ -518,7 +518,7 @@ def main() -> None:
         else ROOT / args.segment_report
     output_path = args.output if args.output.is_absolute() else ROOT / args.output
     data = build()
-    model, blob, meta = load_checkpoint(
+    model, blob, meta = load_model(
         checkpoint, data,
         required_capabilities=("conditional_nonempty_incidence", "gram_interactions"))
     labels = np.load(assignments)["segment"].astype(np.int64)
@@ -657,8 +657,6 @@ def main() -> None:
         scenarios.append(answer)
 
     frozen_policy = {
-        "checkpoint_sha256": file_sha256(checkpoint),
-        "data_fingerprint_sha256": blob["data_fingerprint_sha256"],
         "objective": args.objective,
         "selection_split": "validation", "evaluation_split": "test",
         "selection_context_sampling": "simple random trips within segment",
@@ -668,9 +666,6 @@ def main() -> None:
         "scenarios": scenarios,
     }
     independent = {
-        "checkpoint_sha256": file_sha256(checkpoint),
-        "data_fingerprint_sha256": blob["data_fingerprint_sha256"],
-        "selection_policy_sha256": None,
         "model_conditional_status": "completed",
         "policy_value_evaluated": "not_identifiable",
         "reason": ("test-panel calculations evaluate a frozen fitted-model policy, but "
@@ -681,7 +676,6 @@ def main() -> None:
                    else output_path.with_name("frozen_policy.json"))
     frozen_path.parent.mkdir(parents=True, exist_ok=True)
     frozen_path.write_text(strict_json_dumps(frozen_policy))
-    independent["selection_policy_sha256"] = file_sha256(frozen_path)
     independent_path = (args.independent_evaluation_output.resolve()
                         if args.independent_evaluation_output
                         else output_path.with_name("independent_policy_evaluation.json"))
@@ -689,8 +683,6 @@ def main() -> None:
 
     output = {
         "checkpoint": str(checkpoint),
-        "checkpoint_sha256": file_sha256(checkpoint),
-        "data_fingerprint_sha256": blob["data_fingerprint_sha256"],
         "trained_capabilities": blob["trained_capabilities"],
         "state": "(promotion days remaining, expected markdown budget remaining)",
         "actions": (
@@ -721,9 +713,7 @@ def main() -> None:
         "maximum_campaign_spend_under_action_space": maximum_campaign_spend,
         "budget_scenarios": scenarios,
         "frozen_policy": str(frozen_path),
-        "frozen_policy_sha256": file_sha256(frozen_path),
         "independent_policy_evaluation": str(independent_path),
-        "independent_policy_evaluation_sha256": file_sha256(independent_path),
         "not_identified": [
             "wholesale cost and profit", "inventory", "probability of making a trip",
             "competitor/store switching", "quantity beyond product incidence"],

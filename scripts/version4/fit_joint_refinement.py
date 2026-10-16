@@ -23,7 +23,6 @@ and the staged model stays.  --report always records the decision.
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import os
 import subprocess
@@ -37,7 +36,7 @@ import numpy as np
 import torch
 
 from category_safety import category_capacities, project_category_reward_
-from checkpoint_io import load_checkpoint
+from model_io import load_model
 from data import build
 from features import Features
 from fit import Batcher
@@ -107,14 +106,6 @@ def apply_household_size_shift(model, kappa: np.ndarray) -> None:
     model.rho_0_free.sub_(float(kappa.mean()) * torch.arange(1, model.nmax + 1, dtype=model.rho_0_free.dtype))
 
 
-def file_digest(path: Path) -> str:
-    h = hashlib.sha256()
-    with open(path, "rb") as f:
-        for block in iter(lambda: f.read(1 << 20), b""):
-            h.update(block)
-    return h.hexdigest()
-
-
 def main():
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     p.add_argument("--checkpoint", type=Path, required=True, help="staged final checkpoint")
@@ -170,7 +161,7 @@ def main():
     generator = torch.Generator().manual_seed(args.seed)
 
     data = build()
-    model, blob, meta = load_checkpoint(args.checkpoint, data)
+    model, blob, meta = load_model(args.checkpoint, data)
     rank, nmax, J = int(blob["active_rank"]), int(meta["nmax"]), int(data["n_item"])
     for name, parameter in model.named_parameters():
         parameter.requires_grad_(name in REFINED)
@@ -420,9 +411,8 @@ def main():
     if args.report is not None:
         report = {"decision": decision, "rounds": rounds, "contexts": int(len(trips)),
                   "draws_per_context": draws, "evaluation_level": level,
-                  "parent": str(args.checkpoint), "parent_sha256": file_digest(args.checkpoint),
+                  "parent": str(args.checkpoint),
                   "output": str(args.output) if args.output.is_file() else None,
-                  "output_sha256": file_digest(args.output) if args.output.is_file() else None,
                   "seconds": time.time() - started}
         args.report.parent.mkdir(parents=True, exist_ok=True)
         args.report.write_text(json.dumps(report, indent=2, default=float))

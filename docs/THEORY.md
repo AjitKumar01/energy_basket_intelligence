@@ -98,8 +98,8 @@ Prices are centered with training-distribution constants. The category index \(c
 the bundle's declared partition (for example merchandise categories); it changes which
 products share a penalty, not the category term in the energy.
 
-The bundle fingerprint locks source hashes, cohort membership, prices, promotion coverage,
-split counts and full support (see `CANONICAL_INPUT_CONTRACT.md`).
+The bundle fixes cohort membership, prices, promotion coverage, split counts and full
+support (see `CANONICAL_INPUT_CONTRACT.md`).
 
 ---
 

@@ -24,8 +24,8 @@ import pandas as pd
 from scipy.optimize import minimize
 from scipy.special import expit
 
-from checkpoint_io import ROOT
-from provenance import file_sha256, model_data_root, strict_json_dumps
+from model_io import ROOT
+from io_utils import model_data_root, strict_json_dumps
 
 
 DATA_ROOT = model_data_root(ROOT)
@@ -727,7 +727,6 @@ def main() -> None:
         "status": "completed",
         "claim_level": "observational_conditional_price_response",
         "estimand": "within-store product incidence rate response conditional on observed trips",
-        "implementation_sha256": file_sha256(Path(__file__).resolve()),
         "selection": {
             "training_events": int(len(training)),
             "validation_events": int(len(validation)),
@@ -859,7 +858,6 @@ def main() -> None:
         })
         coefficient_path.write_text(strict_json_dumps(coefficient_payload))
     report["coefficients_output"] = str(coefficient_path)
-    report["coefficients_sha256"] = file_sha256(coefficient_path)
     report["coefficients_certified"] = certified is not None
     output = args.output.resolve()
     output.parent.mkdir(parents=True, exist_ok=True)

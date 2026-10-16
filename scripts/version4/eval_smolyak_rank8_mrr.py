@@ -18,12 +18,12 @@ os.environ.setdefault("V3_AFFINITY", "1")
 import numpy as np
 import torch
 
-from checkpoint_io import ROOT, load_checkpoint
+from model_io import ROOT, load_model
 from data import build
 from features import Features
 from fit import Batcher, midrank, popularity_logits, rec_eval
 from ragged import smolyak_grid
-from provenance import file_sha256, strict_json_dumps
+from io_utils import strict_json_dumps
 from uncertainty import household_cluster_se, paired_score_summary
 
 
@@ -199,7 +199,7 @@ def main():
     torch.set_num_threads(args.threads)
     data = build()
     ckpt = args.ckpt if args.ckpt.is_absolute() else ROOT / args.ckpt
-    model, blob, meta = load_checkpoint(
+    model, blob, meta = load_model(
         ckpt, data,
         required_capabilities=("conditional_nonempty_incidence", "gram_interactions"))
     singular = torch.linalg.svdvals(model.phi)
@@ -218,8 +218,6 @@ def main():
     protocol = "conditioned-incidence" if args.conditioned else args.protocol
     base = {
         "checkpoint": str(ckpt),
-        "checkpoint_sha256": file_sha256(ckpt),
-        "data_fingerprint_sha256": blob["data_fingerprint_sha256"],
         "trained_capabilities": blob["trained_capabilities"],
         "checkpoint_iteration": int(blob["iter"]),
         "active_rank": active_rank,
@@ -229,11 +227,10 @@ def main():
     if protocol == "locked-add-one":
         parent = None
         if args.parent is not None:
-            parent, parent_blob, parent_meta = load_checkpoint(args.parent.resolve(), data,
+            parent, parent_blob, parent_meta = load_model(args.parent.resolve(), data,
                 required_capabilities=("conditional_nonempty_incidence",))
             if float(parent.phi.detach().abs().max()) != 0. or parent.nmax != model.nmax:
                 raise ValueError("recommendation parent must be additive on the identical support")
-            base["parent_sha256"] = file_sha256(args.parent.resolve())
         recommendation = locked_add_one(model, batcher, data, trips, args.seed, parent=parent)
         output = {
             **base,

@@ -1,43 +1,18 @@
-"""Reproducible initialization artifacts for Version-4 sparse training.
+"""The untrained initialization file that every Version-4 fit starts from.
 
-An adaptive rule is part of the numerical method, not a universal table of nodes.  Its
-index set depends on the integrand at the state where it was constructed.  This module
-therefore binds a rule to the exact *untrained* model state and data support used by the
-preflight audit.  No optimizer state or learned checkpoint is stored.
+It stores the model dimensions (``metadata``) and the untrained model state.  No optimizer
+state or fitted parameters are stored.
 """
 
 from __future__ import annotations
 
-import hashlib
 from collections.abc import Iterable, Mapping
 from pathlib import Path
 
-import numpy as np
 import torch
 
 
 ARTIFACT_FORMAT = 1
-
-
-def _tensor_bytes(value: torch.Tensor) -> bytes:
-    tensor = value.detach().cpu().contiguous()
-    return (str(tensor.dtype).encode() + b"\0"
-            + np.asarray(tensor.shape, dtype=np.int64).tobytes()
-            + tensor.numpy().tobytes())
-
-
-def tensor_mapping_sha256(values: Mapping[str, torch.Tensor]) -> str:
-    """Stable digest of a named tensor mapping, including names, shapes and dtypes."""
-    digest = hashlib.sha256()
-    for name in sorted(values):
-        digest.update(name.encode())
-        digest.update(b"\0")
-        digest.update(_tensor_bytes(values[name]))
-    return digest.hexdigest()
-
-
-def model_state_sha256(model: torch.nn.Module) -> str:
-    return tensor_mapping_sha256(model.state_dict())
 
 
 @torch.no_grad()
@@ -80,7 +55,7 @@ def initialize_nested_trace_class_phi(model, *, active_rank: int,
 def save_sparse_initialization_artifact(path: str | Path, model: torch.nn.Module, *,
                                         metadata: Mapping, sequence: Iterable,
                                         calibration_trips: Iterable[int]) -> dict:
-    """Save an untrained state and its adaptive rule as one fail-closed artifact."""
+    """Save an untrained model state with its metadata."""
     path = Path(path)
     state = {name: value.detach().cpu().clone()
              for name, value in model.state_dict().items()}
@@ -93,7 +68,6 @@ def save_sparse_initialization_artifact(path: str | Path, model: torch.nn.Module
         "metadata": dict(metadata),
         "accepted_sequence": accepted,
         "calibration_trips": [int(value) for value in calibration_trips],
-        "model_state_sha256": tensor_mapping_sha256(state),
         "model_state": state,
     }
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -103,7 +77,7 @@ def save_sparse_initialization_artifact(path: str | Path, model: torch.nn.Module
 
 def load_sparse_initialization_artifact(path: str | Path, model: torch.nn.Module,
                                         *, expected_metadata: Mapping | None = None) -> dict:
-    """Restore and verify the exact untrained state bound to a sparse rule."""
+    """Load the untrained state into ``model`` and return the file's other fields."""
     payload = torch.load(Path(path), map_location="cpu", weights_only=False)
     if payload.get("format") != ARTIFACT_FORMAT or payload.get("kind") != \
             "version4_sparse_untrained_initialization":
@@ -111,9 +85,6 @@ def load_sparse_initialization_artifact(path: str | Path, model: torch.nn.Module
     state = payload.get("model_state")
     if not isinstance(state, dict):
         raise ValueError("sparse initialization artifact has no model state")
-    digest = tensor_mapping_sha256(state)
-    if digest != payload.get("model_state_sha256"):
-        raise ValueError("sparse initialization artifact failed its state digest")
     if expected_metadata:
         got = payload.get("metadata", {})
         mismatch = {key: (got.get(key), value) for key, value in expected_metadata.items()
@@ -121,7 +92,5 @@ def load_sparse_initialization_artifact(path: str | Path, model: torch.nn.Module
         if mismatch:
             raise ValueError(f"sparse initialization metadata mismatch: {mismatch}")
     model.load_state_dict(state, strict=True)
-    if model_state_sha256(model) != digest:
-        raise RuntimeError("restored sparse initialization differs from certified state")
     return {key: value for key, value in payload.items() if key != "model_state"}
 

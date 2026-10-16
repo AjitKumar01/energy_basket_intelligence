@@ -68,12 +68,11 @@ certification, not a causal or commercial deployment certificate.
 ### Stage A — data and support
 
 A dataset adapter writes the canonical directory, and `prepare_model_bundle.py` converts it
-into a fingerprinted model-data bundle: checkout baskets, product/store/week prices and price
+into a model-data bundle: checkout baskets, product/store/week prices and price
 deviations, promotions, the declared availability rule, and a training-only product partition
 (`CANONICAL_INPUT_CONTRACT.md`). The product and household cohorts are defined from training
 periods only. An observed basket in any split outside the declared support is a hard error;
-outcomes are never deleted to fit the support. The pipeline re-verifies the bundle fingerprint
-before any stage runs.
+outcomes are never deleted to fit the support.
 
 ### Stage B — exact additive maximum likelihood
 

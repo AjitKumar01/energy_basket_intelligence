@@ -11,13 +11,13 @@ os.environ.setdefault("V3_AFFINITY", "1")
 import numpy as np
 import torch
 
-from checkpoint_io import ROOT, load_checkpoint
+from model_io import ROOT, load_model
 from data import build
 from features import Features
 from fit import Batcher
 from interaction_particles import differentiable_logz_beta0
 from pipeline_support import smolyak_rule
-from provenance import file_sha256, strict_json_dumps
+from io_utils import strict_json_dumps
 from uncertainty import paired_score_summary
 
 
@@ -84,10 +84,10 @@ def main():
     data = build()
     parent_path = args.parent if args.parent.is_absolute() else ROOT / args.parent
     child_path = args.child if args.child.is_absolute() else ROOT / args.child
-    parent, parent_blob, meta = load_checkpoint(
+    parent, parent_blob, meta = load_model(
         parent_path, data,
         required_capabilities=("conditional_nonempty_incidence",))
-    child, child_blob, child_meta = load_checkpoint(
+    child, child_blob, child_meta = load_model(
         child_path, data,
         required_capabilities=("conditional_nonempty_incidence", "gram_interactions"))
     if float(parent.phi.detach().abs().max()) != 0.0:
@@ -135,9 +135,6 @@ def main():
     result = {
         "parent": str(parent_path), "parent_iteration": int(parent_blob["iter"]),
         "child": str(child_path), "child_iteration": int(child_blob["iter"]),
-        "parent_sha256": file_sha256(parent_path),
-        "checkpoint_sha256": file_sha256(child_path),
-        "data_fingerprint_sha256": child_blob["data_fingerprint_sha256"],
         "trained_capabilities": child_blob["trained_capabilities"],
         "split": args.split, "complete_support": f"1..{int(meta['nmax'])}",
         "active_rank": active_rank,
@@ -177,7 +174,6 @@ def main():
         low_child=low_value, audit_trips=trips[:n_audit],
         audit_child=audit_value)
     result["per_trip_output"] = str(per_trip_output)
-    result["per_trip_sha256"] = file_sha256(per_trip_output)
     output.write_text(strict_json_dumps(result))
     print(strict_json_dumps(result), end="")
     if not result["numerical_certification"]["passed"]:

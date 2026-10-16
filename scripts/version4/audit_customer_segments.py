@@ -23,7 +23,7 @@ from sklearn.metrics import adjusted_rand_score, silhouette_score
 from sklearn.preprocessing import StandardScaler
 from torch.nn.functional import softplus
 
-from checkpoint_io import ROOT, load_checkpoint
+from model_io import ROOT, load_model
 from data import BI, build
 from features import Features
 from fit import Batcher
@@ -31,7 +31,7 @@ from interaction_particles import (blocked_rejuvenation,
                                    rao_blackwell_particle_statistics)
 from pipeline_support import copied_context, named_basket, particle_delta
 from tempered_ais import annealed_smc_logz
-from provenance import file_sha256, strict_json_dumps
+from io_utils import strict_json_dumps
 from uncertainty import paired_score_summary
 
 
@@ -407,7 +407,7 @@ def main():
     torch.set_num_threads(args.threads)
     data = build()
     ckpt = args.ckpt if args.ckpt.is_absolute() else ROOT / args.ckpt
-    model, blob, meta = load_checkpoint(
+    model, blob, meta = load_model(
         ckpt, data,
         required_capabilities=("conditional_nonempty_incidence", "gram_interactions"))
     representation, taste, price = household_representation(model)
@@ -489,11 +489,8 @@ def main():
     np.savez_compressed(assignments, household=np.arange(len(labels)), segment=labels,
                         representation=representation, taste=taste, price=price,
                         centers=centers)
-    assignments_digest = file_sha256(assignments)
     output = {
         "checkpoint": str(ckpt), "checkpoint_iteration": int(blob["iter"]),
-        "checkpoint_sha256": file_sha256(ckpt),
-        "data_fingerprint_sha256": blob["data_fingerprint_sha256"],
         "trained_capabilities": blob["trained_capabilities"],
         "method": ("KMeans on separately standardized, equal-block-weighted, "
                    "rotation-invariant identified household taste and price surfaces; "
@@ -502,7 +499,6 @@ def main():
         "test_leakage": False,
         "chosen_segments": count, "candidate_selection": selection,
         "assignments": str(assignments),
-        "assignments_sha256": assignments_digest,
         "distribution_metrics": (
             "symmetric Dirichlet total prior mass 1; KL in nats; JS and TV reported; "
             "all eligible segment test baskets form the real reference; observed and "

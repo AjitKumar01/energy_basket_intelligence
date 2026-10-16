@@ -27,14 +27,14 @@ import torch
 from scipy.special import logsumexp
 from scipy.stats import norm
 
-from checkpoint_io import ROOT, load_checkpoint
-from audit_population_size import resumable_screen, screen_signature
+from model_io import ROOT, load_model
+from audit_population_size import population_screen
 from data import build
 from features import Features
 from fit import Batcher
 from pipeline_support import (TAIL_THRESHOLD_SELECTION, size_tail_threshold,
                               supported_trips)
-from provenance import file_sha256, strict_json_dumps
+from io_utils import strict_json_dumps
 
 
 torch.set_default_dtype(torch.float64)
@@ -176,36 +176,6 @@ def cap_households(log_probability: np.ndarray, household: np.ndarray,
     return result, upper_bound
 
 
-def seed_population_cache(checkpoint: Path, population_output: Path,
-                          population: np.ndarray, rank: int, levels: list[int],
-                          log_probability: np.ndarray, observed: np.ndarray,
-                          data_fingerprint: str) -> str:
-    """Write the exactly tilted low-rule law for the final checkpoint.
-
-    The common household shift changes the cached size law analytically, so rerunning the
-    full-catalogue DP would be redundant. The ordinary population audit verifies the
-    signature before accepting this cache and still performs its q(confirm) panels.
-    """
-    signature = screen_signature(
-        checkpoint, population, rank, levels, data_fingerprint)
-    prefix = population_output.with_name(
-        f"{population_output.stem}.screen-{signature[:12]}")
-    np.save(str(prefix) + ".log_probability.npy",
-            np.asarray(log_probability, dtype=np.float64))
-    np.save(str(prefix) + ".observed.npy",
-            np.asarray(observed, dtype=np.int16))
-    np.save(str(prefix) + ".level.npy",
-            np.full(len(population), levels[0], dtype=np.int16))
-    progress = {
-        "signature": signature, "contexts": len(population),
-        "rank": rank, "levels": levels,
-        "completed_contexts": len(population), "complete": True,
-    }
-    Path(str(prefix) + ".progress.json").write_text(
-        strict_json_dumps(progress))
-    return str(prefix)
-
-
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--checkpoint", type=Path, required=True)
@@ -229,8 +199,6 @@ def main() -> None:
                         default=Path("artifacts/candidate_rank1.pt"))
     parser.add_argument("--report", type=Path,
                         default=Path("artifacts/candidate_rank1.json"))
-    parser.add_argument("--population-output", type=Path,
-                        default=Path("reports/population_size.json"))
     args = parser.parse_args()
     if not 0 < args.screen_tail_cap < 0.5:
         raise ValueError("screen-tail-cap must lie strictly between zero and 0.5")
@@ -241,7 +209,7 @@ def main() -> None:
     data = build()
     checkpoint = args.checkpoint if args.checkpoint.is_absolute() \
         else ROOT / args.checkpoint
-    model, blob, meta = load_checkpoint(
+    model, blob, meta = load_model(
         checkpoint, data,
         required_capabilities=("conditional_nonempty_incidence", "gram_interactions"))
     if not model.household_size_rank1:
@@ -258,10 +226,9 @@ def main() -> None:
     report_path = args.report if args.report.is_absolute() else ROOT / args.report
     report_path.parent.mkdir(parents=True, exist_ok=True)
     levels = [args.screen_level, args.screen_level + 1, args.screen_level + 2]
-    observed, base_log_probability, used_level, provenance = resumable_screen(
-        model, batcher, population, checkpoint, args.rank, levels, args.chunk,
-        report_path, f"rank1-base-q{args.screen_level}",
-        blob["data_fingerprint_sha256"])
+    observed, base_log_probability, used_level, screen_summary = population_screen(
+        model, batcher, population, args.rank, levels, args.chunk,
+        f"rank1-base-q{args.screen_level}")
     household = data["trip_user"][population].astype(np.int64, copy=False)
     day = data["trip_day"][population].astype(np.int64, copy=False)
     n_household = int(data["n_user"])
@@ -335,8 +302,6 @@ def main() -> None:
     result = {
         "method": "identified_rank_one_household_common_utility",
         "parent": str(checkpoint),
-        "parent_sha256": file_sha256(checkpoint),
-        "data_fingerprint_sha256": blob["data_fingerprint_sha256"],
         "trained_capabilities": blob["trained_capabilities"],
         "output": str(args.output if args.output.is_absolute() else ROOT / args.output),
         "status": (
@@ -381,7 +346,7 @@ def main() -> None:
         "maximum_screen_tail_ge_threshold": float(tail.max()),
         "contexts_tail_probability_ge_half": int((tail >= .5).sum()),
         "contexts_expected_size_ge_40": int((expected >= 40).sum()),
-        "base_screen": provenance,
+        "base_screen": screen_summary,
         "interpretation": (
             "The checkpoint already learned the common household coordinate during "
             "exact additive fitting. This stage tests only a post-interaction "
@@ -424,14 +389,7 @@ def main() -> None:
     torch.save(result_blob, temporary)
     temporary.replace(output)
 
-    population_output = (
-        args.population_output if args.population_output.is_absolute()
-        else ROOT / args.population_output)
-    cache_prefix = seed_population_cache(
-        output, population_output, population, args.rank, levels,
-        tilted, observed, blob["data_fingerprint_sha256"])
     result["output"] = str(output)
-    result["final_population_cache_prefix"] = cache_prefix
     report_path.write_text(strict_json_dumps(result))
     print(strict_json_dumps(result), end="", flush=True)
 

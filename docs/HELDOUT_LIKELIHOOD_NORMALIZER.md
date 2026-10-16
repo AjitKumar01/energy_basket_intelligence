@@ -59,7 +59,7 @@ The current checkpoint has active rank five.
 For validation, the executable performs the following steps:
 
 1. Load the exact additive-parent checkpoint and the final interaction checkpoint.
-2. Verify checkpoint capability, data fingerprint, support and active rank.
+2. Verify checkpoint capability, support and active rank.
 3. Select baskets having split identifier 1 and observed size at most 120.
 4. Apply a deterministic permutation with the declared seed.
 5. Retain the first 4,096 validation trips.
@@ -684,7 +684,6 @@ requires dependence-robust inference.
 The accepted checkpoint and report are:
 
 - child: `artifacts/candidate_rank1.pt`;
-- child SHA-256: `9e198024b83fa748653ab9cc5fa3ddd6f5a35a01f62830c6d2516e421475e2db`;
 - report: `reports/likelihood_validation.json`; and
 - per-trip values: `reports/likelihood_validation_per_trip.npz`.
 

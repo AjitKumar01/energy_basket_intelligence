@@ -21,7 +21,7 @@ import numpy as np
 import pandas as pd
 import torch
 
-from checkpoint_io import ROOT, load_checkpoint
+from model_io import ROOT, load_model
 from data import BI, build
 from features import Features
 from fit import Batcher
@@ -29,7 +29,7 @@ from interaction_particles import (blocked_rejuvenation,
                                    rao_blackwell_particle_statistics)
 from pipeline_support import named_basket, particle_delta
 from tempered_ais import annealed_smc_logz
-from provenance import file_sha256, strict_json_dumps
+from io_utils import strict_json_dumps
 from price_response import changed_price_context
 
 
@@ -75,7 +75,7 @@ def main():
     torch.set_num_threads(args.threads)
     ckpt = args.ckpt if args.ckpt.is_absolute() else ROOT / args.ckpt
     data = build()
-    model, blob, meta = load_checkpoint(
+    model, blob, meta = load_model(
         ckpt, data,
         required_capabilities=("conditional_nonempty_incidence", "gram_interactions"))
     features = Features(int(data["n_item"]), int(data["n_store"]), include_recency=False)
@@ -226,8 +226,6 @@ def main():
             and price_component.get("level") == "disabled"))
     output = {
         "checkpoint": str(ckpt),
-        "checkpoint_sha256": file_sha256(ckpt),
-        "data_fingerprint_sha256": blob["data_fingerprint_sha256"],
         "trained_capabilities": blob["trained_capabilities"],
         "checkpoint_iteration": int(blob["iter"]),
         "best_iteration": int(blob["best_iteration"]),
@@ -265,10 +263,8 @@ def main():
     }
     if args.panel_output:
         output["panel_output"] = str(panel_output)
-        output["panel_sha256"] = file_sha256(panel_output)
     if args.per_context_output:
         output["per_context_output"] = str(per_context)
-        output["per_context_sha256"] = file_sha256(per_context)
     args.output = args.output if args.output.is_absolute() else ROOT / args.output
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(strict_json_dumps(output))

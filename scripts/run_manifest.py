@@ -1,12 +1,7 @@
-"""Run logging, atomic status manifests and frozen-source identity for driver scripts."""
+"""Run logging and the per-invocation status manifest for the pipeline driver."""
 from __future__ import annotations
 
-import hashlib
 import json
-from pathlib import Path
-
-
-ROOT = Path(__file__).resolve().parents[1]
 
 
 class Tee:
@@ -30,12 +25,3 @@ def write_manifest(path, value):
     temporary = path.with_suffix(".pending.json")
     temporary.write_text(json.dumps(value, indent=2, allow_nan=False) + "\n")
     temporary.replace(path)
-
-
-def source_identity():
-    """Digest every source and test file so a long run can refuse mid-run code edits."""
-    paths = sorted((ROOT / "scripts").rglob("*.py"))
-    paths += sorted((ROOT / "scripts").rglob("*.cpp"))
-    paths += sorted((ROOT / "tests").glob("*.py"))
-    return {str(path.relative_to(ROOT)): hashlib.sha256(path.read_bytes()).hexdigest()
-            for path in paths}

@@ -25,8 +25,8 @@ import pandas as pd
 from scipy.spatial import cKDTree
 
 from data import BI, build
-from checkpoint_io import load_checkpoint
-from provenance import file_sha256, strict_json_dumps
+from model_io import load_model
+from io_utils import strict_json_dumps
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -271,7 +271,7 @@ def markdown(result):
 def main(args):
     checkpoint = args.checkpoint if args.checkpoint.is_absolute() else ROOT / args.checkpoint
     data = build()
-    model, blob, _meta = load_checkpoint(
+    model, blob, _meta = load_model(
         checkpoint, data,
         required_capabilities=("conditional_nonempty_incidence", "gram_interactions"))
     state = model.state_dict()
@@ -340,8 +340,6 @@ def main(args):
         })
     result = {
         "checkpoint": str(checkpoint),
-        "checkpoint_sha256": file_sha256(checkpoint),
-        "data_fingerprint_sha256": blob["data_fingerprint_sha256"],
         "trained_capabilities": blob["trained_capabilities"],
         "split": "test",
         "definition": (

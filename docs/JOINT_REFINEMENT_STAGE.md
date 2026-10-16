@@ -102,7 +102,7 @@ python scripts/run_pipeline.py --model-data-root <bundle> --run-dir <run> --prof
 
 `--joint-refinement` inserts a `refinement` stage between `interaction` and `evaluation`.
 Evaluation and certification use `candidate_refined.pt` only when `reports/joint_refinement.json`
-records an accepted decision whose parent digest is the staged checkpoint's; otherwise they use
+records an accepted decision; otherwise they use
 `candidate_rank1.pt`. `--evaluation-level-offset` sets the Smolyak level of the likelihood,
 recommendation and population-size gates. The default (rank + 2) is unchanged; the stress world
 needs rank + 3.

@@ -28,7 +28,7 @@ from fit import Batcher
 from pipeline_support import supported_trips
 from interaction_particles import (differentiable_log_size_beta0,
                                    differentiable_logz_beta0)
-from provenance import file_sha256, require_fingerprint, strict_json_dumps
+from io_utils import strict_json_dumps
 from ragged import RaggedModel
 from price_response import additive_uniform_price_response
 from sparse_artifact import load_sparse_initialization_artifact
@@ -39,9 +39,9 @@ ROOT = Path(__file__).resolve().parents[2]
 
 
 class Tee:
-    def __init__(self, stream, path, append=False):
+    def __init__(self, stream, path):
         self.stream = stream
-        self.file = Path(path).open("a" if append else "w", buffering=1)
+        self.file = Path(path).open("w", buffering=1)
 
     def write(self, value):
         self.stream.write(value)
@@ -59,8 +59,6 @@ def parse_args():
                         default=Path("out/v3_version4_sparse_init.pt"))
     parser.add_argument("--label", default="run259_exact_additive")
     parser.add_argument("--output-dir", type=Path, default=ROOT / "out")
-    parser.add_argument("--resume", type=Path,
-                        help="resume an exact Phi=0 checkpoint; --iters is the final update")
     parser.add_argument("--iters", type=int, default=200)
     parser.add_argument("--batch", type=int, default=128)
     parser.add_argument("--lr", type=float, default=.001)
@@ -70,7 +68,6 @@ def parse_args():
     parser.add_argument("--validation-chunk", type=int, default=128)
     parser.add_argument("--eval-every", type=int, default=50)
     parser.add_argument("--log-every", type=int, default=10)
-    parser.add_argument("--milestone-every", type=int, default=500)
     parser.add_argument("--lr-patience", type=int, default=4,
                         help="validation plateaus before halving the learning rate")
     parser.add_argument("--lr-factor", type=float, default=0.5)
@@ -121,40 +118,23 @@ def atomic_save(path, payload):
     os.replace(temporary, path)
 
 
-def material_validation_patience(evaluations, minimum_delta):
-    """Count evaluations since validation last improved by the declared amount."""
-    if not evaluations:
-        return 0
-    anchor = float(evaluations[0]["basket_loglik"])
-    since = 0
-    for row in evaluations[1:]:
-        value = float(row["basket_loglik"])
-        if value > anchor + float(minimum_delta):
-            anchor = value
-            since = 0
-        else:
-            since += 1
-    return since
-
-
 def load_model(artifact, data):
     raw = torch.load(artifact, map_location="cpu", weights_only=False)
     meta = raw["metadata"]
-    require_fingerprint(meta.get("data_fingerprint_sha256"), ROOT)
     model = RaggedModel(
         int(data["n_item"]), int(data["n_user"]), int(data["n_cat"]),
         K=int(meta["K"]), Kz=int(meta["Kz"]), nmax=int(meta["nmax"]),
         R=int(meta["R"]), seed=int(meta["seed"]), S=int(data["n_store"]),
         Kp=int(meta["Kp"]), phi_init=0.0,
         household_size_rank1=bool(meta.get("household_size_rank1", False)))
-    restored = load_sparse_initialization_artifact(artifact, model)
+    load_sparse_initialization_artifact(artifact, model)
     with torch.no_grad():
         model.phi.zero_()
     model._poly_degree_native = True
     model._esp_native = True
     model._esp_log_blocked = True
     model.double().train()
-    return model, meta, restored
+    return model, meta
 
 
 def fitted_parameters(model):
@@ -239,7 +219,6 @@ def load_supported_price_sensitivity(path, catalogue_products):
         raise RuntimeError("supported price sensitivities are invalid")
     return sensitivity, level, {
         "coefficient_path": str(path),
-        "coefficient_sha256": file_sha256(path),
         "estimated_product_deviations": estimated_products,
         "unestimated_products_using_global_sensitivity":
             int(catalogue_products - estimated_products) if use_global_fallback else 0,
@@ -306,7 +285,7 @@ def validate(model, batcher, trips, chunk):
 
 def main():
     args = parse_args()
-    price_provenance = None
+    price_metadata = None
     if args.supported_price_coefficients is not None:
         if args.global_price_sensitivity > 0 or args.disable_price_response:
             raise SystemExit(
@@ -326,18 +305,17 @@ def main():
     output = args.output_dir.resolve()
     output.mkdir(parents=True, exist_ok=True)
     log_path = output / f"v3_{args.label}.log"
-    checkpoint_path = output / f"v3_{args.label}.pt"
     best_path = output / f"v3_{args.label}_best.pt"
     history_path = output / f"v3_{args.label}_history.json"
-    sys.stdout = Tee(sys.stdout, log_path, append=args.resume is not None)
+    sys.stdout = Tee(sys.stdout, log_path)
 
     data = build()
-    model, meta, restored = load_model(artifact, data)
+    model, meta = load_model(artifact, data)
     supported_price_sensitivity = None
     supported_price_level = None
     if args.supported_price_coefficients is not None:
         (supported_price_sensitivity, supported_price_level,
-         price_provenance) = load_supported_price_sensitivity(
+         price_metadata) = load_supported_price_sensitivity(
             args.supported_price_coefficients, model.J)
     elif args.global_price_sensitivity > 0:
         supported_price_sensitivity = np.full(
@@ -350,13 +328,13 @@ def main():
         configure_supported_price(
             model, supported_price_sensitivity, supported_price_level)
         if supported_price_sensitivity is not None else None)
-    if supported_price_audit is not None and price_provenance is not None:
-        supported_price_audit.update(price_provenance)
+    if supported_price_audit is not None and price_metadata is not None:
+        supported_price_audit.update(price_metadata)
     if int(meta["active_rank"]) != 8:
         raise RuntimeError("expected the certified rank-8 parent artifact")
     price_feature_contract = (
-        price_provenance.get("price_feature_contract", "chain_and_store")
-        if price_provenance is not None else "chain_and_store")
+        price_metadata.get("price_feature_contract", "chain_and_store")
+        if price_metadata is not None else "chain_and_store")
     if price_feature_contract not in {"chain_and_store", "chain_product_week_only"}:
         raise RuntimeError(f"unknown price feature contract {price_feature_contract!r}")
     features = Features(
@@ -382,56 +360,6 @@ def main():
     rho_c_capacities = category_capacities(
         data, int(data["n_cat"]), int(meta["nmax"]))
 
-    start_iteration = 0
-    resumed = None
-    if args.resume is not None:
-        resume_path = args.resume if args.resume.is_absolute() else ROOT / args.resume
-        resumed = torch.load(resume_path, map_location="cpu", weights_only=False)
-        if resumed.get("estimator") != "exact_version4_no_gram_dynamic_program":
-            raise RuntimeError("resume checkpoint is not from the exact Phi=0 stage")
-        if resumed.get("data_fingerprint_sha256") != meta["data_fingerprint_sha256"]:
-            raise RuntimeError("resume checkpoint belongs to a different audited dataset")
-        prior = resumed["config"]
-        prior_price = resumed.get("supported_price_component")
-        if (prior_price is None) != (supported_price_audit is None):
-            raise RuntimeError("supported price mode must remain unchanged when resuming")
-        if supported_price_audit is not None:
-            for key in ("level", "coefficient_sha256", "sensitivity_minimum",
-                        "sensitivity_median", "sensitivity_maximum"):
-                if prior_price.get(key) != supported_price_audit.get(key):
-                    raise RuntimeError(
-                        "supported price coefficients must remain unchanged when resuming")
-        if args.elast_w > 0 and resumed.get("price_response_estimator") != "exact_dp_fourth_order":
-            raise RuntimeError("cannot resume proxy-elasticity optimizer under the corrected objective")
-        if args.elast_w > 0 and float(prior.get("elast_step", 1e-3)) != args.elast_step:
-            raise RuntimeError("--elast-step must remain unchanged when resuming")
-        for key in ("batch", "seed"):
-            if int(prior[key]) != int(getattr(args, key)):
-                raise RuntimeError(f"--{key} must remain {prior[key]} when resuming")
-        prior_reward = float(prior.get("rho_c_max_category_reward", 0.0))
-        if prior_reward != float(args.rho_c_max_category_reward):
-            raise RuntimeError(
-                "--rho-c-max-category-reward must remain "
-                f"{prior_reward:g} when resuming")
-        model.load_state_dict(resumed["model"])
-        if supported_price_sensitivity is not None:
-            supported_price_audit = configure_supported_price(
-                model, supported_price_sensitivity, supported_price_level)
-            if price_provenance is not None:
-                supported_price_audit.update(price_provenance)
-        optimizer.load_state_dict(resumed["optimizer"])
-        start_iteration = int(resumed["iter"])
-        if args.iters <= start_iteration:
-            raise RuntimeError(
-                f"--iters={args.iters} must exceed resumed iteration {start_iteration}")
-        # The only stochastic training operation is NumPy's uniform minibatch draw.
-        # Replaying those inexpensive draws reproduces the exact next minibatch without
-        # storing a fragile pickled RNG implementation in historical checkpoints.
-        for _ in range(start_iteration):
-            rng.choice(len(train), size=args.batch, replace=False)
-        if float(model.phi.detach().abs().max()) != 0.0:
-            raise RuntimeError("resume checkpoint has a nonzero Gram residual")
-
     print("[exact-additive] unchanged version-4 utilities/category/size law; Gram residual "
           "held at zero for this exact MLE stage", flush=True)
     print(f"[exact-additive] J={model.J}, full support 1..{model.nmax}, batch={args.batch}, "
@@ -455,44 +383,18 @@ def main():
               f"max attractive reward={args.rho_c_max_category_reward:g} nats; "
               f"initial max={initial_category_safety['maximum_reward_after']:.6f}",
               flush=True)
-    if resumed is not None:
-        print(f"[exact-additive] resumed iteration {start_iteration} from {resume_path}; "
-              f"optimizer and minibatch stream restored", flush=True)
     print(f"[exact-additive] log: {log_path}", flush=True)
 
     started = time.perf_counter()
-    resumed_value = validate(model, batcher, valid, args.validation_chunk)
-    if resumed is None:
-        initial = resumed_value
-        evaluations = [{"iter": 0, **initial}]
-        records = []
-        best_score = initial["basket_loglik"]
-        best_iteration = 0
-        plateau_anchor = best_score
-        plateau_evaluations = 0
-        evaluations_since_best = 0
-        print(f"[exact-additive] initial validation LL={best_score:.6f}", flush=True)
-    else:
-        evaluations = list(resumed["evaluations"])
-        records = list(resumed["records"])
-        initial = {key: value for key, value in evaluations[0].items() if key != "iter"}
-        best_score = float(resumed["best_validation"])
-        best_iteration = int(resumed["best_iteration"])
-        scheduler = resumed.get("scheduler", {})
-        plateau_anchor = float(scheduler.get("plateau_anchor", best_score))
-        plateau_evaluations = int(scheduler.get("plateau_evaluations", 0))
-        if scheduler.get("convergence_patience_basis") == "material_validation_gain":
-            evaluations_since_best = int(scheduler.get("evaluations_since_best", 0))
-        else:
-            evaluations_since_best = material_validation_patience(
-                evaluations, args.validation_min_delta)
-        saved = next(x for x in reversed(evaluations)
-                     if int(x["iter"]) == start_iteration)
-        tolerance = 5e-10
-        if abs(resumed_value["basket_loglik"] - saved["basket_loglik"]) > tolerance:
-            raise RuntimeError("resume validation panel does not reproduce the checkpoint")
-        print(f"[exact-additive] reproduced validation {start_iteration}: "
-              f"LL={resumed_value['basket_loglik']:.6f}", flush=True)
+    initial = validate(model, batcher, valid, args.validation_chunk)
+    evaluations = [{"iter": 0, **initial}]
+    records = []
+    best_score = initial["basket_loglik"]
+    best_iteration = 0
+    plateau_anchor = best_score
+    plateau_evaluations = 0
+    evaluations_since_best = 0
+    print(f"[exact-additive] initial validation LL={best_score:.6f}", flush=True)
 
     def payload(iteration):
         return {
@@ -501,19 +403,16 @@ def main():
             "price_response_estimator": (
                 "fixed_zero_after_failed_heldout_support"
                 if supported_price_level == "disabled" else
-                price_provenance.get(
+                price_metadata.get(
                     "price_response_estimator",
                     "matched_store_conditional_binomial_hierarchy_v1")
-                if price_provenance is not None else
+                if price_metadata is not None else
                 "matched_store_conditional_binomial_hierarchy_v1"
                 if supported_price_audit is not None else "exact_dp_fourth_order"),
             "supported_price_component": supported_price_audit,
             "optimization_contract": "regularized fit with validation early stopping; not a stationarity certificate",
-            "fresh_artifact_digest": restored["model_state_sha256"],
-            "data_fingerprint_sha256": meta["data_fingerprint_sha256"],
             "iter": iteration,
             "model": model.state_dict(),
-            "optimizer": optimizer.state_dict(),
             "config": vars(args),
             "objective": (
                 "exact normalized Phi=0 likelihood with a frozen independently fitted "
@@ -531,20 +430,14 @@ def main():
             "parent_active_rank": 8,
             "best_validation": best_score,
             "best_iteration": best_iteration,
-            "scheduler": {
-                "plateau_anchor": plateau_anchor,
-                "plateau_evaluations": plateau_evaluations,
-                "evaluations_since_best": evaluations_since_best,
-                "convergence_patience_basis": "material_validation_gain",
-                "learning_rate": float(optimizer.param_groups[0]["lr"]),
-            },
+            "learning_rate": float(optimizer.param_groups[0]["lr"]),
             "evaluations": evaluations,
             "records": records,
         }
 
-    atomic_save(best_path, payload(start_iteration))
+    atomic_save(best_path, payload(0))
     converged = False
-    for iteration in range(start_iteration + 1, args.iters + 1):
+    for iteration in range(1, args.iters + 1):
         tick = time.perf_counter()
         trips = train[rng.choice(len(train), size=args.batch, replace=False)]
         ix, ctx, line_ctx, house, li, lt, lc, _lq = batcher.make(trips)
@@ -686,7 +579,7 @@ def main():
                 best_score = current["basket_loglik"]
                 best_iteration = iteration
                 atomic_save(best_path, payload(iteration))
-                print(f"[exact-additive] new best checkpoint at {iteration}", flush=True)
+                print(f"[exact-additive] new best model at {iteration}", flush=True)
             if material_improved:
                 plateau_anchor = current["basket_loglik"]
                 plateau_evaluations = 0
@@ -704,11 +597,6 @@ def main():
                     print(f"[exact-additive] validation plateau: lr "
                           f"{old_lr:.3g} -> {new_lr:.3g}", flush=True)
                 plateau_evaluations = 0
-            atomic_save(checkpoint_path, payload(iteration))
-            if args.milestone_every and iteration % args.milestone_every == 0:
-                milestone = output / f"v3_{args.label}_iter{iteration}.pt"
-                atomic_save(milestone, payload(iteration))
-                print(f"[exact-additive] milestone: {milestone}", flush=True)
             history_path.write_text(strict_json_dumps({
                 "initial_validation": initial,
                 "latest_validation": current,

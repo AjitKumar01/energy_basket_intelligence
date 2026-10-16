@@ -11,12 +11,12 @@ os.environ.setdefault("V3_AFFINITY", "1")
 import numpy as np
 import torch
 
-from checkpoint_io import ROOT, load_checkpoint
+from model_io import ROOT, load_model
 from data import build
 from features import Features
 from fit import Batcher
 from interaction_particles import differentiable_log_size_beta0
-from provenance import file_sha256, strict_json_dumps
+from io_utils import strict_json_dumps
 
 
 torch.set_default_dtype(torch.float64)
@@ -116,8 +116,8 @@ def main() -> None:
     child_path = args.child if args.child.is_absolute() else ROOT / args.child
     panel_path = (args.confirmed_panel if args.confirmed_panel.is_absolute()
                   else ROOT / args.confirmed_panel)
-    parent, parent_blob, meta = load_checkpoint(parent_path, data)
-    child, child_blob, child_meta = load_checkpoint(child_path, data)
+    parent, parent_blob, meta = load_model(parent_path, data)
+    child, child_blob, child_meta = load_model(child_path, data)
     if int(meta["nmax"]) != int(child_meta["nmax"]):
         raise ValueError("parent and child supports differ")
     training_sizes = np.asarray(data["trip_nlines"])[data["trip_split"] == 0]
@@ -153,8 +153,8 @@ def main() -> None:
     report = {
         "method": "identified_size_log_odds_decomposition",
         "identity": "log P(N=n+1)/P(N=n) = Delta H_x(n) - Delta rho_0(n)",
-        "parent": str(parent_path), "parent_sha256": file_sha256(parent_path),
-        "child": str(child_path), "child_sha256": file_sha256(child_path),
+        "parent": str(parent_path),
+        "child": str(child_path),
         "parent_iteration": int(parent_blob["iter"]),
         "child_iteration": int(child_blob["iter"]),
         "confirmed_panel": str(panel_path), "panel_contexts": int(len(trips)),

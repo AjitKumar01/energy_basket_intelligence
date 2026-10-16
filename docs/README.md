@@ -18,13 +18,13 @@ synthetic stress world (`SYNTHETIC_STRESS_WORLD.md`).
    test worlds and on a complete synthetic run, cost, scaling and limits.
 4. **`CANONICAL_INPUT_CONTRACT.md`** and **`SYNTHETIC_STRESS_WORLD.md`**: how data enters, and
    the shipped synthetic retailer.
-5. **`STAGEWISE_RESURRECTION.md`**: run directories, logs, resuming and moving runs.
+5. **`RUNS.md`**: running the pipeline, run directories and logs.
 
 ## Theory by stage
 
 | Pipeline stage | Theory | Code (`scripts/version4/` unless noted) |
 |---|---|---|
-| data | `CANONICAL_INPUT_CONTRACT.md`, `SUBSTITUTION_EVIDENCE_PARTITION.md` | `../prepare_model_bundle.py`, `canonical_contract.py`, `canonical_basket_input.py`, `catalogue_partition.py`, `build_affinity_partition.py`, `evidence_partition.py`, `data.py`, `provenance.py` |
+| data | `CANONICAL_INPUT_CONTRACT.md`, `SUBSTITUTION_EVIDENCE_PARTITION.md` | `../prepare_model_bundle.py`, `canonical_contract.py`, `canonical_basket_input.py`, `catalogue_partition.py`, `build_affinity_partition.py`, `evidence_partition.py`, `data.py` |
 | initialize | `THEORY.md` §§2–4 | `initialize_version4.py`, `sparse_artifact.py` |
 | additive (price evidence + exact additive fit) | `THEORY.md` §§3, 5–7, 10 (Phase B), `PROBABILITY_FOUNDATIONS_AND_PRICE_COUNTERFACTUALS.md` | `fit_supported_price_response.py`, `fit_exact_additive.py`, `ragged.py`, `features.py`, `fit.py` |
 | rank | `THEORY.md` §§9–10 (Phase C) | `build_spectral_phi_initialization.py`, `basket_incidence.py` |
@@ -35,7 +35,8 @@ synthetic stress world (`SYNTHETIC_STRESS_WORLD.md`).
 
 Shared numerics: `pipeline_support.py` (quadrature rules and helpers), `adaptive_sparse.py`
 (sparse Gaussian quadrature), `poly_degree_native.{cpp,py}` and `setup_poly_degree_native.py`
-(the compiled category/size dynamic program), `checkpoint_io.py` (checkpoint loading).
+(the compiled category/size dynamic program), `model_io.py` (loading fitted model files),
+`io_utils.py` (bundle location and JSON reports).
 Driver and run bookkeeping: `../run_pipeline.py`, `../run_manifest.py`,
 `../runtime_capabilities.py`.
 
@@ -56,4 +57,4 @@ Driver and run bookkeeping: `../run_pipeline.py`, `../run_manifest.py`,
 | `CANONICAL_INPUT_CONTRACT.md` | Canonical input format, dataset configs and partitions |
 | `SUBSTITUTION_EVIDENCE_PARTITION.md` | The substitution-evidence partition option |
 | `SYNTHETIC_STRESS_WORLD.md` | The shipped synthetic retailer and its causal price truth |
-| `STAGEWISE_RESURRECTION.md` | Run directories, logs, recovery and portability |
+| `RUNS.md` | Running the pipeline, run directories and logs |

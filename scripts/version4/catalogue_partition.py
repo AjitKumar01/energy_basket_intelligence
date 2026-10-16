@@ -24,7 +24,6 @@ reported, not used.
 """
 from __future__ import annotations
 
-import hashlib
 import json
 from pathlib import Path
 
@@ -142,6 +141,5 @@ def write_partition(output_dir: Path, items: pd.DataFrame, group_id, manifest: d
     categories = manifest.pop("categories", None)
     if categories is not None:
         manifest["categories"] = categories
-    manifest["partition_sha256"] = hashlib.sha256(output.read_bytes()).hexdigest()
     (Path(output_dir) / "affinity_manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
     return manifest

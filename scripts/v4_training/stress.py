@@ -30,9 +30,11 @@ import json
 import math
 import os
 import sys
+import pathlib
 import time
 from pathlib import Path
 
+sys.modules.setdefault("pathlib._local", pathlib)
 os.environ.setdefault("V3_AFFINITY", "1")
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "scripts/version4"))
@@ -45,7 +47,7 @@ import torch.nn.functional as F  # noqa: E402
 torch.set_default_dtype(torch.float64)
 NEG = -float("inf")
 BASE_NAMES = ("lam", "alpha", "theta", "rho_c", "rho_0_free", "w_dsp", "w_mlr", "mu", "delta", "zeta", "xi")
-OTHER_BASE_NAMES = ("lam", "alpha", "theta", "w_dsp", "w_mlr", "mu", "delta", "zeta", "xi")
+OTHER_BASE_NAMES = ("alpha", "theta", "w_dsp", "w_mlr", "mu", "delta", "zeta", "xi")
 USE_CPP_SAMPLER = os.environ.get("STRESS_CPP_SAMPLER", "0") == "1"
 
 
@@ -274,10 +276,18 @@ def train(args):
     from pipeline_support import supported_trips
     data, model, meta, batcher = setup(args.initialization, args.additive, args.threads)
     J, C, nmax, r = int(data["n_item"]), int(data["n_cat"]), int(meta["nmax"]), args.rank
-    train_trips = supported_trips(data, 0, nmax)
+    all_train_trips = supported_trips(data, 0, nmax)
     rng = np.random.default_rng(args.seed)
-    order = rng.permutation(train_trips)
     t0 = time.time()
+    val_batches = []
+    if args.val_trips > 0:
+        v_perm = np.random.default_rng(args.seed + 99).permutation(all_train_trips)
+        val_trips = np.sort(v_perm[:args.val_trips])
+        train_trips = np.sort(v_perm[args.val_trips:])
+        val_batches = [Batch(batcher, val_trips[s:s + args.batch], J) for s in range(0, len(val_trips), args.batch)]
+    else:
+        train_trips = all_train_trips
+    order = rng.permutation(train_trips)
     batches = [Batch(batcher, np.sort(order[s:s + args.batch]), J) for s in range(0, len(order), args.batch)]
     log = open(args.out.with_suffix(".log"), "a")
 
@@ -286,8 +296,9 @@ def train(args):
         print(line, flush=True)
         log.write(line + "\n"); log.flush()
 
-    emit({"event": "start", "train_trips": len(train_trips), "batches": len(batches),
-          "batching_seconds": round(time.time() - t0, 1), "args": {k: str(v) for k, v in vars(args).items()}})
+    emit({"event": "start", "train_trips": len(train_trips), "val_trips": len(val_batches) * args.batch if val_batches else 0,
+          "batches": len(batches), "batching_seconds": round(time.time() - t0, 1),
+          "args": {k: str(v) for k, v in vars(args).items()}})
     torch.manual_seed(args.seed)
     tied = None
     if args.tie_phi:
@@ -310,35 +321,61 @@ def train(args):
     N = len(train_trips)
     gen = torch.Generator().manual_seed(args.seed + 1)
     started = time.time()
+    lr_lam = args.lr_base if args.lr_lam is None else args.lr_lam
 
-    # Empirical training incidence for natural-gradient / moment-matching preconditioning of rho_0 and rho_c
+    # Empirical training incidence for natural-gradient / moment-matching preconditioning of rho_0, rho_c, and lam
     with torch.no_grad():
         size_counts = torch.zeros(nmax + 1)
         cat_pair_sum = torch.zeros(C)
+        item_counts = torch.zeros(J)
+        obs_cat_pres = torch.zeros(C)
         for bt in batches:
             n_b = torch.zeros(bt.ix.B, dtype=torch.long).index_add_(0, bt.lt, torch.ones_like(bt.li))
             size_counts.index_add_(0, n_b.clamp(max=nmax), torch.ones_like(n_b, dtype=torch.float64))
             nc_row = torch.zeros(bt.ix.n_rows).index_add_(0, bt.ix.row_of, bt.obs.double())
             cat_pair_sum.index_add_(0, bt.ix.row_cat, model.pair_feature(nc_row))
-        p_size_prec = (size_counts[1:] / N).clamp_min(2e-3)   # rho_0_free[k] is the size-(k+1) potential
+            obs_cat_pres.index_add_(0, bt.ix.row_cat, (nc_row > 0).double())
+            item_counts.index_add_(0, bt.ix.item, bt.obs.double())
+        p_size_prec = (size_counts[1:] / N).clamp_min(2e-3)
         d_cat_prec = (cat_pair_sum / N).clamp_min(5e-3)
+        p_item_prec = (item_counts / N).clamp_min(2e-3)
+        p_obs_cat_pres = obs_cat_pres / N
 
-    def run_stage(name, epochs, lr_base, lr_rho, lr_rho0, lr_phi, step_fn, average, mm_rho=0.0, mm_rho0=0.0):
+    @torch.no_grad()
+    def eval_val_ll():
+        if not val_batches:
+            return None, None
+        vgen = torch.Generator().manual_seed(args.seed + 777)
+        lls, ess_list = [], []
+        for vbt in val_batches:
+            vbt.bind(model)
+            est, _, ess, _ = is_log_z(model, vbt, r, vgen, burn=80, components=32, thin=2, draws=256)
+            e = model.energy(vbt.li, vbt.lt, vbt.lc, vbt.ix.B, vbt.line_ctx)
+            lls.append((e - est).numpy())
+            ess_list.append(ess.numpy())
+        return float(np.concatenate(lls).mean()), float(np.concatenate(ess_list).mean())
+
+    def run_stage(name, epochs, lr_b, lr_l, lr_rho, lr_rho0, lr_phi, step_fn, average, mm_rho=0.0, mm_rho0=0.0, mm_lam=0.0,
+                  monitor_val=False):
         opt = torch.optim.Adam([
-            {"params": other_base, "lr": lr_base},
+            {"params": other_base, "lr": lr_b},
+            {"params": [model.lam], "lr": lr_l},
             {"params": [model.rho_c], "lr": lr_rho},
             {"params": [model.rho_0_free], "lr": lr_rho0},
             {"params": [model.phi] if tied is None else [tied[0], tied[1]], "lr": lr_phi},
         ])
-        phi_params = opt.param_groups[3]["params"]
+        phi_params = opt.param_groups[4]["params"]
         total = epochs * len(batches)
         decay = (args.lr_final_ratio) ** (1.0 / max(total - 1, 1))
         avg, n_avg, it = None, 0, 0
+        best_val_ll, best_state, bad_checks = -float("inf"), None, 0
         for epoch in range(1, epochs + 1):
             t_ep = time.time()
             acc, sizes = [], []
             g_r0_sum = torch.zeros_like(model.rho_0_free)
             g_rc_sum = torch.zeros_like(model.rho_c)
+            g_lam_sum = torch.zeros_like(model.lam)
+            mod_cat_pres = torch.zeros(C)
             for bi in rng.permutation(len(batches)):
                 it += 1
                 bt = batches[bi]
@@ -357,58 +394,95 @@ def train(args):
                         model.phi.grad = None
                 g_r0 = model.rho_0_free.grad.detach().clone()
                 g_rc = model.rho_c.grad.detach().clone()
+                g_lam = model.lam.grad.detach().clone()
                 g_r0_sum.add_(g_r0)
                 g_rc_sum.add_(g_rc)
+                g_lam_sum.add_(g_lam)
                 torch.nn.utils.clip_grad_norm_(base + list(phi_params), 10.0)
                 opt.step()
                 if tied is not None:
                     with torch.no_grad():
                         model.phi[:, :r] = tied[0][tied[2]] + tied[1]
-                if mm_rho > 0.0 or mm_rho0 > 0.0:
-                    scale_lr = opt.param_groups[3]["lr"] / max(lr_phi, 1e-12) if lr_phi > 0 else 1.0
+                if mm_rho > 0.0 or mm_rho0 > 0.0 or mm_lam > 0.0:
+                    scale_lr = opt.param_groups[4]["lr"] / max(lr_phi, 1e-12) if lr_phi > 0 else 1.0
                     with torch.no_grad():
                         if mm_rho0 > 0.0:
                             model.rho_0_free.sub_(mm_rho0 * scale_lr * g_r0)
                         if mm_rho > 0.0:
                             model.rho_c.sub_((mm_rho * scale_lr / len(batches)) * (g_rc / d_cat_prec))
+                        if mm_lam > 0.0:
+                            model.lam.sub_((mm_lam * scale_lr / len(batches)) * (g_lam / p_item_prec))
                 project(model, caps, opt, r)
                 for gp in opt.param_groups:
                     gp["lr"] *= decay
                 acc.append(float(value.detach()))
                 if extra is not None:
-                    sizes.append(extra)
-                if average and it > total // 2:
+                    sizes.append(extra[:2])
+                    if len(extra) > 2:
+                        mod_cat_pres.add_(extra[2])
+                if average and it > total // 3:
                     st = {k: v.detach().clone() for k, v in model.state_dict().items()}
                     avg = st if avg is None else {k: (avg[k] + (st[k] - avg[k]) / (n_avg + 1)) if st[k].is_floating_point()
                                                    else st[k] for k in st}
                     n_avg += 1
-            if mm_rho > 0.0 or mm_rho0 > 0.0:
+            if mm_rho > 0.0 or mm_rho0 > 0.0 or mm_lam > 0.0:
                 with torch.no_grad():
                     g_r0_bar = g_r0_sum / len(batches)
                     g_rc_bar = g_rc_sum / len(batches)
+                    g_lam_bar = g_lam_sum / len(batches)
                     if mm_rho0 > 0.0:
                         model.rho_0_free.sub_(0.5 * (g_r0_bar / p_size_prec).clamp(-0.5, 0.5))
                     if mm_rho > 0.0:
                         model.rho_c.sub_(0.5 * (g_rc_bar / d_cat_prec).clamp(-0.5, 0.5))
+                    if mm_lam > 0.0:
+                        model.lam.sub_(0.35 * (g_lam_bar / p_item_prec).clamp(-0.35, 0.35))
                 project(model, caps, opt, r)
             sv = torch.linalg.svdvals(phi_r(model, r).detach())
             row = {"stage": name, "epoch": epoch, "objective": float(np.mean(acc)),
                    "phi_eig_top3": [round(float(v), 3) for v in (sv[:3] ** 2)],
-                   "lr_phi": opt.param_groups[3]["lr"],
+                   "lr_phi": opt.param_groups[4]["lr"],
                    "epoch_seconds": round(time.time() - t_ep, 2),
                    "seconds": round(time.time() - started, 1)}
             if sizes:
                 row["chain_mean_size"] = float(np.mean([s[0] for s in sizes]))
                 row["data_mean_size"] = float(np.mean([s[1] for s in sizes]))
-            emit(row)
-        if avg is not None:
+                cat_gap = (mod_cat_pres / N - p_obs_cat_pres).abs()
+                row["cat_pres_gap_mean"] = round(float(cat_gap.mean()), 4)
+                row["cat_pres_gap_max"] = round(float(cat_gap.max()), 4)
+            if monitor_val and val_batches and (epoch % args.val_every == 0 or epoch == epochs):
+                cur_st = {k: v.detach().clone() for k, v in model.state_dict().items()}
+                eval_st = avg if avg is not None else cur_st
+                model.load_state_dict(eval_st)
+                v_ll, v_ess = eval_val_ll()
+                row["val_ll"] = round(v_ll, 4)
+                row["val_ess"] = round(v_ess, 4)
+                if v_ll > best_val_ll + args.val_tol:
+                    best_val_ll = v_ll
+                    best_state = {k: v.clone() for k, v in eval_st.items()}
+                    bad_checks = 0
+                else:
+                    if v_ll > best_val_ll:
+                        best_val_ll = v_ll
+                        best_state = {k: v.clone() for k, v in eval_st.items()}
+                    if epoch >= args.min_sml_epochs:
+                        bad_checks += 1
+                model.load_state_dict(cur_st)
+                emit(row)
+                if bad_checks >= args.patience and epoch >= args.min_sml_epochs:
+                    emit({"event": "early_stop", "stage": name, "epoch": epoch, "best_val_ll": round(best_val_ll, 4)})
+                    break
+            else:
+                emit(row)
+        if best_state is not None:
+            model.load_state_dict(best_state)
+        elif avg is not None:
             model.load_state_dict(avg)
-            if tied is not None:                             # keep phi = psi[cat] + delta at the averaged phi
-                with torch.no_grad():
-                    tied[1].copy_(model.phi[:, :r] - tied[0][tied[2]])
+        if tied is not None:
+            with torch.no_grad():
+                tied[1].copy_(model.phi[:, :r] - tied[0][tied[2]])
 
-    # stage A: pseudo-likelihood (gentle Phi warm-up with separate rho_0 / rho_c learning rates)
-    run_stage("pseudo-likelihood", args.pl_epochs, args.lr_base, args.lr_rho, args.lr_rho0, args.lr_phi_pl,
+    # stage A: pseudo-likelihood (gentle Phi warm-up with separate rho_0 / rho_c / lam learning rates)
+    run_stage("pseudo-likelihood", args.pl_epochs, args.lr_base, lr_lam, args.lr_rho, args.lr_rho0, args.lr_phi_pl,
               lambda bt: (pseudo_loglik(model, bt.ix, bt.obs, r), None), average=False)
     torch.save({"model": {k: v.detach().clone() for k, v in model.state_dict().items()}, "rank": r,
                 "stage": "pseudo-likelihood"}, args.out.with_name(args.out.stem + "_pl.pt"))
@@ -424,16 +498,21 @@ def train(args):
         chains[i] = X
         with torch.no_grad():
             z = basket_field(model, ix, X, r) + torch.randn(ix.B, r, generator=gen)
+            nc_mod = torch.zeros(ix.n_rows).index_add_(0, ix.row_of, X.double())
+            cat_pres_b = torch.zeros(C).index_add_(0, ix.row_cat, (nc_mod > 0).double())
         e_obs = model.energy(bt.li, bt.lt, bt.lc, ix.B, bt.line_ctx)
         lz = log_zc(model, ix, slot_utilities(model, ix, z, r))
         size_chain = float(torch.zeros(ix.B).index_add_(0, ix.item_trip, X.double()).mean())
-        return (e_obs - lz).mean(), (size_chain, float(bt.obs.sum()) / ix.B)
+        return (e_obs - lz).mean(), (size_chain, float(bt.obs.sum()) / ix.B, cat_pres_b)
 
-    run_stage("sml", args.sml_epochs, args.lr_base, args.lr_rho, args.lr_rho0, args.lr_phi_sml, sml_step,
-              average=True, mm_rho=args.mm_rho, mm_rho0=args.mm_rho0)
+    run_stage("sml", args.sml_epochs, args.lr_base, lr_lam, args.lr_rho, args.lr_rho0, args.lr_phi_sml, sml_step,
+              average=True, mm_rho=args.mm_rho, mm_rho0=args.mm_rho0, mm_lam=args.mm_lam, monitor_val=True)
     if args.cal_epochs > 0:
-        run_stage("calibrate", args.cal_epochs, 0.0, args.lr_rho, args.lr_rho0, 0.0, sml_step,
-                  average=False, mm_rho=args.mm_rho, mm_rho0=args.mm_rho0)
+        run_stage("calibrate", args.cal_epochs, 0.0, 0.5 * lr_lam, args.lr_rho, args.lr_rho0, 0.0, sml_step,
+                  average=False, mm_rho=args.mm_rho, mm_rho0=args.mm_rho0, mm_lam=args.mm_lam)
+    if val_batches:
+        v_ll, v_ess = eval_val_ll()
+        emit({"event": "final_val", "val_ll": round(v_ll, 4), "val_ess": round(v_ess, 4)})
     torch.save({"model": {k: v.detach().clone() for k, v in model.state_dict().items()}, "rank": r,
                 "stage": "sml", "seconds": time.time() - started, "args": {k: str(v) for k, v in vars(args).items()}},
                args.out.with_suffix(".pt"))
@@ -442,8 +521,8 @@ def train(args):
 
 # ---- evaluate ---------------------------------------------------------------------------------
 @torch.no_grad()
-def is_log_z(model, bt, r, gen, burn, components, thin, draws, defensive=0.1):
-    """Importance-sampled log Z per trip (Step 1's estimator) and the final chain state."""
+def is_log_z_orig(model, bt, r, gen, burn, components, thin, draws, defensive=0.1):
+    """Original single-chain importance-sampled log Z per trip."""
     ix = bt.ix
     X = sample_slots(model, ix, slot_utilities(model, ix, None, r, beta=0.0), gen)
     X = gibbs(model, ix, X, r, gen, sweeps=burn)
@@ -473,6 +552,105 @@ def is_log_z(model, bt, r, gen, burn, components, thin, draws, defensive=0.1):
     est_b = torch.logsumexp(log_w[:, h:], 1) - math.log(draws - h)
     ess = 1.0 / torch.softmax(log_w, 1).square().sum(1) / draws
     return est, est_a - est_b, ess, X
+
+
+@torch.no_grad()
+def is_log_z(model, bt, r, gen, burn, components, thin, draws, defensive=0.1):
+    """Multi-chain tempered + active-subspace overdispersed importance-sampled log Z per trip."""
+    if os.environ.get("STRESS_ORIG_IS", "0") == "1":
+        return is_log_z_orig(model, bt, r, gen, burn, components, thin, draws, defensive)
+    ix = bt.ix
+    B = ix.B
+    ph_full = phi_r(model, r).detach()
+    _, sv, Vt = torch.linalg.svd(ph_full, full_matrices=False)
+    eigs = sv.square()
+    active = eigs > 4.0
+    sig_def = torch.where(active, torch.full_like(sv, 1.35), torch.ones_like(sv))
+    log_det_def = sig_def.log().sum()
+
+    # Chain 0: exact standard burn-in from beta=0 so returned X has unchanged law for classifier test
+    X = sample_slots(model, ix, slot_utilities(model, ix, None, r, beta=0.0), gen)
+    X = gibbs(model, ix, X, r, gen, sweeps=burn)
+    centres = []
+    n_ch = 4
+    k_per_ch = max(components // 2, 64)
+    thin_c = max(thin // 2, 1)
+    X_out = None
+    steps_0 = max(components * thin, k_per_ch * thin_c)
+    for k in range(steps_0):
+        X = gibbs(model, ix, X, r, gen)
+        if (k + 1) % thin_c == 0 and len(centres) < k_per_ch:
+            centres.append(basket_field(model, ix, X, r))
+        if (k + 1) == components * thin:
+            X_out = X.clone()
+    if X_out is None:
+        X_out = X.clone()
+
+    # Chains 1..3: diverse initializations with tempered annealing (beta = 0.25 -> 0.5 -> 0.75 -> 1.0)
+    t_sweeps = max(burn // 8, 25)
+    for ch in range(1, n_ch):
+        if ch == 1:
+            Xc = sample_slots(model, ix, slot_utilities(model, ix, torch.zeros(B, r), r, beta=1.0), gen)
+        elif ch in (2, 3) and float(sv[0]) > 1.0:
+            sgn = 1.0 if ch == 2 else -1.0
+            z_seed = (sgn * 1.5 * sv[0] * Vt[0])[None, :].expand(B, r)
+            Xc = sample_slots(model, ix, slot_utilities(model, ix, z_seed, r, beta=1.0), gen)
+        else:
+            Xc = sample_slots(model, ix, slot_utilities(model, ix, None, r, beta=0.0), gen)
+        for b_temp in (0.25, 0.5, 0.75, 1.0):
+            Xc = gibbs(model, ix, Xc, r, gen, sweeps=t_sweeps, beta=b_temp)
+        for k in range(k_per_ch * thin_c):
+            Xc = gibbs(model, ix, Xc, r, gen)
+            if (k + 1) % thin_c == 0:
+                centres.append(basket_field(model, ix, Xc, r))
+
+    centres = torch.stack(centres, 1)                       # B x Kc x r
+    Kc = centres.shape[1]
+    centres_rot = centres @ Vt.T                            # B x Kc x r
+    centres_rot_T = centres_rot.transpose(1, 2).contiguous()  # B x r x Kc
+    c_norm2 = -0.5 * centres_rot.square().sum(2)            # B x Kc
+
+    # Mixture weights: (1 - defensive) uniform over Kc centres + defensive overdispersed N(0, diag(sig_def^2))
+    w_cent = (1.0 - defensive) / float(Kc)
+    probs = torch.tensor([w_cent] * Kc + [defensive], dtype=centres.dtype)
+    cdf = probs.cumsum(0)
+    cdf[-1] = 1.0
+
+    half = 0.5 * r * math.log(2 * math.pi)
+    h = draws // 2
+    h2 = draws - h
+    # Independent stratified component indices for each half [0:h] and [h:draws]
+    u_a = (torch.arange(h, dtype=centres.dtype)[None, :] + torch.rand(B, h, generator=gen)) / float(h)
+    u_a = u_a.gather(1, torch.argsort(torch.rand(B, h, generator=gen), dim=1))
+    u_b = (torch.arange(h2, dtype=centres.dtype)[None, :] + torch.rand(B, h2, generator=gen)) / float(h2)
+    u_b = u_b.gather(1, torch.argsort(torch.rand(B, h2, generator=gen), dim=1))
+    picks_all = torch.cat([torch.searchsorted(cdf, u_a), torch.searchsorted(cdf, u_b)], dim=1).clamp(max=Kc)
+
+    # Vectorized proposal sampling and log_q evaluation across all draws at once
+    prior_all = picks_all == Kc                                                        # B x draws
+    c_pick_all = centres_rot.gather(1, picks_all.clamp(max=Kc - 1)[:, :, None].expand(B, draws, r))
+    mean_rot_all = torch.where(prior_all[:, :, None], torch.zeros(B, draws, r), c_pick_all)
+    scale_rot_all = torch.where(prior_all[:, :, None], sig_def[None, None, :], torch.ones(B, draws, r))
+    z_rot_all = mean_rot_all + scale_rot_all * torch.randn(B, draws, r, generator=gen)
+    z_all = z_rot_all @ Vt                                                             # B x draws x r
+    z_norm2_all = -0.5 * z_rot_all.square().sum(2)                                     # B x draws
+    lp_all = z_norm2_all - half
+    comp_all = z_norm2_all[:, :, None] + c_norm2[:, None, :] + torch.bmm(z_rot_all, centres_rot_T) - half
+    lp_def_all = -0.5 * (z_rot_all / sig_def[None, None, :]).square().sum(2) - half - log_det_def
+    lq_all = torch.logaddexp(math.log1p(-defensive) + torch.logsumexp(comp_all, 2) - math.log(Kc),
+                             math.log(defensive) + lp_def_all)
+    ph_slot = ph_full[ix.item]
+    u0_slot = model.b_flat(ix) - 0.5 * ph_slot.square().sum(-1)
+    lzc_list = []
+    for d_idx in range(draws):
+        u_d = u0_slot + (z_all[:, d_idx][ix.item_trip] * ph_slot).sum(-1)
+        lzc_list.append(log_zc(model, ix, u_d))
+    log_w = lp_all + torch.stack(lzc_list, 1) - lq_all
+    est = torch.logsumexp(log_w, 1) - math.log(draws)
+    est_a = torch.logsumexp(log_w[:, :h], 1) - math.log(h)
+    est_b = torch.logsumexp(log_w[:, h:], 1) - math.log(h2)
+    ess = 1.0 / torch.softmax(log_w, 1).square().sum(1) / draws
+    return est, est_a - est_b, ess, X_out
 
 
 def clustered_ci(delta, cluster, reps=2000, seed=0):
@@ -702,15 +880,22 @@ def main():
     p.add_argument("--phi-init", type=float, default=0.05)
     p.add_argument("--pl-epochs", type=int, default=2)
     p.add_argument("--sml-epochs", type=int, default=16)
+    p.add_argument("--min-sml-epochs", type=int, default=16)
     p.add_argument("--cal-epochs", type=int, default=1)
+    p.add_argument("--val-trips", type=int, default=0)
+    p.add_argument("--val-every", type=int, default=4)
+    p.add_argument("--patience", type=int, default=2)
+    p.add_argument("--val-tol", type=float, default=0.005)
     p.add_argument("--sweeps", type=int, default=4)
     p.add_argument("--lr-base", type=float, default=3e-4)
+    p.add_argument("--lr-lam", type=float, default=None)
     p.add_argument("--lr-rho", type=float, default=3e-2)
     p.add_argument("--lr-rho0", type=float, default=5e-2)
     p.add_argument("--lr-phi-pl", type=float, default=1e-3)
     p.add_argument("--lr-phi-sml", type=float, default=3e-3)
     p.add_argument("--mm-rho", type=float, default=1.0)
     p.add_argument("--mm-rho0", type=float, default=0.5)
+    p.add_argument("--mm-lam", type=float, default=0.0)
     p.add_argument("--lr-final-ratio", type=float, default=0.1)
     p.add_argument("--pool-prod", type=float, default=1.45)
     p.add_argument("--phi-prec", type=float, default=2.0)

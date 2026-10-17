@@ -475,15 +475,8 @@ def fit_sml(model: V4, X_obs, h, price, prec, iters, lr, lr_final, gen, chains=1
 
 # ---- log Z estimation -------------------------------------------------------------------------
 @torch.no_grad()
-def is_log_z(model: V4, h, price, gen, burn=200, components=64, thin=2, draws=512, defensive=0.1,
-             tempering=None):
-    """Importance-sampling log Z per context (rows of h/price).
-
-    Model baskets S_1..S_K come from an HS Gibbs chain started from an exact draw of the
-    interaction-free law (z = 0 at utilities b - |phi|^2/2 + 0 -> use b directly).  Proposal:
-    q(z) = (1-a) * mean_k N(z; s_k, I) + a * N(z; 0, I).  Weight: N(z;0,I) Zc(z) / q(z).
-    Returns log Z estimate and the effective-sample-size fraction of the weights.
-    """
+def is_log_z_orig(model: V4, h, price, gen, burn=200, components=64, thin=2, draws=512, defensive=0.1):
+    """Original single-chain importance-sampling log Z per context."""
     phi = model.p["phi"]
     B, r = h.shape[0], phi.shape[1]
     rho_c, rho0 = model.p["rho_c"], model.rho0()
@@ -523,3 +516,94 @@ def is_log_z(model: V4, h, price, gen, burn=200, components=64, thin=2, draws=51
     w = torch.softmax(log_w, 1)
     ess = 1.0 / w.square().sum(1) / draws
     return est, ess
+
+
+@torch.no_grad()
+def is_log_z(model: V4, h, price, gen, burn=200, components=64, thin=2, draws=512, defensive=0.05,
+             tempering=None):
+    """Multi-seed mode-weighted importance-sampling log Z per context (rows of h/price).
+
+    Starts M parallel chains across +/- singular directions of Phi, the beta=0 additive law,
+    and z=0 so isolated interaction modes at large Phi are all visited. Weights proposal
+    centres by exact target log-mass at each unique basket centre + uniform floor, and uses
+    stratified mixture component draws to eliminate discrete mode-sampling variance.
+    """
+    phi = model.p["phi"]
+    B, r = h.shape[0], phi.shape[1]
+    rho_c, rho0 = model.p["rho_c"], model.rho0()
+    b0 = model.b(h, price)
+    phi_sq = phi.square().sum(1)[None, :]
+    u0 = b0 - 0.5 * phi_sq
+
+    _, sv, Vt = torch.linalg.svd(phi, full_matrices=False)
+    seed_u = [b0, u0]
+    for d in range(r):
+        if float(sv[d]) > 0.5:
+            for mult in (1.5, 3.0):
+                z_dir = (mult * sv[d]) * Vt[d]
+                seed_u.append(u0 + (z_dir @ phi.T)[None, :])
+                seed_u.append(u0 - (z_dir @ phi.T)[None, :])
+    M = len(seed_u)
+    u_seeds = torch.stack(seed_u, dim=1).reshape(B * M, -1)
+    X_flat = sample_given_u(u_seeds, model.part, rho_c, rho0, gen)
+    u0_M = u0.repeat_interleave(M, dim=0)
+
+    burn_per_chain = max(burn // 4, 25)
+    for _ in range(burn_per_chain):
+        z_b = X_flat @ phi + torch.randn(B * M, r, generator=gen)
+        X_flat = sample_given_u(u0_M + z_b @ phi.T, model.part, rho_c, rho0, gen)
+
+    k_per_chain = max((components + M - 1) // M, 4)
+    centres = []
+    for k in range(k_per_chain * thin):
+        z_b = X_flat @ phi + torch.randn(B * M, r, generator=gen)
+        X_flat = sample_given_u(u0_M + z_b @ phi.T, model.part, rho_c, rho0, gen)
+        if (k + 1) % thin == 0:
+            centres.append((X_flat @ phi).view(B, M, r))
+    centres = torch.cat(centres, dim=1)[:, :max(components, M * 4), :]
+    K = centres.shape[1]
+
+    # Weight centres by exact target density at s_k (deduplicating identical centres) + uniform floor
+    diff_c = (centres[:, :, None, :] - centres[:, None, :, :]).square().sum(3)
+    same_c = (diff_c < 1e-8).double()
+    mult = same_c.sum(2).clamp_min(1.0)
+    u_centres = (u0[:, None, :] + centres @ phi.T).reshape(B * K, -1)
+    lzc_c = log_zc(u_centres, model.part, rho_c, rho0).view(B, K)
+    lp_c = -0.5 * centres.square().sum(2)
+    log_v = lzc_c + lp_c - torch.log(mult)
+    w_mode = torch.softmax(log_v, dim=1)
+    w_comp = 0.70 * w_mode + 0.30 / float(K)
+    log_w_comp = torch.log(w_comp.clamp_min(1e-300))
+
+    # Stratified component selection across the K centres + 1 defensive prior component (index K)
+    probs_all = torch.cat([(1.0 - defensive) * w_comp, torch.full((B, 1), defensive, dtype=phi.dtype)], dim=1)
+    cdf = probs_all.cumsum(dim=1)
+    cdf[:, -1] = 1.0
+    u_strat = (torch.arange(draws, dtype=phi.dtype)[None, :] + torch.rand(B, draws, generator=gen)) / float(draws)
+    perm = torch.argsort(torch.rand(B, draws, generator=gen), dim=1)
+    u_strat = u_strat.gather(1, perm)
+    picks_all = torch.searchsorted(cdf, u_strat).clamp(max=K)
+    centres_ext = torch.cat([centres, torch.zeros(B, 1, r, dtype=phi.dtype)], dim=1)
+
+    half_log2pi = 0.5 * r * math.log(2 * math.pi)
+    log_w = []
+    batch_d = 64
+    for start in range(0, draws, batch_d):
+        d_cur = min(batch_d, draws - start)
+        pick = picks_all[:, start:start + d_cur]
+        mean = centres_ext.gather(1, pick[:, :, None].expand(B, d_cur, r))
+        z = mean + torch.randn(B, d_cur, r, generator=gen)
+        log_prior = -0.5 * z.square().sum(2) - half_log2pi
+        comp = -0.5 * (z[:, :, None, :] - centres[:, None, :, :]).square().sum(3) - half_log2pi + log_w_comp[:, None, :]
+        log_q = torch.logaddexp(math.log1p(-defensive) + torch.logsumexp(comp, 2),
+                                math.log(defensive) + log_prior)
+        u_flat = (u0[:, None, :] + z @ phi.T).reshape(B * d_cur, -1)
+        lzc = log_zc(u_flat, model.part, rho_c, rho0).view(B, d_cur)
+        log_w.append(log_prior + lzc - log_q)
+    log_w = torch.cat(log_w, 1)
+    est = torch.logsumexp(log_w, 1) - math.log(draws)
+    w = torch.softmax(log_w, 1)
+    ess = 1.0 / w.square().sum(1) / draws
+    return est, ess
+
+

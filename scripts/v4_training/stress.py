@@ -36,6 +36,7 @@ from pathlib import Path
 os.environ.setdefault("V3_AFFINITY", "1")
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "scripts/version4"))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import numpy as np  # noqa: E402
 import torch  # noqa: E402
@@ -44,6 +45,8 @@ import torch.nn.functional as F  # noqa: E402
 torch.set_default_dtype(torch.float64)
 NEG = -float("inf")
 BASE_NAMES = ("lam", "alpha", "theta", "rho_c", "rho_0_free", "w_dsp", "w_mlr", "mu", "delta", "zeta", "xi")
+OTHER_BASE_NAMES = ("lam", "alpha", "theta", "w_dsp", "w_mlr", "mu", "delta", "zeta", "xi")
+USE_CPP_SAMPLER = os.environ.get("STRESS_CPP_SAMPLER", "0") == "1"
 
 
 # ---- setup ------------------------------------------------------------------------------------
@@ -111,14 +114,30 @@ def log_zc(model, ix, u):
 
 # ---- exact vectorized sampler of S | u -------------------------------------------------------
 @torch.no_grad()
-def sample_slots(model, ix, u, gen):
+def sample_slots(model, ix, u, gen, use_cpp: bool | None = None):
     """One exact draw per trip from the additive Version-4 law at slot utilities u (category
     penalty rho_c, size potential rho_0, 1 <= |S| <= nmax).  Returns a slot mask."""
     B, nmax = ix.B, model.nmax
-    scale = torch.full((B,), NEG).index_reduce_(0, ix.item_trip, u, "amax", include_self=True)
-    w = u - scale[ix.item_trip]
     L = int(ix.row_size.max())
     K = min(model.R, L, nmax)
+    if USE_CPP_SAMPLER if use_cpp is None else use_cpp:
+        from build_stress_sampler import load_stress_sampler
+        T = len(ix.item)
+        u_c = u.detach().contiguous()
+        rho_c = model.rho_c.detach().contiguous()
+        rho_0 = model.rho_0().detach().contiguous()
+        seed = int(torch.randint(1, 2**62, (1,), generator=gen).item())
+        out = torch.empty(T, dtype=torch.uint8)
+        rc = load_stress_sampler().sample_slots_cpp(
+            B, ix.n_rows, T, ix.Cpad, K, nmax, seed,
+            u_c.data_ptr(), ix.row_of.data_ptr(), ix.item_pos.data_ptr(),
+            ix.row_size.data_ptr(), ix.row_cat.data_ptr(), ix.flat_slot.data_ptr(),
+            rho_c.data_ptr(), rho_0.data_ptr(), out.data_ptr())
+        if rc != 0:
+            raise RuntimeError(f"native sample_slots_cpp failed with status {rc}")
+        return out.bool()
+    scale = torch.full((B,), NEG).index_reduce_(0, ix.item_trip, u, "amax", include_self=True)
+    w = u - scale[ix.item_trip]
     Wp = torch.full((ix.n_rows, L), NEG)
     Wp[ix.row_of, ix.item_pos] = w
     e = torch.full((ix.n_rows, K + 1), NEG)
@@ -174,10 +193,30 @@ def sample_slots(model, ix, u, gen):
 
 
 @torch.no_grad()
-def gibbs(model, ix, X, r, gen, sweeps=1, beta=1.0):
+def gibbs(model, ix, X, r, gen, sweeps=1, beta=1.0, use_cpp: bool | None = None):
+    if USE_CPP_SAMPLER if use_cpp is None else use_cpp:
+        from build_stress_sampler import load_stress_sampler
+        B, nmax, T = ix.B, model.nmax, len(ix.item)
+        L = int(ix.row_size.max())
+        K = min(model.R, L, nmax)
+        ph = phi_r(model, r)[ix.item].detach().contiguous()
+        b_base = (model.b_flat(ix).detach() - 0.5 * beta * ph.square().sum(-1)).contiguous()
+        rho_c = model.rho_c.detach().contiguous()
+        rho_0 = model.rho_0().detach().contiguous()
+        seed = int(torch.randint(1, 2**62, (1,), generator=gen).item())
+        mask = X.to(torch.uint8).contiguous().clone()
+        rc = load_stress_sampler().gibbs_sweeps_cpp(
+            B, ix.n_rows, T, ix.Cpad, K, nmax, r, int(sweeps), math.sqrt(float(beta)), seed,
+            b_base.data_ptr(), ph.data_ptr(), ix.item_trip.data_ptr(), ix.row_of.data_ptr(),
+            ix.item_pos.data_ptr(), ix.row_size.data_ptr(), ix.row_cat.data_ptr(),
+            ix.row_trip.data_ptr(), ix.flat_slot.data_ptr(), rho_c.data_ptr(),
+            rho_0.data_ptr(), mask.data_ptr())
+        if rc != 0:
+            raise RuntimeError(f"native gibbs_sweeps_cpp failed with status {rc}")
+        return mask.bool()
     for _ in range(sweeps):
         z = basket_field(model, ix, X, r) + torch.randn(ix.B, r, generator=gen)
-        X = sample_slots(model, ix, slot_utilities(model, ix, z, r, beta), gen)
+        X = sample_slots(model, ix, slot_utilities(model, ix, z, r, beta), gen, use_cpp=False)
     return X
 
 
@@ -230,7 +269,7 @@ def train(args):
     from category_safety import category_capacities
     from pipeline_support import supported_trips
     data, model, meta, batcher = setup(args.initialization, args.additive, args.threads)
-    J, nmax, r = int(data["n_item"]), int(meta["nmax"]), args.rank
+    J, C, nmax, r = int(data["n_item"]), int(data["n_cat"]), int(meta["nmax"]), args.rank
     train_trips = supported_trips(data, 0, nmax)
     rng = np.random.default_rng(args.seed)
     order = rng.permutation(train_trips)
@@ -251,19 +290,40 @@ def train(args):
     for n in ("gamma", "beta", "price_kappa", "psi"):
         getattr(model, n).requires_grad_(False)
     base = [getattr(model, n) for n in BASE_NAMES]
+    other_base = [getattr(model, n) for n in OTHER_BASE_NAMES]
     model.phi.requires_grad_(True)
-    caps = category_capacities(data, int(data["n_cat"]), nmax)
+    caps = category_capacities(data, C, nmax)
     N = len(train_trips)
     gen = torch.Generator().manual_seed(args.seed + 1)
     started = time.time()
 
-    def run_stage(name, epochs, lr_base, lr_phi, step_fn, average):
-        opt = torch.optim.Adam([{"params": base, "lr": lr_base}, {"params": [model.phi], "lr": lr_phi}])
+    # Empirical training incidence for natural-gradient / moment-matching preconditioning of rho_0 and rho_c
+    with torch.no_grad():
+        size_counts = torch.zeros(nmax + 1)
+        cat_pair_sum = torch.zeros(C)
+        for bt in batches:
+            n_b = torch.zeros(bt.ix.B, dtype=torch.long).index_add_(0, bt.lt, torch.ones_like(bt.li))
+            size_counts.index_add_(0, n_b.clamp(max=nmax), torch.ones_like(n_b, dtype=torch.float64))
+            nc_row = torch.zeros(bt.ix.n_rows).index_add_(0, bt.ix.row_of, bt.obs.double())
+            cat_pair_sum.index_add_(0, bt.ix.row_cat, model.pair_feature(nc_row))
+        p_size_prec = (size_counts[2:] / N).clamp_min(2e-3)
+        d_cat_prec = (cat_pair_sum / N).clamp_min(5e-3)
+
+    def run_stage(name, epochs, lr_base, lr_rho, lr_rho0, lr_phi, step_fn, average, mm_rho=0.0, mm_rho0=0.0):
+        opt = torch.optim.Adam([
+            {"params": other_base, "lr": lr_base},
+            {"params": [model.rho_c], "lr": lr_rho},
+            {"params": [model.rho_0_free], "lr": lr_rho0},
+            {"params": [model.phi], "lr": lr_phi},
+        ])
         total = epochs * len(batches)
         decay = (args.lr_final_ratio) ** (1.0 / max(total - 1, 1))
         avg, n_avg, it = None, 0, 0
         for epoch in range(1, epochs + 1):
+            t_ep = time.time()
             acc, sizes = [], []
+            g_r0_sum = torch.zeros_like(model.rho_0_free)
+            g_rc_sum = torch.zeros_like(model.rho_c)
             for bi in rng.permutation(len(batches)):
                 it += 1
                 bt = batches[bi]
@@ -272,12 +332,23 @@ def train(args):
                 loss = -value + penalties(model, args, N, r)
                 opt.zero_grad(set_to_none=True)
                 loss.backward()
+                g_r0 = model.rho_0_free.grad.detach().clone()
+                g_rc = model.rho_c.grad.detach().clone()
+                g_r0_sum.add_(g_r0)
+                g_rc_sum.add_(g_rc)
                 torch.nn.utils.clip_grad_norm_(base + [model.phi], 10.0)
                 opt.step()
+                if mm_rho > 0.0 or mm_rho0 > 0.0:
+                    scale_lr = opt.param_groups[3]["lr"] / max(lr_phi, 1e-12) if lr_phi > 0 else 1.0
+                    with torch.no_grad():
+                        if mm_rho0 > 0.0:
+                            model.rho_0_free.sub_(mm_rho0 * scale_lr * g_r0)
+                        if mm_rho > 0.0:
+                            model.rho_c.sub_((mm_rho * scale_lr / len(batches)) * (g_rc / d_cat_prec))
                 project(model, caps, opt, r)
                 for gp in opt.param_groups:
                     gp["lr"] *= decay
-                acc.append(float(value))
+                acc.append(float(value.detach()))
                 if extra is not None:
                     sizes.append(extra)
                 if average and it > total // 2:
@@ -285,10 +356,21 @@ def train(args):
                     avg = st if avg is None else {k: (avg[k] + (st[k] - avg[k]) / (n_avg + 1)) if st[k].is_floating_point()
                                                    else st[k] for k in st}
                     n_avg += 1
+            if mm_rho > 0.0 or mm_rho0 > 0.0:
+                with torch.no_grad():
+                    g_r0_bar = g_r0_sum / len(batches)
+                    g_rc_bar = g_rc_sum / len(batches)
+                    if mm_rho0 > 0.0:
+                        model.rho_0_free.sub_(0.5 * (g_r0_bar / p_size_prec).clamp(-0.5, 0.5))
+                    if mm_rho > 0.0:
+                        model.rho_c.sub_(0.5 * (g_rc_bar / d_cat_prec).clamp(-0.5, 0.5))
+                project(model, caps, opt, r)
             sv = torch.linalg.svdvals(phi_r(model, r).detach())
             row = {"stage": name, "epoch": epoch, "objective": float(np.mean(acc)),
                    "phi_eig_top3": [round(float(v), 3) for v in (sv[:3] ** 2)],
-                   "lr_phi": opt.param_groups[1]["lr"], "seconds": round(time.time() - started, 1)}
+                   "lr_phi": opt.param_groups[3]["lr"],
+                   "epoch_seconds": round(time.time() - t_ep, 2),
+                   "seconds": round(time.time() - started, 1)}
             if sizes:
                 row["chain_mean_size"] = float(np.mean([s[0] for s in sizes]))
                 row["data_mean_size"] = float(np.mean([s[1] for s in sizes]))
@@ -296,8 +378,8 @@ def train(args):
         if avg is not None:
             model.load_state_dict(avg)
 
-    # stage A: pseudo-likelihood
-    run_stage("pseudo-likelihood", args.pl_epochs, args.lr_base, args.lr_phi_pl,
+    # stage A: pseudo-likelihood (gentle Phi warm-up with separate rho_0 / rho_c learning rates)
+    run_stage("pseudo-likelihood", args.pl_epochs, args.lr_base, args.lr_rho, args.lr_rho0, args.lr_phi_pl,
               lambda bt: (pseudo_loglik(model, bt.ix, bt.obs, r), None), average=False)
     torch.save({"model": {k: v.detach().clone() for k, v in model.state_dict().items()}, "rank": r,
                 "stage": "pseudo-likelihood"}, args.out.with_name(args.out.stem + "_pl.pt"))
@@ -318,7 +400,11 @@ def train(args):
         size_chain = float(torch.zeros(ix.B).index_add_(0, ix.item_trip, X.double()).mean())
         return (e_obs - lz).mean(), (size_chain, float(bt.obs.sum()) / ix.B)
 
-    run_stage("sml", args.sml_epochs, args.lr_base, args.lr_phi_sml, sml_step, average=True)
+    run_stage("sml", args.sml_epochs, args.lr_base, args.lr_rho, args.lr_rho0, args.lr_phi_sml, sml_step,
+              average=True, mm_rho=args.mm_rho, mm_rho0=args.mm_rho0)
+    if args.cal_epochs > 0:
+        run_stage("calibrate", args.cal_epochs, 0.0, args.lr_rho, args.lr_rho0, 0.0, sml_step,
+                  average=False, mm_rho=args.mm_rho, mm_rho0=args.mm_rho0)
     torch.save({"model": {k: v.detach().clone() for k, v in model.state_dict().items()}, "rank": r,
                 "stage": "sml", "seconds": time.time() - started, "args": {k: str(v) for k, v in vars(args).items()}},
                args.out.with_suffix(".pt"))
@@ -570,6 +656,7 @@ def evaluate(args):
 
 
 def main():
+    global USE_CPP_SAMPLER
     A = ROOT.parent / "energy_basket_intelligence/artifacts/stress_clean_confirm"
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     p.add_argument("command", choices=("train", "eval"))
@@ -584,16 +671,22 @@ def main():
     p.add_argument("--rank", type=int, default=8)
     p.add_argument("--batch", type=int, default=256)
     p.add_argument("--phi-init", type=float, default=0.05)
-    p.add_argument("--pl-epochs", type=int, default=6)
-    p.add_argument("--sml-epochs", type=int, default=12)
-    p.add_argument("--sweeps", type=int, default=2)
+    p.add_argument("--pl-epochs", type=int, default=2)
+    p.add_argument("--sml-epochs", type=int, default=16)
+    p.add_argument("--cal-epochs", type=int, default=1)
+    p.add_argument("--sweeps", type=int, default=4)
     p.add_argument("--lr-base", type=float, default=3e-4)
-    p.add_argument("--lr-phi-pl", type=float, default=1e-2)
+    p.add_argument("--lr-rho", type=float, default=3e-2)
+    p.add_argument("--lr-rho0", type=float, default=5e-2)
+    p.add_argument("--lr-phi-pl", type=float, default=1e-3)
     p.add_argument("--lr-phi-sml", type=float, default=3e-3)
+    p.add_argument("--mm-rho", type=float, default=1.0)
+    p.add_argument("--mm-rho0", type=float, default=0.5)
     p.add_argument("--lr-final-ratio", type=float, default=0.1)
     p.add_argument("--pool-prod", type=float, default=1.45)
     p.add_argument("--phi-prec", type=float, default=2.0)
     p.add_argument("--rho-c-prec", type=float, default=0.2)
+    p.add_argument("--cpp-sampler", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--eval-batch", type=int, default=256)
     p.add_argument("--ll-trips", type=int, default=0)
     p.add_argument("--burn", type=int, default=200)
@@ -605,6 +698,7 @@ def main():
     p.add_argument("--seed", type=int, default=41001)
     p.add_argument("--threads", type=int, default=8)
     args = p.parse_args()
+    USE_CPP_SAMPLER = bool(args.cpp_sampler)
     args.out.parent.mkdir(parents=True, exist_ok=True)
     (train if args.command == "train" else evaluate)(args)
 

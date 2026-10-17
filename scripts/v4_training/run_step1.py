@@ -48,7 +48,13 @@ def run(args, seed, strength, log):
     train = draw_trips(truth, sup, week_price, H, W, args.train, rng)
     test = draw_trips(truth, sup, week_price, H, W, args.test, rng)
     X, h, price = tensors(train, sup, week_price)
-    prec = {"theta": 1 / 0.8 ** 2, "alpha": 1 / 0.8 ** 2, "delta": 1 / 0.5 ** 2}
+    prec = {
+        "theta": 1 / 0.8 ** 2,
+        "alpha": 1 / 0.8 ** 2,
+        "delta": 1 / 0.5 ** 2,
+        "phi": args.phi_prec,
+        "rho_c": args.rho_c_prec,
+    }
     out = {"seed": seed, "strength": strength, "train": args.train, "test": args.test,
            "data_mean_size": float(X.sum(1).mean())}
     ll = {"truth": exact_trip_ll(truth, sup, test, week_price, H, W)}
@@ -130,9 +136,11 @@ def main():
     p.add_argument("--weeks", type=int, default=8)
     p.add_argument("--train", type=int, default=40000)
     p.add_argument("--test", type=int, default=40000)
-    p.add_argument("--iters", type=int, default=3000)
-    p.add_argument("--lr", type=float, default=0.03)
-    p.add_argument("--lr-final", type=float, default=0.002)
+    p.add_argument("--iters", type=int, default=1500)
+    p.add_argument("--lr", type=float, default=0.01)
+    p.add_argument("--lr-final", type=float, default=0.001)
+    p.add_argument("--phi-prec", type=float, default=2.0)
+    p.add_argument("--rho-c-prec", type=float, default=0.2)
     p.add_argument("--chains", type=int, default=1)
     p.add_argument("--sweeps", type=int, default=1)
     p.add_argument("--every", type=int, default=250)
@@ -143,7 +151,7 @@ def main():
     p.add_argument("--is-draws", type=int, default=2048)
     p.add_argument("--skip-exact", action="store_true")
     p.add_argument("--skip-plugin", action="store_true")
-    p.add_argument("--threads", type=int, default=8)
+    p.add_argument("--threads", type=int, default=2)
     p.add_argument("--output", type=Path, required=True)
     args = p.parse_args()
     torch.set_num_threads(args.threads)

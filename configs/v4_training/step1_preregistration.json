@@ -3,7 +3,11 @@
   "worlds": {
     "form": "Version-4 energy: b + Gram interactions Phi Phi' - rho_c C(n_c,2) - rho_0(|S|); 18 products, 10 categories (5 substitute groups + singletons), nonempty baskets of size <= 5, all 12,615 enumerated",
     "contexts": "100 households x 8 weeks; household taste rank 3, household price sensitivity exp(delta_h), weekly randomized prices",
-    "strengths": [1.0, 3.0, 7.0],
+    "strengths": [
+      1.0,
+      3.0,
+      7.0
+    ],
     "strength_definition": "top eigenvalue of Phi Phi' (rank 3, cross-category complements)",
     "train_trips": 40000,
     "test_trips": 40000,
@@ -11,16 +15,63 @@
   },
   "development_seed": 101,
   "development_changes": "IS proposal enlarged after the dev run failed Gate E (64 components/512 draws -> 256 components thin 4 / 2048 draws); training settings unchanged from the first dev run",
-  "confirmation_seeds": [201, 202, 203],
+  "confirmation_seeds": [
+    201,
+    202,
+    203
+  ],
   "frozen_settings": {
     "pseudo_likelihood": "LBFGS, 8 rounds x 200 iterations, priors theta/alpha precision 1/0.8^2, delta 1/0.5^2 (divided by N)",
-    "sml": {"iters": 3000, "optimizer": "Adam full batch", "lr": 0.03, "lr_final": 0.002, "decay": "geometric", "chains_per_trip": 1, "sweeps_per_iter": 1, "chain_init": "observed basket", "polyak_average_from": 0.5},
-    "is_log_z": {"burn": 200, "components": 256, "thin": 4, "draws": 2048, "defensive_weight": 0.1, "panel_contexts": 200}
+    "sml": {
+      "iters": 3000,
+      "optimizer": "Adam full batch",
+      "lr": 0.03,
+      "lr_final": 0.002,
+      "decay": "geometric",
+      "chains_per_trip": 1,
+      "sweeps_per_iter": 1,
+      "chain_init": "observed basket",
+      "polyak_average_from": 0.5
+    },
+    "is_log_z": {
+      "burn": 200,
+      "components": 256,
+      "thin": 4,
+      "draws": 2048,
+      "defensive_weight": 0.1,
+      "panel_contexts": 200
+    }
   },
   "gates": {
     "gate_E": "on the HS-SML fit: mean |log Z_hat - log Z| <= 0.01 and max <= 0.05 nats over 200 test contexts",
     "gate_T": "exact test log-likelihood: truth minus HS-SML <= 0.02 nats/basket, and correlation of the identified pair interaction (phi_i.phi_j - rho_c[same category], i<j) with truth >= 0.9"
   },
   "decision_rule": "Step 1 passes only if Gate E and Gate T pass in all 9 confirmation worlds (3 seeds x 3 strengths). Otherwise back to design; no stress-world run.",
-  "diagnostic_arms_not_gated": ["exact MLE by enumeration started at truth", "pseudo-likelihood alone", "plug-in z = observed basket field (fit_fast_v4.py shortcut)"]
+  "diagnostic_arms_not_gated": [
+    "exact MLE by enumeration started at truth",
+    "pseudo-likelihood alone",
+    "plug-in z = observed basket field (fit_fast_v4.py shortcut)"
+  ],
+  "amendment_after_confirmation_201_203": {
+    "result_201_203": "8/9 worlds passed; seed 203 strength 1 failed both gates (Phi drifted along the rho_c/Phi flat direction of a two-product category; sampler stopped mixing). Step 1 failed as pre-registered.",
+    "fix": "weak Gaussian prior on Phi (precision 2.0) and rho_c (0.2), divided by N",
+    "settings_used_for_confirmation_301_303": {
+      "iters": 1500,
+      "lr": 0.01,
+      "lr_final": 0.001,
+      "chains": "8 persistent chains per context, weighted by trip count",
+      "is_log_z": "unchanged"
+    },
+    "development_seeds": [
+      101,
+      203
+    ],
+    "confirmation_seeds": [
+      301,
+      302,
+      303
+    ],
+    "record_note": "these settings were frozen on the development seeds but NOT committed before the 301-303 runs; they are recorded here afterwards",
+    "result_301_303": "9/9 worlds pass both gates (runs/step1/confirm_30*.json)"
+  }
 }

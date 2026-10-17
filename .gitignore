@@ -9,6 +9,7 @@ __pycache__/
 /reports/
 *.log
 *.so
+*.dylib
 build/
 .DS_Store
 runs/

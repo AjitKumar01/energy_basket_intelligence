@@ -4,7 +4,11 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 export ENERGY_MODEL_DATA_ROOT="$PWD/data/stress_world/model_input_category"
-export DYLD_INSERT_LIBRARIES="/tmp/libshm_shim.dylib"
+SHIM_DYLIB="$PWD/scripts/v4_training/libshm_shim.dylib"
+if [[ ! -f "$SHIM_DYLIB" || "$PWD/scripts/v4_training/shm_shim.c" -nt "$SHIM_DYLIB" ]]; then
+  clang -dynamiclib -O2 "$PWD/scripts/v4_training/shm_shim.c" -o "$SHIM_DYLIB"
+fi
+export DYLD_INSERT_LIBRARIES="$SHIM_DYLIB"
 /opt/homebrew/bin/python3.11 -u scripts/v4_training/stress.py train \
   --out runs/stress/hs_conv --cpp-sampler --tie-phi --rank 16 \
   --phi-prec 20 --delta-prec 200 --pool-prod 0.5 \

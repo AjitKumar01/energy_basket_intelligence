@@ -306,7 +306,7 @@ def train(args):
             size_counts.index_add_(0, n_b.clamp(max=nmax), torch.ones_like(n_b, dtype=torch.float64))
             nc_row = torch.zeros(bt.ix.n_rows).index_add_(0, bt.ix.row_of, bt.obs.double())
             cat_pair_sum.index_add_(0, bt.ix.row_cat, model.pair_feature(nc_row))
-        p_size_prec = (size_counts[2:] / N).clamp_min(2e-3)
+        p_size_prec = (size_counts[1:] / N).clamp_min(2e-3)   # rho_0_free[k] is the size-(k+1) potential
         d_cat_prec = (cat_pair_sum / N).clamp_min(5e-3)
 
     def run_stage(name, epochs, lr_base, lr_rho, lr_rho0, lr_phi, step_fn, average, mm_rho=0.0, mm_rho0=0.0):

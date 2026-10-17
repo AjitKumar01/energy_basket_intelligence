@@ -241,14 +241,18 @@ def pseudo_loglik(model, ix, X, r):
     return (lp * valid).sum() / ix.B
 
 
-def penalties(model, args, n_train, r):
+def penalties(model, args, n_train, r, tied=None):
     loss = 0.0
     for product, context in ((model.mu, model.delta_c()), (model.zeta, model.xi_c()),
                              (model.alpha, model.theta_c())):
         loss = loss + args.pool_prod * torch.trace((product.T @ product) @ (context.T @ context)) / (
             product.shape[0] * context.shape[0])
-    loss = loss + 0.5 * (args.phi_prec * phi_r(model, r).square().sum()
-                         + args.rho_c_prec * model.rho_c.square().sum()) / n_train
+    if tied is None:
+        phi_prior = args.phi_prec * phi_r(model, r).square().sum()
+    else:                       # phi_j = psi_c(j) + delta_j: category vector plus a shrunk product deviation
+        psi, dlt, _ = tied
+        phi_prior = args.phi_prec * psi.square().sum() + args.delta_prec * dlt.square().sum()
+    loss = loss + 0.5 * (phi_prior + args.rho_c_prec * model.rho_c.square().sum()) / n_train
     return loss
 
 
@@ -285,8 +289,18 @@ def train(args):
     emit({"event": "start", "train_trips": len(train_trips), "batches": len(batches),
           "batching_seconds": round(time.time() - t0, 1), "args": {k: str(v) for k, v in vars(args).items()}})
     torch.manual_seed(args.seed)
-    with torch.no_grad():
-        model.phi[:, :r] = args.phi_init * torch.randn(J, r)
+    tied = None
+    if args.tie_phi:
+        cat = model.cat_of.long()
+        psi = (args.phi_init * torch.randn(C, r)).requires_grad_(True)
+        dlt = torch.zeros(J, r, requires_grad=True)
+        tied = (psi, dlt, cat)
+        with torch.no_grad():
+            model.phi.zero_()
+            model.phi[:, :r] = psi[cat] + dlt
+    else:
+        with torch.no_grad():
+            model.phi[:, :r] = args.phi_init * torch.randn(J, r)
     for n in ("gamma", "beta", "price_kappa", "psi"):
         getattr(model, n).requires_grad_(False)
     base = [getattr(model, n) for n in BASE_NAMES]
@@ -314,8 +328,9 @@ def train(args):
             {"params": other_base, "lr": lr_base},
             {"params": [model.rho_c], "lr": lr_rho},
             {"params": [model.rho_0_free], "lr": lr_rho0},
-            {"params": [model.phi], "lr": lr_phi},
+            {"params": [model.phi] if tied is None else [tied[0], tied[1]], "lr": lr_phi},
         ])
+        phi_params = opt.param_groups[3]["params"]
         total = epochs * len(batches)
         decay = (args.lr_final_ratio) ** (1.0 / max(total - 1, 1))
         avg, n_avg, it = None, 0, 0
@@ -329,15 +344,26 @@ def train(args):
                 bt = batches[bi]
                 bt.bind(model)
                 value, extra = step_fn(bt)
-                loss = -value + penalties(model, args, N, r)
+                loss = -value + penalties(model, args, N, r, tied)
                 opt.zero_grad(set_to_none=True)
+                if tied is not None:
+                    model.phi.grad = None
                 loss.backward()
+                if tied is not None:                         # chain rule phi -> (psi, delta)
+                    with torch.no_grad():
+                        g = model.phi.grad[:, :r]
+                        tied[0].grad = tied[0].grad + torch.zeros_like(tied[0]).index_add_(0, tied[2], g)
+                        tied[1].grad = tied[1].grad + g
+                        model.phi.grad = None
                 g_r0 = model.rho_0_free.grad.detach().clone()
                 g_rc = model.rho_c.grad.detach().clone()
                 g_r0_sum.add_(g_r0)
                 g_rc_sum.add_(g_rc)
-                torch.nn.utils.clip_grad_norm_(base + [model.phi], 10.0)
+                torch.nn.utils.clip_grad_norm_(base + list(phi_params), 10.0)
                 opt.step()
+                if tied is not None:
+                    with torch.no_grad():
+                        model.phi[:, :r] = tied[0][tied[2]] + tied[1]
                 if mm_rho > 0.0 or mm_rho0 > 0.0:
                     scale_lr = opt.param_groups[3]["lr"] / max(lr_phi, 1e-12) if lr_phi > 0 else 1.0
                     with torch.no_grad():
@@ -377,6 +403,9 @@ def train(args):
             emit(row)
         if avg is not None:
             model.load_state_dict(avg)
+            if tied is not None:                             # keep phi = psi[cat] + delta at the averaged phi
+                with torch.no_grad():
+                    tied[1].copy_(model.phi[:, :r] - tied[0][tied[2]])
 
     # stage A: pseudo-likelihood (gentle Phi warm-up with separate rho_0 / rho_c learning rates)
     run_stage("pseudo-likelihood", args.pl_epochs, args.lr_base, args.lr_rho, args.lr_rho0, args.lr_phi_pl,
@@ -686,6 +715,8 @@ def main():
     p.add_argument("--pool-prod", type=float, default=1.45)
     p.add_argument("--phi-prec", type=float, default=2.0)
     p.add_argument("--rho-c-prec", type=float, default=0.2)
+    p.add_argument("--tie-phi", action="store_true", help="phi_j = psi_category(j) + delta_j")
+    p.add_argument("--delta-prec", type=float, default=200.0, help="prior precision on delta (with --tie-phi)")
     p.add_argument("--cpp-sampler", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--eval-batch", type=int, default=256)
     p.add_argument("--ll-trips", type=int, default=0)

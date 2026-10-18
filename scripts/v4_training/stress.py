@@ -49,6 +49,9 @@ NEG = -float("inf")
 BASE_NAMES = ("lam", "alpha", "theta", "rho_c", "rho_0_free", "w_dsp", "w_mlr", "mu", "delta", "zeta", "xi")
 OTHER_BASE_NAMES = ("alpha", "theta", "w_dsp", "w_mlr", "mu", "delta", "zeta", "xi")
 USE_CPP_SAMPLER = os.environ.get("STRESS_CPP_SAMPLER", "0") == "1"
+# Run as a script, this module is __main__; helpers that `import stress` must get this same module
+# (and its USE_CPP_SAMPLER), not a second copy with the pure-Python sampler.
+sys.modules.setdefault("stress", sys.modules[__name__])
 
 
 # ---- setup ------------------------------------------------------------------------------------
@@ -1040,7 +1043,6 @@ def classifier_auc(real, generated, groups, n_item, item_cat, n_cat, kind):
 
 
 def evaluate(args):
-    from pipeline_support import supported_trips
     from price_response import changed_price_context
     data, model, meta, batcher = setup(args.initialization, args.additive, args.threads)
     blob = torch.load(args.out.with_suffix(".pt") if args.checkpoint is None else args.checkpoint,
@@ -1050,7 +1052,7 @@ def evaluate(args):
     for q in model.parameters():
         q.requires_grad_(False)
     r = int(blob["rank"])
-    J, C, nmax = int(data["n_item"]), int(data["n_cat"]), int(meta["nmax"])
+    J = int(data["n_item"])
     item_cat = np.zeros(J, dtype=np.int64)
     item_cat[data["line_item"]] = data["line_cat"]
     gen = torch.Generator().manual_seed(args.seed + 5)
@@ -1068,16 +1070,13 @@ def evaluate(args):
     trips = ref["trips"].astype(np.int64)
     if args.ll_trips:
         trips = trips[:args.ll_trips]
-    ll, half_diff, ess_all, gen_baskets = [], [], [], {}
+    ll, half_diff, ess_all = [], [], []
     for s in range(0, len(trips), args.eval_batch):
         bt = Batch(batcher, trips[s:s + args.eval_batch], J)
         bt.bind(model)
-        est, dhalf, ess, X = is_log_z(model, bt, r, gen, args.burn, args.components, args.thin, args.draws)
+        est, dhalf, ess, _ = is_log_z(model, bt, r, gen, args.burn, args.components, args.thin, args.draws)
         e = obs_energy(model, bt, r)
         ll.append((e - est).numpy()); half_diff.append(dhalf.numpy()); ess_all.append(ess.numpy())
-        items = bt.ix.item.numpy(); xt = bt.ix.item_trip.numpy(); Xn = X.numpy()
-        for b, t in enumerate(bt.trips):
-            gen_baskets[int(t)] = np.sort(items[Xn & (xt == b)])
         print(f"[eval {tag}] LL {s + len(bt.trips)}/{len(trips)} running mean {np.concatenate(ll).mean():.4f} "
               f"({time.time() - t0:.0f}s)", flush=True)
     ll, half_diff, ess_all = map(np.concatenate, (ll, half_diff, ess_all))
@@ -1099,33 +1098,23 @@ def evaluate(args):
     np.savez(args.out.with_name(tag + ".per_trip.npz"), trips=trips, ll=ll, half_diff=half_diff, ess=ess_all)
     print(json.dumps(report["likelihood"]), flush=True)
 
-    # 2. classifier two-sample test on all test trips (one chain basket per trip after burn-in)
-    test = supported_trips(data, 2, nmax)
-    lptr = data["line_ptr"]
-    real = [np.sort(data["line_item"][lptr[t]:lptr[t + 1]]) for t in test]
-    generated = []
-    for s in range(0, len(test), args.eval_batch):
-        part = test[s:s + args.eval_batch]
-        if all(int(t) in gen_baskets for t in part):
-            generated += [gen_baskets[int(t)] for t in part]
-            continue
-        bt = Batch(batcher, part, J)
-        bt.bind(model)
-        X = sample_slots(model, bt.ix, slot_utilities(model, bt.ix, None, r, beta=0.0), gen, beta=0.0)
-        X = gibbs(model, bt.ix, X, r, gen, sweeps=args.burn).numpy()
-        items, xt = bt.ix.item.numpy(), bt.ix.item_trip.numpy()
-        generated += [np.sort(items[X & (xt == b)]) for b in range(len(part))]
-    groups = np.r_[data["trip_user"][test], data["trip_user"][test]]
-    full = classifier_auc(real, generated, groups, J, item_cat, C, "full")
-    cats = classifier_auc(real, generated, groups, J, item_cat, C, "category")
-    report["classifier"] = {"full_basket_auc": full[0], "category_presence_auc": cats[0],
-                            "size_mean_real": float(np.mean([len(x) for x in real])),
-                            "size_mean_generated": float(np.mean([len(x) for x in generated]))}
+    # 2. classifier two-sample test on all test trips: one fresh basket per trip for each of --auc-seeds
+    from eval_3seed_auc import seed_aucs
+    aucs = seed_aucs(model, data, batcher, r, args.auc_seeds, args.burn, args.eval_batch)
+    aucs = {"checkpoint": report["checkpoint"], **aucs}
+    args.out.with_name(tag + "_3seed_auc.json").write_text(json.dumps(aucs, indent=2) + "\n")
+    first = aucs["seeds"][0]
+    report["classifier"] = {"full_basket_auc": first["full_basket_auc"], "category_presence_auc": first["category_presence_auc"],
+                            "size_mean_real": first["size_mean_real"], "size_mean_generated": first["size_mean_generated"],
+                            "full_basket_auc_mean": aucs["full_basket_auc_mean"],
+                            "category_presence_auc_mean": aucs["category_presence_auc_mean"],
+                            "category_presence_auc_sd": aucs["category_presence_auc_sd"],
+                            "size_mean_generated_mean": aucs["size_mean_generated_mean"]}
     print(json.dumps(report["classifier"]), flush=True)
     if args.no_price_scenarios:   # real data (ERIM, Dunnhumby): no causal price truth to score against
         report["pass_rules"] = {
             "1_ll_vs_certified_ci_above_0": report["likelihood"]["vs_certified_v4_household_95"][0] > 0,
-            "2_category_auc_le_0.80": report["classifier"]["category_presence_auc"] <= 0.80}
+            "2_category_auc_le_0.80": report["classifier"]["category_presence_auc_mean"] <= 0.80}
         report["eval_seconds"] = time.time() - t0
         args.out.with_name(tag + ".eval.json").write_text(json.dumps(report, indent=1) + "\n")
         print(json.dumps(report["pass_rules"]), flush=True)
@@ -1219,7 +1208,7 @@ def evaluate(args):
     L = report["likelihood"]
     report["pass_rules"] = {
         "1_ll_vs_certified_ci_above_0": L["vs_certified_v4_household_95"][0] > 0,
-        "2_category_auc_le_0.80": report["classifier"]["category_presence_auc"] <= 0.80,
+        "2_category_auc_le_0.80": report["classifier"]["category_presence_auc_mean"] <= 0.80,
         "3_own_price_corr_ge_0.85": report["price"]["own"]["correlation"] >= 0.85}
     report["eval_seconds"] = time.time() - t0
     args.out.with_name(tag + ".eval.json").write_text(json.dumps(report, indent=1) + "\n")
@@ -1237,6 +1226,8 @@ def main():
     p.add_argument("--phi0-refit", type=Path,
                    default=ROOT.parent / "ebi_v4x/runs/stress/base.per_trip.npz")
     p.add_argument("--world", type=Path, default=ROOT / "data/stress_world")
+    p.add_argument("--auc-seeds", type=int, nargs="+", default=[41006, 41007, 41008],
+                   help="classifier seeds; eval writes <run>_3seed_auc.json and pass rule 2 uses their mean")
     p.add_argument("--no-price-scenarios", action="store_true",
                    help="skip the price scenarios (real data has no causal truth); pass rules 1-2 only")
     p.add_argument("--out", type=Path, required=True)
@@ -1246,7 +1237,7 @@ def main():
     p.add_argument("--phi-init", type=float, default=0.05)
     p.add_argument("--pl-epochs", type=int, default=2)
     p.add_argument("--sml-epochs", type=int, default=16)
-    p.add_argument("--min-sml-epochs", type=int, default=16)
+    p.add_argument("--min-sml-epochs", type=int, default=0)
     p.add_argument("--cal-epochs", type=int, default=1)
     p.add_argument("--val-trips", type=int, default=0)
     p.add_argument("--val-every", type=int, default=4)

@@ -155,6 +155,7 @@ def main():
     p.add_argument("--burn", type=int, default=200)
     p.add_argument("--seed", type=int, default=41001)
     p.add_argument("--threads", type=int, default=4)
+    p.add_argument("--max-trips", type=int, default=0, help="score a fixed random subset of training trips (0 = all)")
     p.add_argument("--output", type=Path, default=ROOT / "runs/stress/multicount_pull_diagnostic.json")
     args = p.parse_args()
 
@@ -181,20 +182,30 @@ def main():
     all_train_trips = supported_trips(data, 0, nmax)
     v_perm = np.random.default_rng(args.seed + 99).permutation(all_train_trips)
     train_trips = np.sort(v_perm[2048:])
-    batches = [Batch(batcher, train_trips[s:s + 256], J) for s in range(0, len(train_trips), 256)]
+    # real baskets need no sampling, so they always use every training trip; model baskets use
+    # a fixed random subset when --max-trips is set (generation is the expensive part)
+    model_trips = train_trips
+    if args.max_trips and len(train_trips) > args.max_trips:
+        model_trips = np.sort(np.random.default_rng(args.seed + 444).choice(train_trips, args.max_trips, replace=False))
+
+    def counts(bt, mask):
+        nc_row = torch.zeros(bt.ix.n_rows).index_add_(0, bt.ix.row_of, mask.double())
+        nc_bc = torch.zeros((bt.ix.B, C), dtype=torch.int64)
+        nc_bc[bt.ix.row_trip, bt.ix.row_cat] = nc_row.long()
+        return nc_bc.numpy()
 
     gen = torch.Generator().manual_seed(args.seed + 333)
     nc_real_list, nc_mod_list = [], []
     with torch.no_grad():
-        for bt in batches:
+        for s in range(0, len(train_trips), 256):
+            bt = Batch(batcher, train_trips[s:s + 256], J)
+            nc_real_list.append(counts(bt, bt.obs))
+        for s in range(0, len(model_trips), 256):
+            bt = Batch(batcher, model_trips[s:s + 256], J)
             bt.bind(model)
             X_mod = sample_slots(model, bt.ix, slot_utilities(model, bt.ix, None, r, beta=0.0), gen, beta=0.0)
             X_mod = gibbs(model, bt.ix, X_mod, r, gen, sweeps=args.burn)
-            for mask, dest in ((bt.obs, nc_real_list), (X_mod, nc_mod_list)):
-                nc_row = torch.zeros(bt.ix.n_rows).index_add_(0, bt.ix.row_of, mask.double())
-                nc_bc = torch.zeros((bt.ix.B, C), dtype=torch.int64)
-                nc_bc[bt.ix.row_trip, bt.ix.row_cat] = nc_row.long()
-                dest.append(nc_bc.numpy())
+            nc_mod_list.append(counts(bt, X_mod))
 
     nc_real = np.concatenate(nc_real_list, axis=0)
     nc_mod = np.concatenate(nc_mod_list, axis=0)
@@ -215,6 +226,7 @@ def main():
 
     summary = {
         "train_trips": int(len(train_trips)),
+        "model_trips": int(len(model_trips)),
         "seconds": round(time.time() - t0, 1),
         "real_pooled": real_stats["pooled_nc_given_pos"],
         "model_pooled": mod_stats["pooled_nc_given_pos"],

@@ -27,6 +27,58 @@ from pipeline_support import supported_trips  # noqa: E402
 torch.set_default_dtype(torch.float64)
 
 
+def seed_aucs(model, data, batcher, r, seeds, burn=200, eval_batch=256):
+    """Classifier two-sample AUCs (full basket, category presence) on all supported test trips,
+    one freshly generated basket per trip for each seed."""
+    J, C, nmax = int(data["n_item"]), int(data["n_cat"]), int(model.nmax)
+    item_cat = np.zeros(J, dtype=np.int64)
+    item_cat[data["line_item"]] = data["line_cat"]
+    test = supported_trips(data, 2, nmax)
+    lptr = data["line_ptr"]
+    real = [np.sort(data["line_item"][lptr[t]:lptr[t + 1]]) for t in test]
+    groups = np.r_[data["trip_user"][test], data["trip_user"][test]]
+    test_batches = [Batch(batcher, test[s:s + eval_batch], J) for s in range(0, len(test), eval_batch)]
+
+    seed_results = []
+    for sd in seeds:
+        ts = time.time()
+        gen = torch.Generator().manual_seed(sd)
+        generated = []
+        with torch.no_grad():
+            for bt in test_batches:
+                bt.bind(model)
+                X = sample_slots(model, bt.ix, slot_utilities(model, bt.ix, None, r, beta=0.0), gen, beta=0.0)
+                X = gibbs(model, bt.ix, X, r, gen, sweeps=burn).numpy()
+                items, xt = bt.ix.item.numpy(), bt.ix.item_trip.numpy()
+                generated += [np.sort(items[X & (xt == b)]) for b in range(len(bt.trips))]
+        full_m, full_sd = classifier_auc(real, generated, groups, J, item_cat, C, "full")
+        cat_m, cat_sd = classifier_auc(real, generated, groups, J, item_cat, C, "category")
+        row = {
+            "seed": int(sd),
+            "full_basket_auc": round(full_m, 4),
+            "full_basket_fold_sd": round(full_sd, 4),
+            "category_presence_auc": round(cat_m, 4),
+            "category_presence_fold_sd": round(cat_sd, 4),
+            "size_mean_real": round(float(np.mean([len(x) for x in real])), 4),
+            "size_mean_generated": round(float(np.mean([len(x) for x in generated])), 4),
+            "seconds": round(time.time() - ts, 1),
+        }
+        print(json.dumps(row), flush=True)
+        seed_results.append(row)
+
+    sd_ = (lambda k: round(float(np.std([x[k] for x in seed_results], ddof=1)), 4)) if len(seeds) > 1 else (lambda k: 0.0)
+    return {
+        "test_trips": int(len(test)),
+        "burn": burn,
+        "seeds": seed_results,
+        "full_basket_auc_mean": round(float(np.mean([x["full_basket_auc"] for x in seed_results])), 4),
+        "full_basket_auc_sd": sd_("full_basket_auc"),
+        "category_presence_auc_mean": round(float(np.mean([x["category_presence_auc"] for x in seed_results])), 4),
+        "category_presence_auc_sd": sd_("category_presence_auc"),
+        "size_mean_generated_mean": round(float(np.mean([x["size_mean_generated"] for x in seed_results])), 4),
+    }
+
+
 def main():
     A = ROOT.parent / "energy_basket_intelligence/artifacts/stress_clean_confirm"
     p = argparse.ArgumentParser(description=__doc__)
@@ -47,55 +99,8 @@ def main():
     model.eval()
     for q in model.parameters():
         q.requires_grad_(False)
-    r = int(blob["rank"])
-    J, C, nmax = int(data["n_item"]), int(data["n_cat"]), int(meta["nmax"])
-    item_cat = np.zeros(J, dtype=np.int64)
-    item_cat[data["line_item"]] = data["line_cat"]
-
-    test = supported_trips(data, 2, nmax)
-    lptr = data["line_ptr"]
-    real = [np.sort(data["line_item"][lptr[t]:lptr[t + 1]]) for t in test]
-    groups = np.r_[data["trip_user"][test], data["trip_user"][test]]
-    test_batches = [Batch(batcher, test[s:s + args.eval_batch], J) for s in range(0, len(test), args.eval_batch)]
-
-    seed_results = []
-    for sd in args.seeds:
-        ts = time.time()
-        gen = torch.Generator().manual_seed(sd)
-        generated = []
-        with torch.no_grad():
-            for bt in test_batches:
-                bt.bind(model)
-                X = sample_slots(model, bt.ix, slot_utilities(model, bt.ix, None, r, beta=0.0), gen, beta=0.0)
-                X = gibbs(model, bt.ix, X, r, gen, sweeps=args.burn).numpy()
-                items, xt = bt.ix.item.numpy(), bt.ix.item_trip.numpy()
-                generated += [np.sort(items[X & (xt == b)]) for b in range(len(bt.trips))]
-        full_m, full_sd = classifier_auc(real, generated, groups, J, item_cat, C, "full")
-        cat_m, cat_sd = classifier_auc(real, generated, groups, J, item_cat, C, "category")
-        row = {
-            "seed": int(sd),
-            "full_basket_auc": round(full_m, 4),
-            "full_basket_fold_sd": round(full_sd, 4),
-            "category_presence_auc": round(cat_m, 4),
-            "category_presence_fold_sd": round(cat_sd, 4),
-            "size_mean_real": round(float(np.mean([len(x) for x in real])), 4),
-            "size_mean_generated": round(float(np.mean([len(x) for x in generated])), 4),
-            "seconds": round(time.time() - ts, 1),
-        }
-        print(json.dumps(row), flush=True)
-        seed_results.append(row)
-
-    summary = {
-        "checkpoint": str(args.checkpoint),
-        "test_trips": int(len(test)),
-        "burn": args.burn,
-        "seeds": seed_results,
-        "full_basket_auc_mean": round(float(np.mean([x["full_basket_auc"] for x in seed_results])), 4),
-        "full_basket_auc_sd": round(float(np.std([x["full_basket_auc"] for x in seed_results], ddof=1)), 4),
-        "category_presence_auc_mean": round(float(np.mean([x["category_presence_auc"] for x in seed_results])), 4),
-        "category_presence_auc_sd": round(float(np.std([x["category_presence_auc"] for x in seed_results], ddof=1)), 4),
-        "size_mean_generated_mean": round(float(np.mean([x["size_mean_generated"] for x in seed_results])), 4),
-    }
+    summary = {"checkpoint": str(args.checkpoint),
+               **seed_aucs(model, data, batcher, int(blob["rank"]), args.seeds, args.burn, args.eval_batch)}
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(summary, indent=2) + "\n")
     print("SUMMARY:", json.dumps(summary), flush=True)

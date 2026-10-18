@@ -19,18 +19,18 @@ from world import Support, contexts, exact_log_z, make_truth  # noqa: E402
 torch.set_default_dtype(torch.float64)
 
 
-def run_mode(args, sup, hp, cw, use_f_extra=False, presence_phi=False, cat_rho0=False):
+def run_mode(args, sup, hp, cw, use_f_extra=False, presence_phi=False, cat_rho0=False, u_cat=False):
     J, H, W, K, r, nmax = 18, 100, 8, 3, 3, 5
     results = []
     for strength in args.strengths:
         truth, week_price = make_truth(args.seed, strength, J=J, H=H, W=W, K=K, r=r, nmax=nmax,
-                                       use_f_extra=use_f_extra, presence_phi=presence_phi, cat_rho0=cat_rho0)
+                                       use_f_extra=use_f_extra, presence_phi=presence_phi, cat_rho0=cat_rho0, u_cat=u_cat)
         pp = week_price[torch.as_tensor(cw)]
 
         # Also verify exact beta=0 DP normalizer log_zc against brute-force enumeration at Phi=0
         if strength == args.strengths[0]:
             t_zero, _ = make_truth(args.seed, strength, J=J, H=H, W=W, K=K, r=r, nmax=nmax,
-                                   use_f_extra=use_f_extra, presence_phi=presence_phi, cat_rho0=cat_rho0)
+                                   use_f_extra=use_f_extra, presence_phi=presence_phi, cat_rho0=cat_rho0, u_cat=u_cat)
             with torch.no_grad():
                 t_zero.p["phi"].zero_()
                 if presence_phi:
@@ -71,7 +71,7 @@ def run_mode(args, sup, hp, cw, use_f_extra=False, presence_phi=False, cat_rho0=
                 "pass_gate_E": bool(err_f.mean() <= 0.01 and err_f.max() <= 0.05),
             },
         }
-        mode_tag = "m3" if cat_rho0 else ("m2" if presence_phi else ("m1" if use_f_extra else "baseline"))
+        mode_tag = "m4a" if u_cat else ("m3" if cat_rho0 else ("m2" if presence_phi else ("m1" if use_f_extra else "baseline")))
         print(json.dumps({"mode": mode_tag, **row}), flush=True)
         results.append(row)
     return results
@@ -79,7 +79,7 @@ def run_mode(args, sup, hp, cw, use_f_extra=False, presence_phi=False, cat_rho0=
 
 def main():
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--mode", choices=("baseline", "m1", "m2", "m3", "all"), default="baseline")
+    p.add_argument("--mode", choices=("baseline", "m1", "m2", "m3", "m4a", "all"), default="baseline")
     p.add_argument("--seed", type=int, default=101)
     p.add_argument("--strengths", type=float, nargs="+", default=[1.0, 3.0, 7.0, 25.0, 50.0, 75.0])
     p.add_argument("--panel", type=int, default=200)
@@ -119,6 +119,9 @@ def main():
     elif args.mode == "m3":
         results = run_mode(args, sup, hp, cw_p, use_f_extra=True, presence_phi=True, cat_rho0=True)
         payload = {"mode": "m3", "results": results}
+    elif args.mode == "m4a":
+        results = run_mode(args, sup, hp, cw_p, use_f_extra=True, presence_phi=True, cat_rho0=True, u_cat=True)
+        payload = {"mode": "m4a", "results": results}
     else:
         payload = {
             "panel_contexts": args.panel,

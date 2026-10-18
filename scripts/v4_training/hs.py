@@ -398,14 +398,15 @@ def sample_given_u(u, part: Partition, rho_c, rho0, gen, f_extra=None, cat_shift
 
 class V4:
     """Version-4 parameters for a small world.  b_tj = lam_j + theta_h.alpha_j - exp(delta_h) g_j price_wj.
-    Supports M1 (f_extra: C x 3 count potential offsets), M2 (presence_phi=True), and M3 (cat_rho0=True)."""
+    Supports M1 (f_extra), M2 (presence_phi), M3 (cat_rho0), and M4a (u_cat)."""
 
-    def __init__(self, J, H, K, r, part: Partition, seed=0, requires_grad=True, use_f_extra=False, presence_phi=False, cat_rho0=False):
+    def __init__(self, J, H, K, r, part: Partition, seed=0, requires_grad=True, use_f_extra=False, presence_phi=False, cat_rho0=False, u_cat=False):
         g = torch.Generator().manual_seed(seed)
         self.part = part
         self.use_f_extra = use_f_extra
         self.presence_phi = presence_phi
         self.cat_rho0 = cat_rho0
+        self.u_cat = u_cat
         self.p = {
             "lam": torch.zeros(J),
             "theta": 0.1 * torch.randn(H, K, generator=g),
@@ -421,6 +422,8 @@ class V4:
         if presence_phi:
             self.p["psi"] = 0.05 * torch.randn(part.C, r, generator=g)
             self.p["delta_phi"] = 0.01 * torch.randn(J, r, generator=g)
+        if u_cat:
+            self.p["u_cat"] = torch.zeros(part.C, K)
         for v in self.p.values():
             v.requires_grad_(requires_grad)
 
@@ -455,8 +458,11 @@ class V4:
 
     def b(self, h, price):
         p = self.p
-        return p["lam"] + p["theta"][h] @ p["alpha"].T \
+        out = p["lam"] + p["theta"][h] @ p["alpha"].T \
             - torch.exp(p["delta"][h])[:, None] * self.g()[None, :] * price
+        if getattr(self, "u_cat", False) and "u_cat" in p:
+            out = out + (p["theta"][h] @ p["u_cat"].T)[:, self.part.group]
+        return out
 
     def energy(self, X, h, price):
         """E(S) for 0/1 baskets X (B x J)."""
@@ -491,6 +497,8 @@ class V4:
             val = val + prec.get("phi", 2.0) * p["phi"].square().sum()
         if self.use_f_extra:
             val = val + prec.get("f_extra", 2.0) * p["f_extra"].square().sum()
+        if getattr(self, "u_cat", False) and "u_cat" in p:
+            val = val + prec.get("u_cat", 2.0) * p["u_cat"].square().sum()
         return 0.5 * val
 
     def state(self):

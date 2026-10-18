@@ -979,12 +979,19 @@ def main():
         pat_tau1_no_u, pres_tau1_no_u = score_chain_ablation(tau_override=1.0, zero_U=True)
         pat_no_cross, pres_no_cross = score_chain_ablation(zero_cross=True)
 
-        # Variance decomposition of household taste theta @ alpha in V4 vs Chain
+        # Variance decomposition of household taste theta @ alpha (and optional u_cat) in V4 vs Chain
         ta_v4 = (model.theta_c() @ model.alpha.T).numpy()
+        if getattr(model, "u_cat", None) is not None:
+            u_v4 = (model.theta_c() @ model.u_cat.T).numpy()
+            ta_v4_tot = ta_v4 + u_v4[:, cat_of_np]
+            u_v4_between_cat_var = float(u_v4.var(0).mean())
+        else:
+            ta_v4_tot = ta_v4
+            u_v4_between_cat_var = 0.0
         ta_ch = (chain_model.theta @ chain_model.alpha.T).numpy()
-        ta_v4_between_cat_var = float(np.mean([ta_v4[:, cat_of_np == c].mean(1).var() for c in range(C)]))
+        ta_v4_between_cat_var = float(np.mean([ta_v4_tot[:, cat_of_np == c].mean(1).var() for c in range(C)]))
         ta_v4_within_cat_var = float(
-            np.mean([(ta_v4[:, cat_of_np == c] - ta_v4[:, cat_of_np == c].mean(1, keepdims=True)).var() for c in range(C)])
+            np.mean([(ta_v4_tot[:, cat_of_np == c] - ta_v4_tot[:, cat_of_np == c].mean(1, keepdims=True)).var() for c in range(C)])
         )
         ta_ch_between_cat_var = float(np.mean([ta_ch[:, cat_of_np == c].mean(1).var() for c in range(C)]))
         ta_ch_within_cat_var = float(
@@ -1121,6 +1128,7 @@ def main():
                 "chain_theta_alpha_between_cat_mean_var": round(ta_ch_between_cat_var, 4),
                 "chain_theta_alpha_within_cat_var": round(ta_ch_within_cat_var, 4),
                 "chain_dedicated_theta_U_cat_var": round(u_ch_between_cat_var, 4),
+                "v4_dedicated_theta_U_cat_var": round(u_v4_between_cat_var, 4),
                 "v4_mean_price_slope_frozen": round(g_v4_mean, 4),
                 "chain_mean_price_slope": round(g_ch_mean, 4),
                 "v4_mean_display_weight": round(float(model.w_dsp.mean()), 4),

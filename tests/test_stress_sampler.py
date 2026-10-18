@@ -94,6 +94,7 @@ def test_m1_m2_sampler_matches_dp_derivatives_on_stress_trips(use_cpp):
     J, C, r = int(data["n_item"]), int(data["n_cat"]), 8
     g0 = torch.Generator().manual_seed(10)
     model.f_extra = torch.nn.Parameter(0.35 * torch.randn(C, 3, generator=g0))
+    model.u_cat = torch.nn.Parameter(0.3 * torch.randn(C, model.theta.shape[1], generator=g0))
     model.presence_phi = True
     model.psi_cat = torch.nn.Parameter(0.35 * torch.randn(C, r, generator=g0))
     dlt = 0.15 * torch.randn(J, r, generator=g0)

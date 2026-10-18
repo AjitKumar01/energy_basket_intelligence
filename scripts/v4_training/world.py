@@ -47,10 +47,10 @@ def partition(J, nmax):
     return Partition(group, nmax)
 
 
-def make_truth(seed, strength, J=18, H=100, W=8, K=3, r=3, nmax=5, use_f_extra=False, presence_phi=False, cat_rho0=False):
+def make_truth(seed, strength, J=18, H=100, W=8, K=3, r=3, nmax=5, use_f_extra=False, presence_phi=False, cat_rho0=False, u_cat=False):
     g = torch.Generator().manual_seed(seed)
     part = partition(J, nmax)
-    t = V4(J, H, K, r, part, requires_grad=False, use_f_extra=use_f_extra, presence_phi=presence_phi, cat_rho0=cat_rho0)
+    t = V4(J, H, K, r, part, requires_grad=False, use_f_extra=use_f_extra, presence_phi=presence_phi, cat_rho0=cat_rho0, u_cat=u_cat)
     phi = 0.25 * torch.randn(J, r, generator=g)
     for d, items in enumerate(MISSIONS):
         phi[items, d] += 1.0
@@ -82,6 +82,8 @@ def make_truth(seed, strength, J=18, H=100, W=8, K=3, r=3, nmax=5, use_f_extra=F
             delta_phi = phi - psi[part.group]
             t.p["psi"].copy_(psi)
             t.p["delta_phi"].copy_(delta_phi)
+        if u_cat:
+            t.p["u_cat"].copy_(0.4 * torch.randn(part.C, K, generator=g))
     price = 0.35 * torch.randn(W, J, generator=g)
     return t, price
 

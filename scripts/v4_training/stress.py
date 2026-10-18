@@ -66,6 +66,17 @@ def setup(initialization, additive, threads):
         model.phi.zero_()
     model.presence_phi = False
     model.cat_rho0 = False
+    orig_b_at = model.b_at
+
+    def b_at_with_u_cat(it, trip, c):
+        b = orig_b_at(it, trip, c)
+        if getattr(model, "u_cat", None) is not None:
+            hh = model.house[trip]
+            theta = model.theta_c()
+            b = b + (theta[hh] * model.u_cat[model.cat_of[it]]).sum(-1)
+        return b
+
+    model.b_at = b_at_with_u_cat
     features = Features(int(data["n_item"]), int(data["n_store"]), include_recency=False,
                         include_store_price=True)
     batcher = Batcher(data, features, int(meta["nmax"]), include_recency=False)
@@ -73,7 +84,7 @@ def setup(initialization, additive, threads):
 
 
 def configure_model_from_blob(model, blob):
-    """Attach optional M1 (f_extra), M2 (psi_cat, presence_phi), and M3 (cat_rho0) parameters from checkpoint blob and load state."""
+    """Attach optional M1 (f_extra), M2 (psi_cat, presence_phi), M3 (cat_rho0), and M4a (u_cat) parameters from checkpoint blob and load state."""
     st = blob["model"]
     if "f_extra" in st and st["f_extra"] is not None:
         if getattr(model, "f_extra", None) is None:
@@ -84,6 +95,9 @@ def configure_model_from_blob(model, blob):
             model.psi_cat = torch.nn.Parameter(torch.zeros_like(st["psi_cat"]))
     else:
         model.presence_phi = False
+    if "u_cat" in st and st["u_cat"] is not None:
+        if getattr(model, "u_cat", None) is None:
+            model.u_cat = torch.nn.Parameter(torch.zeros_like(st["u_cat"]))
     model.cat_rho0 = bool(blob.get("cat_rho0", False))
     model.load_state_dict(st)
 
@@ -529,7 +543,10 @@ def penalties(model, args, n_train, r, tied=None, price_init=None):
             p = getattr(model, n)
             if p.requires_grad:
                 price_prior = price_prior + args.price_prec * (p - v0).square().sum()
-    loss = loss + 0.5 * (phi_prior + args.rho_c_prec * model.rho_c.square().sum() + extra_prior + price_prior) / n_train
+    u_cat_prior = 0.0
+    if getattr(model, "u_cat", None) is not None:
+        u_cat_prior = args.u_cat_prec * model.u_cat.square().sum()
+    loss = loss + 0.5 * (phi_prior + args.rho_c_prec * model.rho_c.square().sum() + extra_prior + price_prior + u_cat_prior) / n_train
     return loss
 
 
@@ -585,6 +602,8 @@ def train(args):
     torch.manual_seed(args.seed)
     if args.f_extra:
         model.register_parameter("f_extra", torch.nn.Parameter(torch.zeros(C, 3)))
+    if args.u_cat:
+        model.register_parameter("u_cat", torch.nn.Parameter(torch.zeros(C, model.theta.shape[1])))
     if args.presence_phi:
         args.tie_phi = True
         model.presence_phi = True
@@ -661,7 +680,7 @@ def train(args):
         return float(np.concatenate(lls).mean()), float(np.concatenate(ess_list).mean())
 
     def run_stage(name, epochs, lr_b, lr_l, lr_rho, lr_rho0, lr_phi, step_fn, average, mm_rho=0.0, mm_rho0=0.0, mm_lam=0.0,
-                  monitor_val=False, lr_price=0.0):
+                  monitor_val=False, lr_price=0.0, lr_u_cat=0.0):
         param_groups = [
             {"params": other_base, "lr": lr_b},
             {"params": [model.lam], "lr": lr_l},
@@ -673,6 +692,9 @@ def train(args):
         if getattr(model, "f_extra", None) is not None:
             param_groups.append({"params": [model.f_extra], "lr": 0.2 * lr_rho})
             extra_params.append(model.f_extra)
+        if getattr(model, "u_cat", None) is not None and lr_u_cat > 0.0:
+            param_groups.append({"params": [model.u_cat], "lr": lr_u_cat})
+            extra_params.append(model.u_cat)
         price_params = [getattr(model, n) for n in ("gamma", "beta", "price_kappa", "psi") if getattr(model, n).requires_grad]
         if price_params and lr_price > 0.0:
             param_groups.append({"params": price_params, "lr": lr_price})
@@ -795,12 +817,15 @@ def train(args):
             with torch.no_grad():
                 tied[1].copy_(model.phi[:, :r] - tied[0][tied[2]])
 
+    lr_u_pl = args.lr_u_cat if args.u_cat else 0.0
+    lr_u_sml = args.lr_u_cat if args.u_cat else 0.0
+    lr_u_cal = 0.5 * args.lr_u_cat if args.u_cat else 0.0
     # stage A: pseudo-likelihood (gentle Phi warm-up with separate rho_0 / rho_c / lam learning rates)
     run_stage("pseudo-likelihood", args.pl_epochs, args.lr_base, lr_lam, args.lr_rho, args.lr_rho0, args.lr_phi_pl,
-              lambda bt: (pseudo_loglik(model, bt.ix, bt.obs, r), None), average=False)
+              lambda bt: (pseudo_loglik(model, bt.ix, bt.obs, r), None), average=False, lr_u_cat=lr_u_pl)
     torch.save({"model": {k: v.detach().clone() for k, v in model.state_dict().items()}, "rank": r,
                 "use_f_extra": bool(args.f_extra), "presence_phi": bool(args.presence_phi),
-                "cat_rho0": bool(args.cat_rho0),
+                "cat_rho0": bool(args.cat_rho0), "u_cat": bool(args.u_cat),
                 "stage": "pseudo-likelihood"}, args.out.with_name(args.out.stem + "_pl.pt"))
 
     # stage B: stochastic maximum likelihood with persistent per-trip chains (data-initialized)
@@ -828,17 +853,18 @@ def train(args):
 
     run_stage("sml", args.sml_epochs, args.lr_base, lr_lam, args.lr_rho, args.lr_rho0, args.lr_phi_sml, sml_step,
               average=True, mm_rho=args.mm_rho, mm_rho0=args.mm_rho0, mm_lam=args.mm_lam, monitor_val=True,
-              lr_price=lr_price_sml)
+              lr_price=lr_price_sml, lr_u_cat=lr_u_sml)
     if args.cal_epochs > 0:
         run_stage("calibrate", args.cal_epochs, 0.0, 0.5 * lr_lam, args.lr_rho, args.lr_rho0, 0.0, sml_step,
                   average=False, mm_rho=args.mm_rho, mm_rho0=args.mm_rho0, mm_lam=args.mm_lam,
-                  lr_price=lr_price_cal)
+                  lr_price=lr_price_cal, lr_u_cat=lr_u_cal)
     if val_batches:
         v_ll, v_ess = eval_val_ll()
         emit({"event": "final_val", "val_ll": round(v_ll, 4), "val_ess": round(v_ess, 4)})
     torch.save({"model": {k: v.detach().clone() for k, v in model.state_dict().items()}, "rank": r,
                 "use_f_extra": bool(args.f_extra), "presence_phi": bool(args.presence_phi),
                 "cat_rho0": bool(args.cat_rho0), "unfreeze_price": bool(args.unfreeze_price),
+                "u_cat": bool(args.u_cat),
                 "stage": "sml", "seconds": time.time() - started, "args": {k: str(v) for k, v in vars(args).items()}},
                args.out.with_suffix(".pt"))
     emit({"event": "trained", "seconds": round(time.time() - started, 1)})
@@ -1239,6 +1265,9 @@ def main():
     p.add_argument("--unfreeze-price", action="store_true", help="T1: unfreeze gamma, beta, price_kappa and psi in SML and calibration stages")
     p.add_argument("--lr-price", type=float, default=3e-3, help="T1: learning rate for unfrozen price/recency parameters in SML (halved in calibrate)")
     p.add_argument("--price-prec", type=float, default=2.0, help="T1: prior precision on gamma, beta, price_kappa, psi centred at initial Phi=0 values")
+    p.add_argument("--u-cat", action="store_true", help="M4a: household taste per category b_tj += theta_h . U_c(j)")
+    p.add_argument("--lr-u-cat", type=float, default=5e-3, help="M4a: learning rate for U_c in PL and SML (halved in calibrate)")
+    p.add_argument("--u-cat-prec", type=float, default=2.0, help="M4a: weak prior precision on U_c centred at 0")
     p.add_argument("--cpp-sampler", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--eval-batch", type=int, default=256)
     p.add_argument("--ll-trips", type=int, default=0)

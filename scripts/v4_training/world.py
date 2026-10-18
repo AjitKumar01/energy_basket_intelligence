@@ -47,10 +47,10 @@ def partition(J, nmax):
     return Partition(group, nmax)
 
 
-def make_truth(seed, strength, J=18, H=100, W=8, K=3, r=3, nmax=5, use_f_extra=False, presence_phi=False):
+def make_truth(seed, strength, J=18, H=100, W=8, K=3, r=3, nmax=5, use_f_extra=False, presence_phi=False, cat_rho0=False):
     g = torch.Generator().manual_seed(seed)
     part = partition(J, nmax)
-    t = V4(J, H, K, r, part, requires_grad=False, use_f_extra=use_f_extra, presence_phi=presence_phi)
+    t = V4(J, H, K, r, part, requires_grad=False, use_f_extra=use_f_extra, presence_phi=presence_phi, cat_rho0=cat_rho0)
     phi = 0.25 * torch.randn(J, r, generator=g)
     for d, items in enumerate(MISSIONS):
         phi[items, d] += 1.0
@@ -98,7 +98,8 @@ def energy_table(model: V4, sup: Support, h, price):
         extra_c = (n_c - 1.0).clamp_min(0.0)
         diag = diag - extra_c @ p["psi"].square().sum(1)
     pair = 0.5 * (s.square().sum(1) - diag)
-    rest = pair - cat_count_penalty_matrix(n_c, p["rho_c"], model.f_extra()) - model.rho0()[sup.size - 1]
+    size_idx = (n_c > 0).sum(1).long() if getattr(model, "cat_rho0", False) else sup.size
+    rest = pair - cat_count_penalty_matrix(n_c, p["rho_c"], model.f_extra()) - model.rho0()[size_idx - 1]
     return b @ sup.M.T + rest[None, :]
 
 

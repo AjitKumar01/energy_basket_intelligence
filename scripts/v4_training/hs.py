@@ -100,10 +100,10 @@ def _convolve(a, b, nmax):
     return out
 
 
-def log_zc(u, part: Partition, rho_c, rho0, return_tables=False, f_extra=None, cat_shift=None):
+def log_zc(u, part: Partition, rho_c, rho0, return_tables=False, f_extra=None, cat_shift=None, cat_rho0=False):
     """log Zc over nonempty baskets of size <= nmax, given per-trip utilities u (B x J).
-    rho0: length-nmax tensor, rho0[n-1] is the size potential of size n."""
-    if return_tables:
+    rho0: length-nmax tensor, rho0[n-1] is the size potential of size n (or active category count m when cat_rho0=True)."""
+    if return_tables and not cat_rho0:
         polys, prefixes = _category_polys(u, part, rho_c, f_extra=f_extra, cat_shift=cat_shift)
         prefix = [torch.zeros(u.shape[0], 1)]
         for p in polys:
@@ -118,6 +118,65 @@ def log_zc(u, part: Partition, rho_c, rho0, return_tables=False, f_extra=None, c
     nmax = part.nmax
     u_max = u.detach().amax(dim=1, keepdim=True).clamp(min=-20.0, max=20.0)
     w = torch.exp(u - u_max)
+    if cat_rho0:
+        mmax = min(part.C, nmax)
+        tot2d = torch.zeros((B, nmax + 1, mmax + 1), dtype=u.dtype)
+        tot2d[:, 0, 0] = 1.0
+        deg_tot = 0
+        cat_tot = 0
+        for c, items in enumerate(part.members):
+            m = len(items)
+            if m == 1:
+                wc = w[:, items[0]:items[0] + 1, None]
+                new_deg = min(deg_tot + 1, nmax)
+                new_cat = min(cat_tot + 1, mmax)
+                out = tot2d.clone()
+                out[:, 1:new_deg + 1, 1:new_cat + 1] = (
+                    out[:, 1:new_deg + 1, 1:new_cat + 1] + tot2d[:, :new_deg, :new_cat] * wc
+                )
+                tot2d = out
+                deg_tot, cat_tot = new_deg, new_cat
+            else:
+                top_c = min(m, nmax)
+                ec = torch.zeros((B, top_c + 1), dtype=u.dtype)
+                ec[:, 0] = 1.0
+                cur_d = 0
+                for idx_i in items:
+                    wi = w[:, idx_i:idx_i + 1]
+                    nd = min(cur_d + 1, top_c)
+                    ec_prev = ec[:, :nd].clone()
+                    ec[:, 1:nd + 1] = ec[:, 1:nd + 1] + ec_prev * wi
+                    cur_d = nd
+                ks = torch.arange(top_c + 1, dtype=u.dtype)
+                pen = cat_count_penalty(c, ks, rho_c, f_extra)[None, :]
+                if cat_shift is not None and top_c >= 2:
+                    km1 = (ks - 1.0).clamp_min(0.0)[None, :]
+                    pen = pen + km1 * cat_shift[:, c:c + 1]
+                pc = ec * torch.exp(-pen)
+                new_deg = min(deg_tot + top_c, nmax)
+                new_cat = min(cat_tot + 1, mmax)
+                out = tot2d.clone()
+                for k in range(1, top_c + 1):
+                    keep = min(deg_tot + 1, new_deg + 1 - k)
+                    if keep <= 0:
+                        break
+                    out[:, k:k + keep, 1:new_cat + 1] = (
+                        out[:, k:k + keep, 1:new_cat + 1]
+                        + tot2d[:, :keep, :new_cat] * pc[:, k:k + 1, None]
+                    )
+                tot2d = out
+                deg_tot, cat_tot = new_deg, new_cat
+        n_hi = min(deg_tot, nmax)
+        m_hi = min(cat_tot, mmax)
+        ks_n = torch.arange(1, n_hi + 1, dtype=u.dtype)[None, :, None]
+        sub2d = tot2d[:, 1:n_hi + 1, 1:m_hi + 1]
+        log_joint = torch.where(
+            sub2d > 0.0,
+            torch.log(sub2d.clamp_min(1e-300)) + ks_n * u_max[:, :, None] - rho0[:m_hi][None, None, :],
+            torch.full_like(sub2d, NEG),
+        )
+        return torch.logsumexp(log_joint.reshape(B, -1), dim=1)
+
     tot = torch.zeros((B, nmax + 1), dtype=u.dtype)
     tot[:, 0] = 1.0
     deg_tot = 0
@@ -163,7 +222,7 @@ def log_zc(u, part: Partition, rho_c, rho0, return_tables=False, f_extra=None, c
 
 
 @torch.no_grad()
-def sample_given_u(u, part: Partition, rho_c, rho0, gen, f_extra=None, cat_shift=None):
+def sample_given_u(u, part: Partition, rho_c, rho0, gen, f_extra=None, cat_shift=None, cat_rho0=False):
     """Exact draws S ~ additive law at utilities u (B x J), nonempty, |S| <= nmax. Returns B x J 0/1."""
     B, J = u.shape
     nmax = part.nmax
@@ -171,6 +230,97 @@ def sample_given_u(u, part: Partition, rho_c, rho0, gen, f_extra=None, cat_shift
     w = torch.exp(u - u_max)
 
     polys, prefixes = [], []
+    if cat_rho0:
+        mmax = min(part.C, nmax)
+        init2d = torch.zeros((B, nmax + 1, mmax + 1), dtype=u.dtype)
+        init2d[:, 0, 0] = 1.0
+        prefix2d = [init2d]
+        deg_tot, cat_tot = 0, 0
+        for c, items in enumerate(part.members):
+            m = len(items)
+            top_c = min(m, nmax)
+            e = torch.zeros((B, top_c + 1), dtype=u.dtype)
+            e[:, 0] = 1.0
+            steps = [e.clone()]
+            cur_d = 0
+            for i in items:
+                wi = w[:, i:i + 1]
+                nd = min(cur_d + 1, top_c)
+                e[:, 1:nd + 1] = e[:, 1:nd + 1] + e[:, :nd].clone() * wi
+                cur_d = nd
+                steps.append(e.clone())
+            prefixes.append(steps)
+            if m == 1:
+                pc = e
+            else:
+                ks = torch.arange(top_c + 1, dtype=u.dtype)
+                pen = cat_count_penalty(c, ks, rho_c, f_extra)[None, :]
+                if cat_shift is not None and top_c >= 2:
+                    km1 = (ks - 1.0).clamp_min(0.0)[None, :]
+                    pen = pen + km1 * cat_shift[:, c:c + 1]
+                pc = e * torch.exp(-pen)
+            polys.append(pc)
+
+            prev2d = prefix2d[-1]
+            new_deg = min(deg_tot + top_c, nmax)
+            new_cat = min(cat_tot + 1, mmax)
+            out2d = prev2d.clone()
+            for k in range(1, top_c + 1):
+                keep = min(deg_tot + 1, new_deg + 1 - k)
+                if keep <= 0:
+                    break
+                out2d[:, k:k + keep, 1:new_cat + 1] = (
+                    out2d[:, k:k + keep, 1:new_cat + 1]
+                    + prev2d[:, :keep, :new_cat] * pc[:, k:k + 1, None]
+                )
+            prefix2d.append(out2d)
+            deg_tot, cat_tot = new_deg, new_cat
+
+        tot2d = prefix2d[-1]
+        ks_n = torch.arange(1, nmax + 1, dtype=u.dtype)[None, :, None]
+        sub2d = tot2d[:, 1:, 1:]
+        log_joint = torch.where(
+            sub2d > 0.0,
+            torch.log(sub2d.clamp_min(1e-300)) + ks_n * u_max[:, :, None] - rho0[:mmax][None, None, :],
+            torch.full_like(sub2d, NEG),
+        )
+        flat_idx = torch.multinomial(torch.softmax(log_joint.reshape(B, -1), 1), 1, generator=gen).squeeze(1)
+        rem_n = (flat_idx // mmax) + 1
+        rem_m = (flat_idx % mmax) + 1
+        X = torch.zeros(B, J, dtype=u.dtype)
+        b_idx = torch.arange(B)
+        for c in range(part.C - 1, -1, -1):
+            before2d, poly = prefix2d[c], polys[c]
+            K = poly.shape[1]
+            probs = torch.zeros((B, K), dtype=u.dtype)
+            probs[:, 0] = before2d[b_idx, rem_n, rem_m] * poly[:, 0]
+            for k in range(1, K):
+                ok = (rem_n >= k) & (rem_m >= 1)
+                rn = (rem_n - k).clamp(min=0)
+                rm = (rem_m - 1).clamp(min=0)
+                probs[:, k] = torch.where(ok, before2d[b_idx, rn, rm] * poly[:, k], torch.zeros(B, dtype=u.dtype))
+            k = torch.multinomial(probs.clamp_min(0.0) + 1e-300 * (probs > 0).double(), 1, generator=gen).squeeze(1)
+            rem_n = rem_n - k
+            rem_m = rem_m - (k > 0).long()
+            items, steps = part.members[c], prefixes[c]
+            if len(items) == 1:
+                X[:, items[0]] = k.double()
+            else:
+                need = k.clone()
+                for pos in range(len(items) - 1, -1, -1):
+                    i = int(items[pos])
+                    prev, cur = steps[pos], steps[pos + 1]
+                    have = need > 0
+                    nk = need.clamp(min=1)
+                    num = w[:, i] * prev.gather(1, (nk - 1).clamp(max=prev.shape[1] - 1)[:, None]).squeeze(1)
+                    den = cur.gather(1, nk.clamp(max=cur.shape[1] - 1)[:, None]).squeeze(1).clamp_min(1e-300)
+                    p_take = torch.where(have, (num / den).clamp(0.0, 1.0), torch.zeros(B, dtype=u.dtype))
+                    take = (torch.rand(B, generator=gen) < p_take) & have
+                    X[:, i] = take.double()
+                    need = need - take.long()
+        assert int((rem_n != 0).sum()) == 0 and int((rem_m != 0).sum()) == 0
+        return X
+
     prefix = [torch.ones((B, 1), dtype=u.dtype)]
     deg_tot = 0
     for c, items in enumerate(part.members):
@@ -248,13 +398,14 @@ def sample_given_u(u, part: Partition, rho_c, rho0, gen, f_extra=None, cat_shift
 
 class V4:
     """Version-4 parameters for a small world.  b_tj = lam_j + theta_h.alpha_j - exp(delta_h) g_j price_wj.
-    Supports M1 (f_extra: C x 3 count potential offsets) and M2 (presence_phi=True with psi: C x r, delta_phi: J x r)."""
+    Supports M1 (f_extra: C x 3 count potential offsets), M2 (presence_phi=True), and M3 (cat_rho0=True)."""
 
-    def __init__(self, J, H, K, r, part: Partition, seed=0, requires_grad=True, use_f_extra=False, presence_phi=False):
+    def __init__(self, J, H, K, r, part: Partition, seed=0, requires_grad=True, use_f_extra=False, presence_phi=False, cat_rho0=False):
         g = torch.Generator().manual_seed(seed)
         self.part = part
         self.use_f_extra = use_f_extra
         self.presence_phi = presence_phi
+        self.cat_rho0 = cat_rho0
         self.p = {
             "lam": torch.zeros(J),
             "theta": 0.1 * torch.randn(H, K, generator=g),
@@ -318,8 +469,8 @@ class V4:
             extra_c = (n_c - 1.0).clamp_min(0.0)
             diag = diag - extra_c @ p["psi"].square().sum(1)
         pair = 0.5 * (s.square().sum(1) - diag)
-        n = X.sum(1).long()
-        return (X * self.b(h, price)).sum(1) + pair - cat_count_penalty_matrix(n_c, p["rho_c"], self.f_extra()) - self.rho0()[n - 1]
+        size_idx = (n_c > 0).sum(1).long() if self.cat_rho0 else X.sum(1).long()
+        return (X * self.b(h, price)).sum(1) + pair - cat_count_penalty_matrix(n_c, p["rho_c"], self.f_extra()) - self.rho0()[size_idx - 1]
 
     def utilities(self, h, price, z):
         phi = self.eff_phi()
@@ -366,8 +517,14 @@ def pseudo_likelihood(model: V4, X, h, price):
     n_wo = X.sum(1, keepdim=True) - X                                       # basket size without j
     R = torch.cat([torch.zeros(1), model.rho0()])                           # R[n] for n = 0..nmax
     nmax = part.nmax
-    idx = n_wo.long()
-    up = R[(idx + 1).clamp(max=nmax)] - R[idx]
+    if model.cat_rho0:
+        k_tot = (n_c > 0).sum(1, keepdim=True)
+        new_cat = (n_c_wo == 0)
+        k_wo = (k_tot - X.long() * new_cat.long()).clamp(min=0)
+        up = new_cat.double() * (R[(k_wo + 1).clamp(max=nmax)] - R[k_wo])
+    else:
+        idx = n_wo.long()
+        up = R[(idx + 1).clamp(max=nmax)] - R[idx]
     d = b + pair - p["rho_c"][part.group][None, :] * n_c_wo - up
     valid = (n_wo > 0) & (n_wo < nmax)                                      # both states admissible
     lp = F.logsigmoid(torch.where(X > 0, d, -d))
@@ -427,7 +584,7 @@ def gibbs_sweep(model: V4, X, h, price, gen, sweeps=1):
     for _ in range(sweeps):
         z = model.basket_s(X) + torch.randn(X.shape[0], phi.shape[1], generator=gen)
         X = sample_given_u(model.utilities(h, price, z), model.part, model.p["rho_c"], model.rho0(), gen,
-                           f_extra=model.f_extra(), cat_shift=model.cat_shift(z))
+                           f_extra=model.f_extra(), cat_shift=model.cat_shift(z), cat_rho0=model.cat_rho0)
     return X, z
 
 
@@ -458,7 +615,7 @@ def fit_sml(model: V4, X_obs, h, price, prec, iters, lr, lr_final, gen, chains=1
     data_mean_size = float(X_obs.sum(1).mean())
 
     def mean_obs_energy():
-        if model.use_f_extra or model.presence_phi:
+        if model.use_f_extra or model.presence_phi or model.cat_rho0:
             return model.energy(X_obs, h, price).mean()
         p = model.p
         b_c = model.b(h_ctx, p_ctx)
@@ -501,7 +658,7 @@ def fit_sml(model: V4, X_obs, h, price, prec, iters, lr, lr_final, gen, chains=1
             b_c = model.b(h_ctx, p_ctx)
             u_all = b_c[u_cidx] - 0.5 * phi.square().sum(1)[None, :] + z @ phi.T
             lzc = log_zc(u_all, model.part, model.p["rho_c"], model.rho0(),
-                         f_extra=model.f_extra(), cat_shift=model.cat_shift(z))
+                         f_extra=model.f_extra(), cat_shift=model.cat_shift(z), cat_rho0=model.cat_rho0)
             lzc_mean = (lzc * wu_plug).sum()
         else:
             with torch.no_grad():
@@ -512,13 +669,13 @@ def fit_sml(model: V4, X_obs, h, price, prec, iters, lr, lr_final, gen, chains=1
                 for _ in range(sweeps):
                     z = model.basket_s(S) + torch.randn(S.shape[0], phi.shape[1], generator=gen)
                     S = sample_given_u(b_chain + z @ phi.T, model.part, rho_c, rho0, gen,
-                                       f_extra=f_ext, cat_shift=model.cat_shift(z))
+                                       f_extra=f_ext, cat_shift=model.cat_shift(z), cat_rho0=model.cat_rho0)
                 z = model.basket_s(S) + torch.randn(S.shape[0], phi.shape[1], generator=gen)
             phi = model.eff_phi()
             b_c = model.b(h_ctx, p_ctx)
             u_all = b_c[chain_cidx] - 0.5 * phi.square().sum(1)[None, :] + z @ phi.T
             lzc = log_zc(u_all, model.part, model.p["rho_c"], model.rho0(),
-                         f_extra=model.f_extra(), cat_shift=model.cat_shift(z))
+                         f_extra=model.f_extra(), cat_shift=model.cat_shift(z), cat_rho0=model.cat_rho0)
             lzc_mean = (lzc * chain_w).sum()
 
         loss = -(mean_obs_energy() - lzc_mean) + model.prior(prec) / N
@@ -553,16 +710,16 @@ def is_log_z_orig(model: V4, h, price, gen, burn=200, components=64, thin=2, dra
     rho_c, rho0, f_ext = model.p["rho_c"], model.rho0(), model.f_extra()
     b0 = model.b(h, price)
     u0 = b0 - 0.5 * phi.square().sum(1)[None, :]
-    X = sample_given_u(b0, model.part, rho_c, rho0, gen, f_extra=f_ext)
+    X = sample_given_u(b0, model.part, rho_c, rho0, gen, f_extra=f_ext, cat_rho0=model.cat_rho0)
     for _ in range(burn):
         z_b = model.basket_s(X) + torch.randn(B, r, generator=gen)
         X = sample_given_u(u0 + z_b @ phi.T, model.part, rho_c, rho0, gen,
-                           f_extra=f_ext, cat_shift=model.cat_shift(z_b))
+                           f_extra=f_ext, cat_shift=model.cat_shift(z_b), cat_rho0=model.cat_rho0)
     centres = []
     for k in range(components * thin):
         z_b = model.basket_s(X) + torch.randn(B, r, generator=gen)
         X = sample_given_u(u0 + z_b @ phi.T, model.part, rho_c, rho0, gen,
-                           f_extra=f_ext, cat_shift=model.cat_shift(z_b))
+                           f_extra=f_ext, cat_shift=model.cat_shift(z_b), cat_rho0=model.cat_rho0)
         if (k + 1) % thin == 0:
             centres.append(model.basket_s(X))
     centres = torch.stack(centres, 1)                                       # B x K x r
@@ -584,7 +741,7 @@ def is_log_z_orig(model: V4, h, price, gen, burn=200, components=64, thin=2, dra
         z_flat = z.reshape(B * d_cur, r)
         u_flat = (u0[:, None, :] + z @ phi.T).reshape(B * d_cur, -1)
         lzc = log_zc(u_flat, model.part, rho_c, rho0,
-                     f_extra=f_ext, cat_shift=model.cat_shift(z_flat)).view(B, d_cur)
+                     f_extra=f_ext, cat_shift=model.cat_shift(z_flat), cat_rho0=model.cat_rho0).view(B, d_cur)
         log_w.append(log_prior + lzc - log_q)
     log_w = torch.cat(log_w, 1)
     est = torch.logsumexp(log_w, 1) - math.log(draws)
@@ -596,13 +753,7 @@ def is_log_z_orig(model: V4, h, price, gen, burn=200, components=64, thin=2, dra
 @torch.no_grad()
 def is_log_z(model: V4, h, price, gen, burn=200, components=64, thin=2, draws=512, defensive=0.05,
              tempering=None):
-    """Multi-seed mode-weighted importance-sampling log Z per context (rows of h/price).
-
-    Starts M parallel chains across +/- singular directions of Phi, the beta=0 additive law,
-    and z=0 so isolated interaction modes at large Phi are all visited. Weights proposal
-    centres by exact target log-mass at each unique basket centre + uniform floor, and uses
-    stratified mixture component draws to eliminate discrete mode-sampling variance.
-    """
+    """Multi-seed mode-weighted importance-sampling log Z per context (rows of h/price)."""
     phi = model.eff_phi()
     B, r = h.shape[0], phi.shape[1]
     rho_c, rho0, f_ext = model.p["rho_c"], model.rho0(), model.f_extra()
@@ -625,7 +776,7 @@ def is_log_z(model: V4, h, price, gen, burn=200, components=64, thin=2, draws=51
     X_seeds = []
     for m_i in range(M):
         X_seeds.append(sample_given_u(seed_u[m_i], model.part, rho_c, rho0, gen,
-                                      f_extra=f_ext, cat_shift=model.cat_shift(seed_z[m_i])))
+                                      f_extra=f_ext, cat_shift=model.cat_shift(seed_z[m_i]), cat_rho0=model.cat_rho0))
     X_flat = torch.stack(X_seeds, dim=1).reshape(B * M, -1)
     u0_M = u0.repeat_interleave(M, dim=0)
 
@@ -633,34 +784,32 @@ def is_log_z(model: V4, h, price, gen, burn=200, components=64, thin=2, draws=51
     for _ in range(burn_per_chain):
         z_b = model.basket_s(X_flat) + torch.randn(B * M, r, generator=gen)
         X_flat = sample_given_u(u0_M + z_b @ phi.T, model.part, rho_c, rho0, gen,
-                                f_extra=f_ext, cat_shift=model.cat_shift(z_b))
+                                f_extra=f_ext, cat_shift=model.cat_shift(z_b), cat_rho0=model.cat_rho0)
 
     k_per_chain = max((components + M - 1) // M, 4)
     centres = []
     for k in range(k_per_chain * thin):
         z_b = model.basket_s(X_flat) + torch.randn(B * M, r, generator=gen)
         X_flat = sample_given_u(u0_M + z_b @ phi.T, model.part, rho_c, rho0, gen,
-                                f_extra=f_ext, cat_shift=model.cat_shift(z_b))
+                                f_extra=f_ext, cat_shift=model.cat_shift(z_b), cat_rho0=model.cat_rho0)
         if (k + 1) % thin == 0:
             centres.append(model.basket_s(X_flat).view(B, M, r))
     centres = torch.cat(centres, dim=1)[:, :max(components, M * 4), :]
     K = centres.shape[1]
 
-    # Weight centres by exact target density at s_k (deduplicating identical centres) + uniform floor
     diff_c = (centres[:, :, None, :] - centres[:, None, :, :]).square().sum(3)
     same_c = (diff_c < 1e-8).double()
     mult = same_c.sum(2).clamp_min(1.0)
     c_flat = centres.reshape(B * K, r)
     u_centres = (u0[:, None, :] + centres @ phi.T).reshape(B * K, -1)
     lzc_c = log_zc(u_centres, model.part, rho_c, rho0,
-                   f_extra=f_ext, cat_shift=model.cat_shift(c_flat)).view(B, K)
+                   f_extra=f_ext, cat_shift=model.cat_shift(c_flat), cat_rho0=model.cat_rho0).view(B, K)
     lp_c = -0.5 * centres.square().sum(2)
     log_v = lzc_c + lp_c - torch.log(mult)
     w_mode = torch.softmax(log_v, dim=1)
     w_comp = 0.70 * w_mode + 0.30 / float(K)
     log_w_comp = torch.log(w_comp.clamp_min(1e-300))
 
-    # Stratified component selection across the K centres + 1 defensive prior component (index K)
     probs_all = torch.cat([(1.0 - defensive) * w_comp, torch.full((B, 1), defensive, dtype=phi.dtype)], dim=1)
     cdf = probs_all.cumsum(dim=1)
     cdf[:, -1] = 1.0
@@ -685,7 +834,7 @@ def is_log_z(model: V4, h, price, gen, burn=200, components=64, thin=2, draws=51
         z_flat = z.reshape(B * d_cur, r)
         u_flat = (u0[:, None, :] + z @ phi.T).reshape(B * d_cur, -1)
         lzc = log_zc(u_flat, model.part, rho_c, rho0,
-                     f_extra=f_ext, cat_shift=model.cat_shift(z_flat)).view(B, d_cur)
+                     f_extra=f_ext, cat_shift=model.cat_shift(z_flat), cat_rho0=model.cat_rho0).view(B, d_cur)
         log_w.append(log_prior + lzc - log_q)
     log_w = torch.cat(log_w, 1)
     est = torch.logsumexp(log_w, 1) - math.log(draws)

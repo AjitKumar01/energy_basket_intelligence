@@ -37,13 +37,17 @@ def load_stress_sampler():
     path = build_stress_sampler(force=False)
     lib = ctypes.CDLL(str(path))
     lib.sample_slots_cpp.argtypes = (
-        [ctypes.c_int64] * 6 + [ctypes.c_uint64] + [ctypes.c_void_p] * 11
+        [ctypes.c_int64] * 7 + [ctypes.c_uint64] + [ctypes.c_void_p] * 11
     )
     lib.sample_slots_cpp.restype = ctypes.c_int
     lib.gibbs_sweeps_cpp.argtypes = (
-        [ctypes.c_int64] * 8 + [ctypes.c_double, ctypes.c_uint64] + [ctypes.c_void_p] * 14
+        [ctypes.c_int64] * 9 + [ctypes.c_double, ctypes.c_uint64] + [ctypes.c_void_p] * 14
     )
     lib.gibbs_sweeps_cpp.restype = ctypes.c_int
+    lib.log_degree_2d_forward_cpp.argtypes = [ctypes.c_int64] * 4 + [ctypes.c_void_p] * 5
+    lib.log_degree_2d_forward_cpp.restype = ctypes.c_int
+    lib.log_degree_2d_backward_cpp.argtypes = [ctypes.c_int64] * 4 + [ctypes.c_void_p] * 5
+    lib.log_degree_2d_backward_cpp.restype = ctypes.c_int
     _HANDLE = lib
     return _HANDLE
 

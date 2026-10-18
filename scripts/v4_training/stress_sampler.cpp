@@ -65,8 +65,8 @@ int sample_trip_categories_2d(
     int64_t deg_so_far = 0;
     int64_t cat_so_far = 0;
     double log_scale = 0.0;
-    int64_t deg_hist[64];
-    int64_t cat_hist[64];
+    std::vector<int64_t> deg_hist(Cpad + 1);
+    std::vector<int64_t> cat_hist(Cpad + 1);
 
     for (int64_t c = 0; c < Cpad; ++c) {
         deg_hist[c] = deg_so_far;

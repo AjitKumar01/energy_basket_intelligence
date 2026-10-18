@@ -1,6 +1,7 @@
 """Exact-gradient training of the Version-4 energy with its interactions, on small worlds.
 
-The model is Version-4's, unchanged (plus optional M1 free category-count potential f_c(n_c)):
+The model is Version-4's, unchanged (plus optional M1 free category-count potential f_c(n_c)
+and M2 presence-based category coupling s(S) = sum_c 1(n_c > 0) psi_c + sum_{j in S} delta_j):
     E(S) = sum_{j in S} b_j + 0.5 (|s(S)|^2 - diag(S)) - sum_c f_c(n_c) - rho_0(|S|),
 over nonempty baskets with |S| <= nmax.
 
@@ -249,11 +250,11 @@ class V4:
     """Version-4 parameters for a small world.  b_tj = lam_j + theta_h.alpha_j - exp(delta_h) g_j price_wj.
     Supports M1 (f_extra: C x 3 count potential offsets) and M2 (presence_phi=True with psi: C x r, delta_phi: J x r)."""
 
-    def __init__(self, J, H, K, r, part: Partition, seed=0, requires_grad=True, use_f_extra=False):
+    def __init__(self, J, H, K, r, part: Partition, seed=0, requires_grad=True, use_f_extra=False, presence_phi=False):
         g = torch.Generator().manual_seed(seed)
         self.part = part
         self.use_f_extra = use_f_extra
-        self.presence_phi = False
+        self.presence_phi = presence_phi
         self.p = {
             "lam": torch.zeros(J),
             "theta": 0.1 * torch.randn(H, K, generator=g),
@@ -266,6 +267,9 @@ class V4:
         }
         if use_f_extra:
             self.p["f_extra"] = torch.zeros(part.C, 3)
+        if presence_phi:
+            self.p["psi"] = 0.05 * torch.randn(part.C, r, generator=g)
+            self.p["delta_phi"] = 0.01 * torch.randn(J, r, generator=g)
         for v in self.p.values():
             v.requires_grad_(requires_grad)
 

@@ -55,6 +55,7 @@ extern "C" int sample_slots_cpp(
     const double* rho_c,
     const double* rho_0,
     const double* f_extra,
+    const double* row_cat_shift,
     uint8_t* out_mask
 ) {
     const double neg_inf = -1.0 / 0.0;
@@ -104,10 +105,12 @@ extern "C" int sample_slots_cpp(
         slot_row[fslot] = r;
         int64_t cat = row_cat[r];
         double rc = rho_c[cat];
+        double cshift = row_cat_shift ? row_cat_shift[r] : 0.0;
         double* g_ptr = &G[fslot * K1];
         g_ptr[0] = 0.0;
         for (int64_t k = 1; k <= Kr; ++k) {
             double pen = rc * (0.5 * k * (k - 1)) + extra_count_pen(f_extra, cat, k);
+            if (k >= 2) pen += (k - 1) * cshift;
             g_ptr[k] = (e_cur[k] > 0.0)
                            ? (std::log(e_cur[k]) + k * rmax - pen)
                            : neg_inf;
@@ -287,9 +290,11 @@ extern "C" int gibbs_sweeps_cpp(
     const double* rho_c,
     const double* rho_0,
     const double* f_extra,
+    const double* psi_cat,
     uint8_t* mask
 ) {
     const double neg_inf = -1.0 / 0.0;
+    const double beta = sqrt_beta * sqrt_beta;
     SplitMix64 rng(seed);
 
     std::vector<int64_t> row_start(n_rows + 1, 0);
@@ -300,6 +305,7 @@ extern "C" int gibbs_sweeps_cpp(
     std::vector<double> phi_ord(T * rank, 0.0);
     std::vector<int64_t> slot_at(T, 0);
     std::vector<double> s(B * rank, 0.0);
+    std::vector<int64_t> init_row_cnt(psi_cat ? n_rows : 0, 0);
 
     for (int64_t t = 0; t < T; ++t) {
         int64_t r = row_of[t];
@@ -313,6 +319,17 @@ extern "C" int gibbs_sweeps_cpp(
         if (mask[t]) {
             double* sb = &s[item_trip[t] * rank];
             for (int64_t d = 0; d < rank; ++d) sb[d] += ps[d];
+            if (psi_cat) init_row_cnt[r] += 1;
+        }
+    }
+    if (psi_cat) {
+        for (int64_t r = 0; r < n_rows; ++r) {
+            if (init_row_cnt[r] >= 2) {
+                double mult = static_cast<double>(init_row_cnt[r] - 1);
+                double* sb = &s[row_trip[r] * rank];
+                const double* pc = &psi_cat[row_cat[r] * rank];
+                for (int64_t d = 0; d < rank; ++d) sb[d] -= mult * pc[d];
+            }
         }
     }
 
@@ -381,11 +398,22 @@ extern "C" int gibbs_sweeps_cpp(
             int64_t fslot = flat_slot[r];
             int64_t cat = row_cat[r];
             double rc = rho_c[cat];
+            double cshift = 0.0;
+            if (psi_cat && Kr >= 2) {
+                const double* pc = &psi_cat[cat * rank];
+                double dot_c = 0.0, norm_c = 0.0;
+                for (int64_t d = 0; d < rank; ++d) {
+                    dot_c += zb[d] * pc[d];
+                    norm_c += pc[d] * pc[d];
+                }
+                cshift = dot_c - 0.5 * beta * norm_c;
+            }
             double* g_ptr = &G[fslot * K1];
             g_ptr[0] = 0.0;
             for (int64_t k = 1; k <= Kr; ++k) {
                 double pen = rc * (0.5 * k * (k - 1)) + extra_count_pen(f_extra, cat, k);
-                    g_ptr[k] = (e_cur[k] > 0.0)
+                if (k >= 2) pen += (k - 1) * cshift;
+                g_ptr[k] = (e_cur[k] > 0.0)
                                ? (std::log(e_cur[k]) + k * rmax - pen)
                                : neg_inf;
             }
@@ -549,6 +577,11 @@ extern "C" int gibbs_sweeps_cpp(
                     }
                 }
                 if (need != 0) return -2;
+            }
+            if (psi_cat && need_orig >= 2) {
+                double mult = static_cast<double>(need_orig - 1);
+                const double* pc = &psi_cat[row_cat[r] * rank];
+                for (int64_t d = 0; d < rank; ++d) sb[d] -= mult * pc[d];
             }
         }
     }

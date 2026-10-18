@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Validate Step-1 Gate E importance-sampling log Z estimator (is_log_z vs is_log_z_orig)
 against exact enumeration across interaction strengths on 200 small-world contexts,
-for baseline Version-4, M1 (free category-count potential f_c(n_c))."""
+for baseline Version-4, M1 (free category-count potential f_c(n_c)), and M2 (M1 + presence-based s(S))."""
 from __future__ import annotations
 
 import argparse
@@ -19,20 +19,23 @@ from world import Support, contexts, exact_log_z, make_truth  # noqa: E402
 torch.set_default_dtype(torch.float64)
 
 
-def run_mode(args, sup, hp, cw, use_f_extra=False):
+def run_mode(args, sup, hp, cw, use_f_extra=False, presence_phi=False):
     J, H, W, K, r, nmax = 18, 100, 8, 3, 3, 5
     results = []
     for strength in args.strengths:
         truth, week_price = make_truth(args.seed, strength, J=J, H=H, W=W, K=K, r=r, nmax=nmax,
-                                       use_f_extra=use_f_extra)
+                                       use_f_extra=use_f_extra, presence_phi=presence_phi)
         pp = week_price[torch.as_tensor(cw)]
 
         # Also verify exact beta=0 DP normalizer log_zc against brute-force enumeration at Phi=0
         if strength == args.strengths[0]:
             t_zero, _ = make_truth(args.seed, strength, J=J, H=H, W=W, K=K, r=r, nmax=nmax,
-                                   use_f_extra=use_f_extra)
+                                   use_f_extra=use_f_extra, presence_phi=presence_phi)
             with torch.no_grad():
                 t_zero.p["phi"].zero_()
+                if presence_phi:
+                    t_zero.p["psi"].zero_()
+                    t_zero.p["delta_phi"].zero_()
                 ex0 = exact_log_z(t_zero, sup, hp, pp)
                 dp0 = log_zc(t_zero.b(hp, pp), t_zero.part, t_zero.p["rho_c"], t_zero.rho0(),
                              f_extra=t_zero.f_extra(), cat_shift=None)
@@ -68,14 +71,14 @@ def run_mode(args, sup, hp, cw, use_f_extra=False):
                 "pass_gate_E": bool(err_f.mean() <= 0.01 and err_f.max() <= 0.05),
             },
         }
-        print(json.dumps({"mode": ("m1" if use_f_extra else "baseline"), **row}), flush=True)
+        print(json.dumps({"mode": ("m2" if presence_phi else ("m1" if use_f_extra else "baseline")), **row}), flush=True)
         results.append(row)
     return results
 
 
 def main():
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--mode", choices=("baseline", "m1", "all"), default="baseline")
+    p.add_argument("--mode", choices=("baseline", "m1", "m2", "all"), default="baseline")
     p.add_argument("--seed", type=int, default=101)
     p.add_argument("--strengths", type=float, nargs="+", default=[1.0, 3.0, 7.0, 25.0, 50.0, 75.0])
     p.add_argument("--panel", type=int, default=200)
@@ -96,7 +99,7 @@ def main():
     cw_p = cw[panel]
 
     if args.mode == "baseline":
-        results = run_mode(args, sup, hp, cw_p, use_f_extra=False)
+        results = run_mode(args, sup, hp, cw_p, use_f_extra=False, presence_phi=False)
         payload = {
             "panel_contexts": args.panel,
             "seed": args.seed,
@@ -109,6 +112,9 @@ def main():
     elif args.mode == "m1":
         results = run_mode(args, sup, hp, cw_p, use_f_extra=True, presence_phi=False)
         payload = {"mode": "m1", "results": results}
+    elif args.mode == "m2":
+        results = run_mode(args, sup, hp, cw_p, use_f_extra=True, presence_phi=True)
+        payload = {"mode": "m2", "results": results}
     else:
         payload = {
             "panel_contexts": args.panel,
@@ -117,8 +123,9 @@ def main():
             "is_components": args.is_components,
             "is_draws": args.is_draws,
             "gate_E_thresholds": {"mean_abs_err_le": 0.01, "max_abs_err_le": 0.05},
-            "baseline": run_mode(args, sup, hp, cw_p, use_f_extra=False),
+            "baseline": run_mode(args, sup, hp, cw_p, use_f_extra=False, presence_phi=False),
             "m1": run_mode(args, sup, hp, cw_p, use_f_extra=True, presence_phi=False),
+            "m2": run_mode(args, sup, hp, cw_p, use_f_extra=True, presence_phi=True),
         }
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(payload, indent=2) + "\n")

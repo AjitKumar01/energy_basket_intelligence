@@ -238,13 +238,14 @@ def sample_slots(model, ix, u, gen, use_cpp: bool | None = None, z=None, beta=1.
         fe_c = model.f_extra.detach().contiguous() if getattr(model, "f_extra", None) is not None else None
         cs_c = cshift.detach().contiguous() if cshift is not None else None
         fe_ptr = fe_c.data_ptr() if fe_c is not None else 0
+        cs_ptr = cs_c.data_ptr() if cs_c is not None else 0
         seed = int(torch.randint(1, 2**62, (1,), generator=gen).item())
         out = torch.empty(T, dtype=torch.uint8)
         rc = load_stress_sampler().sample_slots_cpp(
             B, ix.n_rows, T, ix.Cpad, K, nmax, seed,
             u_c.data_ptr(), ix.row_of.data_ptr(), ix.item_pos.data_ptr(),
             ix.row_size.data_ptr(), ix.row_cat.data_ptr(), ix.flat_slot.data_ptr(),
-            rho_c.data_ptr(), rho_0.data_ptr(), fe_ptr, out.data_ptr())
+            rho_c.data_ptr(), rho_0.data_ptr(), fe_ptr, cs_ptr, out.data_ptr())
         if rc != 0:
             raise RuntimeError(f"native sample_slots_cpp failed with status {rc}")
         return out.bool()
@@ -331,6 +332,7 @@ def gibbs(model, ix, X, r, gen, sweeps=1, beta=1.0, use_cpp: bool | None = None)
         fe_c = model.f_extra.detach().contiguous() if getattr(model, "f_extra", None) is not None else None
         psi_c = model.psi_cat.detach().contiguous() if getattr(model, "presence_phi", False) else None
         fe_ptr = fe_c.data_ptr() if fe_c is not None else 0
+        psi_ptr = psi_c.data_ptr() if psi_c is not None else 0
         seed = int(torch.randint(1, 2**62, (1,), generator=gen).item())
         mask = X.to(torch.uint8).contiguous().clone()
         rc = load_stress_sampler().gibbs_sweeps_cpp(
@@ -338,7 +340,7 @@ def gibbs(model, ix, X, r, gen, sweeps=1, beta=1.0, use_cpp: bool | None = None)
             b_base.data_ptr(), ph.data_ptr(), ix.item_trip.data_ptr(), ix.row_of.data_ptr(),
             ix.item_pos.data_ptr(), ix.row_size.data_ptr(), ix.row_cat.data_ptr(),
             ix.row_trip.data_ptr(), ix.flat_slot.data_ptr(), rho_c.data_ptr(),
-            rho_0.data_ptr(), fe_ptr, mask.data_ptr())
+            rho_0.data_ptr(), fe_ptr, psi_ptr, mask.data_ptr())
         if rc != 0:
             raise RuntimeError(f"native gibbs_sweeps_cpp failed with status {rc}")
         return mask.bool()
@@ -455,11 +457,18 @@ def train(args):
     torch.manual_seed(args.seed)
     if args.f_extra:
         model.register_parameter("f_extra", torch.nn.Parameter(torch.zeros(C, 3)))
+    if args.presence_phi:
+        args.tie_phi = True
+        model.presence_phi = True
     tied = None
     if args.tie_phi:
         cat = model.cat_of.long()
         psi_init = args.phi_init * torch.randn(C, r)
-        psi = psi_init.requires_grad_(True)
+        if args.presence_phi:
+            model.register_parameter("psi_cat", torch.nn.Parameter(psi_init))
+            psi = model.psi_cat
+        else:
+            psi = psi_init.requires_grad_(True)
         dlt = torch.zeros(J, r, requires_grad=True)
         tied = (psi, dlt, cat)
         with torch.no_grad():
@@ -646,7 +655,7 @@ def train(args):
     run_stage("pseudo-likelihood", args.pl_epochs, args.lr_base, lr_lam, args.lr_rho, args.lr_rho0, args.lr_phi_pl,
               lambda bt: (pseudo_loglik(model, bt.ix, bt.obs, r), None), average=False)
     torch.save({"model": {k: v.detach().clone() for k, v in model.state_dict().items()}, "rank": r,
-                "use_f_extra": bool(args.f_extra), "presence_phi": False,
+                "use_f_extra": bool(args.f_extra), "presence_phi": bool(args.presence_phi),
                 "stage": "pseudo-likelihood"}, args.out.with_name(args.out.stem + "_pl.pt"))
 
     # stage B: stochastic maximum likelihood with persistent per-trip chains (data-initialized)
@@ -676,7 +685,7 @@ def train(args):
         v_ll, v_ess = eval_val_ll()
         emit({"event": "final_val", "val_ll": round(v_ll, 4), "val_ess": round(v_ess, 4)})
     torch.save({"model": {k: v.detach().clone() for k, v in model.state_dict().items()}, "rank": r,
-                "use_f_extra": bool(args.f_extra), "presence_phi": False,
+                "use_f_extra": bool(args.f_extra), "presence_phi": bool(args.presence_phi),
                 "stage": "sml", "seconds": time.time() - started, "args": {k: str(v) for k, v in vars(args).items()}},
                args.out.with_suffix(".pt"))
     emit({"event": "trained", "seconds": round(time.time() - started, 1)})
@@ -1071,6 +1080,7 @@ def main():
     p.add_argument("--delta-prec", type=float, default=200.0, help="prior precision on delta (with --tie-phi)")
     p.add_argument("--f-extra", action="store_true", help="M1: free per-category count potential f_c(n_c) with >=4 pooled")
     p.add_argument("--f-extra-prec", type=float, default=2.0, help="prior precision on f_extra deviations from quadratic")
+    p.add_argument("--presence-phi", action="store_true", help="M2: presence-based category coupling s(S) = sum_c 1(n_c>0) psi_c + sum_j delta_j")
     p.add_argument("--cpp-sampler", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--eval-batch", type=int, default=256)
     p.add_argument("--ll-trips", type=int, default=0)

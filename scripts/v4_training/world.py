@@ -4,7 +4,8 @@ Every nonempty basket of size <= nmax is enumerated, so likelihoods, log Z and p
 exact.  The truth is a Version-4 model (hs.V4 parameters) whose interaction strength -- the top
 eigenvalue of Phi Phi' -- is set to a target (the stress world needs about 7; Version-4's
 quadrature caps it at 1).  Interactions are complements across categories ("missions");
-within-category substitution comes from rho_c (or M1's general count potential f_c(n_c)).
+within-category substitution comes from rho_c (or M1's general count potential f_c(n_c)),
+and cross-category coupling can be count-linear or M2's presence-based coupling.
 Contexts are (household, week): household taste, household price sensitivity, weekly prices.
 """
 from __future__ import annotations
@@ -46,10 +47,10 @@ def partition(J, nmax):
     return Partition(group, nmax)
 
 
-def make_truth(seed, strength, J=18, H=100, W=8, K=3, r=3, nmax=5, use_f_extra=False):
+def make_truth(seed, strength, J=18, H=100, W=8, K=3, r=3, nmax=5, use_f_extra=False, presence_phi=False):
     g = torch.Generator().manual_seed(seed)
     part = partition(J, nmax)
-    t = V4(J, H, K, r, part, requires_grad=False, use_f_extra=use_f_extra)
+    t = V4(J, H, K, r, part, requires_grad=False, use_f_extra=use_f_extra, presence_phi=presence_phi)
     phi = 0.25 * torch.randn(J, r, generator=g)
     for d, items in enumerate(MISSIONS):
         phi[items, d] += 1.0
@@ -74,6 +75,13 @@ def make_truth(seed, strength, J=18, H=100, W=8, K=3, r=3, nmax=5, use_f_extra=F
             f_ext[:len(RHO), 1] = torch.tensor([0.55, 0.0, 0.0, 0.75, 0.0])
             f_ext[:len(RHO), 2] = torch.tensor([0.0, 0.0, 0.0, 1.10, 0.0])
             t.p["f_extra"].copy_(f_ext)
+        if presence_phi:
+            psi = torch.zeros(part.C, r)
+            for c, items in enumerate(part.members):
+                psi[c] = phi[items].mean(dim=0)
+            delta_phi = phi - psi[part.group]
+            t.p["psi"].copy_(psi)
+            t.p["delta_phi"].copy_(delta_phi)
     price = 0.35 * torch.randn(W, J, generator=g)
     return t, price
 
@@ -86,6 +94,9 @@ def energy_table(model: V4, sup: Support, h, price):
     n_c = sup.M @ model.part.onehot
     s = model.basket_s(sup.M)
     diag = sup.M @ phi.square().sum(1)
+    if model.presence_phi:
+        extra_c = (n_c - 1.0).clamp_min(0.0)
+        diag = diag - extra_c @ p["psi"].square().sum(1)
     pair = 0.5 * (s.square().sum(1) - diag)
     rest = pair - cat_count_penalty_matrix(n_c, p["rho_c"], model.f_extra()) - model.rho0()[sup.size - 1]
     return b @ sup.M.T + rest[None, :]

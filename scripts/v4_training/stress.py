@@ -509,7 +509,7 @@ def pseudo_loglik(model, ix, X, r):
     return (lp * valid).sum() / ix.B
 
 
-def penalties(model, args, n_train, r, tied=None):
+def penalties(model, args, n_train, r, tied=None, price_init=None):
     loss = 0.0
     for product, context in ((model.mu, model.delta_c()), (model.zeta, model.xi_c()),
                              (model.alpha, model.theta_c())):
@@ -523,7 +523,13 @@ def penalties(model, args, n_train, r, tied=None):
     extra_prior = 0.0
     if getattr(model, "f_extra", None) is not None:
         extra_prior = args.f_extra_prec * model.f_extra.square().sum()
-    loss = loss + 0.5 * (phi_prior + args.rho_c_prec * model.rho_c.square().sum() + extra_prior) / n_train
+    price_prior = 0.0
+    if price_init is not None:
+        for n, v0 in price_init.items():
+            p = getattr(model, n)
+            if p.requires_grad:
+                price_prior = price_prior + args.price_prec * (p - v0).square().sum()
+    loss = loss + 0.5 * (phi_prior + args.rho_c_prec * model.rho_c.square().sum() + extra_prior + price_prior) / n_train
     return loss
 
 
@@ -606,6 +612,7 @@ def train(args):
     else:
         with torch.no_grad():
             model.phi[:, :r] = args.phi_init * torch.randn(J, r)
+    price_init = {n: getattr(model, n).detach().clone() for n in ("gamma", "beta", "price_kappa", "psi")}
     for n in ("gamma", "beta", "price_kappa", "psi"):
         getattr(model, n).requires_grad_(False)
     base = [getattr(model, n) for n in BASE_NAMES]
@@ -654,7 +661,7 @@ def train(args):
         return float(np.concatenate(lls).mean()), float(np.concatenate(ess_list).mean())
 
     def run_stage(name, epochs, lr_b, lr_l, lr_rho, lr_rho0, lr_phi, step_fn, average, mm_rho=0.0, mm_rho0=0.0, mm_lam=0.0,
-                  monitor_val=False):
+                  monitor_val=False, lr_price=0.0):
         param_groups = [
             {"params": other_base, "lr": lr_b},
             {"params": [model.lam], "lr": lr_l},
@@ -666,6 +673,10 @@ def train(args):
         if getattr(model, "f_extra", None) is not None:
             param_groups.append({"params": [model.f_extra], "lr": 0.2 * lr_rho})
             extra_params.append(model.f_extra)
+        price_params = [getattr(model, n) for n in ("gamma", "beta", "price_kappa", "psi") if getattr(model, n).requires_grad]
+        if price_params and lr_price > 0.0:
+            param_groups.append({"params": price_params, "lr": lr_price})
+            extra_params.extend(price_params)
         opt = torch.optim.Adam(param_groups)
         phi_params = opt.param_groups[4]["params"]
         total = epochs * len(batches)
@@ -684,7 +695,7 @@ def train(args):
                 bt = batches[bi]
                 bt.bind(model)
                 value, extra = step_fn(bt)
-                loss = -value + penalties(model, args, N, r, tied)
+                loss = -value + penalties(model, args, N, r, tied, price_init=price_init)
                 opt.zero_grad(set_to_none=True)
                 if tied is not None:
                     model.phi.grad = None
@@ -793,6 +804,11 @@ def train(args):
                 "stage": "pseudo-likelihood"}, args.out.with_name(args.out.stem + "_pl.pt"))
 
     # stage B: stochastic maximum likelihood with persistent per-trip chains (data-initialized)
+    if args.unfreeze_price:
+        for n in ("gamma", "beta", "price_kappa", "psi"):
+            getattr(model, n).requires_grad_(True)
+    lr_price_sml = args.lr_price if args.unfreeze_price else 0.0
+    lr_price_cal = 0.5 * args.lr_price if args.unfreeze_price else 0.0
     chains = [bt.obs.clone() for bt in batches]
     index = {id(bt): i for i, bt in enumerate(batches)}
 
@@ -811,16 +827,18 @@ def train(args):
         return (e_obs - lz).mean(), (size_chain, float(bt.obs.sum()) / ix.B, cat_pres_b)
 
     run_stage("sml", args.sml_epochs, args.lr_base, lr_lam, args.lr_rho, args.lr_rho0, args.lr_phi_sml, sml_step,
-              average=True, mm_rho=args.mm_rho, mm_rho0=args.mm_rho0, mm_lam=args.mm_lam, monitor_val=True)
+              average=True, mm_rho=args.mm_rho, mm_rho0=args.mm_rho0, mm_lam=args.mm_lam, monitor_val=True,
+              lr_price=lr_price_sml)
     if args.cal_epochs > 0:
         run_stage("calibrate", args.cal_epochs, 0.0, 0.5 * lr_lam, args.lr_rho, args.lr_rho0, 0.0, sml_step,
-                  average=False, mm_rho=args.mm_rho, mm_rho0=args.mm_rho0, mm_lam=args.mm_lam)
+                  average=False, mm_rho=args.mm_rho, mm_rho0=args.mm_rho0, mm_lam=args.mm_lam,
+                  lr_price=lr_price_cal)
     if val_batches:
         v_ll, v_ess = eval_val_ll()
         emit({"event": "final_val", "val_ll": round(v_ll, 4), "val_ess": round(v_ess, 4)})
     torch.save({"model": {k: v.detach().clone() for k, v in model.state_dict().items()}, "rank": r,
                 "use_f_extra": bool(args.f_extra), "presence_phi": bool(args.presence_phi),
-                "cat_rho0": bool(args.cat_rho0),
+                "cat_rho0": bool(args.cat_rho0), "unfreeze_price": bool(args.unfreeze_price),
                 "stage": "sml", "seconds": time.time() - started, "args": {k: str(v) for k, v in vars(args).items()}},
                args.out.with_suffix(".pt"))
     emit({"event": "trained", "seconds": round(time.time() - started, 1)})
@@ -1218,6 +1236,9 @@ def main():
     p.add_argument("--f-extra-prec", type=float, default=2.0, help="prior precision on f_extra deviations from quadratic")
     p.add_argument("--presence-phi", action="store_true", help="M2: presence-based category coupling s(S) = sum_c 1(n_c>0) psi_c + sum_j delta_j")
     p.add_argument("--cat-rho0", action="store_true", help="M3: apply size potential rho_0 to active category count K_cat instead of |S|")
+    p.add_argument("--unfreeze-price", action="store_true", help="T1: unfreeze gamma, beta, price_kappa and psi in SML and calibration stages")
+    p.add_argument("--lr-price", type=float, default=3e-3, help="T1: learning rate for unfrozen price/recency parameters in SML (halved in calibrate)")
+    p.add_argument("--price-prec", type=float, default=2.0, help="T1: prior precision on gamma, beta, price_kappa, psi centred at initial Phi=0 values")
     p.add_argument("--cpp-sampler", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--eval-batch", type=int, default=256)
     p.add_argument("--ll-trips", type=int, default=0)

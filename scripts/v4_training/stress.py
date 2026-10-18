@@ -1090,7 +1090,7 @@ def evaluate(args):
         "vs_certified_phi0_parent": float((ll - ref["exact_parent"][:n]).mean()),
         "is_half_split_abs_mean": float(np.abs(half_diff).mean()), "is_half_split_abs_max": float(np.abs(half_diff).max()),
         "is_ess_fraction_mean": float(ess_all.mean()), "is_ess_fraction_min": float(ess_all.min())}
-    if args.phi0_refit is not None:
+    if args.phi0_refit is not None and str(args.phi0_refit) != "none":
         o = np.load(args.phi0_refit)
         m = dict(zip(o["trips"].tolist(), o["ll"].tolist()))
         d = ll - np.array([m[int(t)] for t in trips])
@@ -1122,6 +1122,14 @@ def evaluate(args):
                             "size_mean_real": float(np.mean([len(x) for x in real])),
                             "size_mean_generated": float(np.mean([len(x) for x in generated]))}
     print(json.dumps(report["classifier"]), flush=True)
+    if args.no_price_scenarios:   # real data (ERIM, Dunnhumby): no causal price truth to score against
+        report["pass_rules"] = {
+            "1_ll_vs_certified_ci_above_0": report["likelihood"]["vs_certified_v4_household_95"][0] > 0,
+            "2_category_auc_le_0.80": report["classifier"]["category_presence_auc"] <= 0.80}
+        report["eval_seconds"] = time.time() - t0
+        args.out.with_name(tag + ".eval.json").write_text(json.dumps(report, indent=1) + "\n")
+        print(json.dumps(report["pass_rules"]), flush=True)
+        return
 
     # 3. price scenarios: base chains give z draws; a changed price reweights them exactly
     #    (p_new(z) / p_base(z) is proportional to Zc_new(z) / Zc_base(z)), Rao-Blackwellized incidence
@@ -1229,6 +1237,8 @@ def main():
     p.add_argument("--phi0-refit", type=Path,
                    default=ROOT.parent / "ebi_v4x/runs/stress/base.per_trip.npz")
     p.add_argument("--world", type=Path, default=ROOT / "data/stress_world")
+    p.add_argument("--no-price-scenarios", action="store_true",
+                   help="skip the price scenarios (real data has no causal truth); pass rules 1-2 only")
     p.add_argument("--out", type=Path, required=True)
     p.add_argument("--checkpoint", type=Path, default=None)
     p.add_argument("--rank", type=int, default=8)

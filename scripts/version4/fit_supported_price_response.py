@@ -93,6 +93,8 @@ def build_complete_exposure_events() -> tuple[pd.DataFrame, dict]:
         weekly = weekly.merge(
             items[["PRODUCT_ID", "item_id"]], on="PRODUCT_ID", how="inner",
             validate="many_to_one")
+        # weeks after the analysis window (Dunnhumby's price file runs one week past it) have no trips
+        weekly = weekly[weekly.WEEK_NO.between(0, n_periods)]
         weekly_price_source = "declared price_week.parquet"
     else:
         daily_price = np.exp(np.load(BI / "log_price.npy").astype(np.float64))

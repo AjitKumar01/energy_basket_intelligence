@@ -64,10 +64,26 @@ def setup(initialization, additive, threads):
     model.load_state_dict(raw["model"])
     with torch.no_grad():
         model.phi.zero_()
+    model.presence_phi = False
     features = Features(int(data["n_item"]), int(data["n_store"]), include_recency=False,
                         include_store_price=True)
     batcher = Batcher(data, features, int(meta["nmax"]), include_recency=False)
     return data, model, meta, batcher
+
+
+def configure_model_from_blob(model, blob):
+    """Attach optional M1 (f_extra) and M2 (psi_cat, presence_phi) parameters from checkpoint blob and load state."""
+    st = blob["model"]
+    if "f_extra" in st and st["f_extra"] is not None:
+        if getattr(model, "f_extra", None) is None:
+            model.f_extra = torch.nn.Parameter(torch.zeros_like(st["f_extra"]))
+    if "psi_cat" in st and st["psi_cat"] is not None:
+        model.presence_phi = bool(blob.get("presence_phi", True))
+        if getattr(model, "psi_cat", None) is None:
+            model.psi_cat = torch.nn.Parameter(torch.zeros_like(st["psi_cat"]))
+    else:
+        model.presence_phi = False
+    model.load_state_dict(st)
 
 
 class Batch:
@@ -103,38 +119,132 @@ def slot_utilities(model, ix, z, r, beta=1.0):
     return u
 
 
+def row_cat_shift(model, ix, z, beta=1.0):
+    """Per-row category presence shift a_row(z) = sqrt(beta) z_b.psi_c - 0.5 beta |psi_c|^2 for M2."""
+    if not getattr(model, "presence_phi", False) or beta == 0.0:
+        return None
+    psi_r = model.psi_cat[ix.row_cat]
+    shift = -0.5 * beta * psi_r.square().sum(-1)
+    if z is not None:
+        shift = shift + math.sqrt(beta) * (z[ix.row_trip] * psi_r).sum(-1)
+    return shift
+
+
 def basket_field(model, ix, X, r):
-    """s = sum of phi over the basket (X: slot mask), B x r."""
+    """s = sum of phi over the basket (or M2 presence-based coupling), B x r."""
+    x = X.double()
     ph = phi_r(model, r)[ix.item]
-    return torch.zeros(ix.B, r).index_add_(0, ix.item_trip, ph * X.double()[:, None])
+    s = torch.zeros(ix.B, r).index_add_(0, ix.item_trip, ph * x[:, None])
+    if getattr(model, "presence_phi", False):
+        nc_row = torch.zeros(ix.n_rows).index_add_(0, ix.row_of, x)
+        extra_row = (nc_row - 1.0).clamp_min(0.0)
+        s = s - torch.zeros(ix.B, r).index_add_(0, ix.row_trip, model.psi_cat[ix.row_cat] * extra_row[:, None])
+    return s
 
 
-def log_zc(model, ix, u):
-    from interaction_particles import differentiable_logz_beta0
-    return differentiable_logz_beta0(model, ix, u)
+def obs_energy(model, bt, r):
+    """Exact energy of observed baskets in batch bt, including optional M1 (f_extra) and M2 (presence_phi)."""
+    e = model.energy(bt.li, bt.lt, bt.lc, bt.ix.B, bt.line_ctx)
+    has_f = getattr(model, "f_extra", None) is not None
+    has_m2 = getattr(model, "presence_phi", False)
+    if not has_f and not has_m2:
+        return e
+    ix = bt.ix
+    nc_row = torch.zeros(ix.n_rows, dtype=e.dtype).index_add_(0, ix.row_of, bt.obs.to(e.dtype))
+    if has_f:
+        fe = model.f_extra[ix.row_cat]
+        pen_row = ((nc_row == 2).to(e.dtype) * fe[:, 0]
+                   + (nc_row == 3).to(e.dtype) * fe[:, 1]
+                   + (nc_row >= 4).to(e.dtype) * fe[:, 2])
+        e = e - torch.zeros(ix.B, dtype=e.dtype).index_add_(0, ix.row_trip, pen_row)
+    if has_m2:
+        ph = phi_r(model, r)
+        v_lin = torch.zeros(ix.B, r, dtype=e.dtype).index_add_(0, bt.lt, ph[bt.li])
+        extra_row = (nc_row - 1.0).clamp_min(0.0)
+        psi_row = model.psi_cat[ix.row_cat]
+        shift_b = torch.zeros(ix.B, r, dtype=e.dtype).index_add_(0, ix.row_trip, psi_row * extra_row[:, None])
+        s_m2 = v_lin - shift_b
+        diag_corr = torch.zeros(ix.B, dtype=e.dtype).index_add_(0, ix.row_trip, extra_row * psi_row.square().sum(-1))
+        e = e + 0.5 * (s_m2.square().sum(-1) - v_lin.square().sum(-1) + diag_corr)
+    return e
+
+
+def log_zc(model, ix, u, z=None, beta=1.0):
+    has_f = getattr(model, "f_extra", None) is not None
+    has_m2 = getattr(model, "presence_phi", False) and beta != 0.0
+    if not has_f and not has_m2:
+        from interaction_particles import differentiable_logz_beta0
+        return differentiable_logz_beta0(model, ix, u)
+    from poly_degree_native import log_poly_tree_degree_native
+    from ragged import esp_log_bucketed, seg_max
+    scale = seg_max(u.unsqueeze(0), ix.item_trip, ix.B)[0]
+    centred = u - scale[ix.item_trip]
+    log_e = esp_log_bucketed(
+        centred.unsqueeze(0), ix.row_of, ix.n_rows, model.R,
+        ix.row_size, ix.item_pos)[0]
+    degree_axis = torch.arange(model.R + 1, dtype=u.dtype, device=u.device)
+    log_g = (log_e - model.rho_c[ix.row_cat].unsqueeze(-1)
+             * model.pair_feature(degree_axis))
+    if has_f:
+        fe = model.f_extra[ix.row_cat]
+        fe_pad = torch.zeros(ix.n_rows, model.R + 1, dtype=u.dtype, device=u.device)
+        if model.R >= 2:
+            fe_pad[:, 2] = fe[:, 0]
+        if model.R >= 3:
+            fe_pad[:, 3] = fe[:, 1]
+        if model.R >= 4:
+            fe_pad[:, 4:] = fe[:, 2:3]
+        log_g = log_g - fe_pad
+    if has_m2:
+        cshift = row_cat_shift(model, ix, z, beta=beta)
+        if cshift is not None:
+            km1 = (degree_axis - 1.0).clamp_min(0.0)
+            log_g = log_g - cshift[:, None] * km1[None, :]
+    category = torch.full((1, ix.B * ix.Cpad, model.R + 1), -float("inf"),
+                          dtype=u.dtype, device=u.device)
+    category[..., 0] = 0.0
+    category = category.index_copy(1, ix.flat_slot, log_g.unsqueeze(0)).view(
+        1, ix.B, ix.Cpad, model.R + 1)
+    degrees = torch.zeros(ix.B * ix.Cpad, dtype=torch.long, device=u.device)
+    degrees[ix.flat_slot] = ix.row_size.clamp(max=model.R)
+    degrees = degrees.view(ix.B, ix.Cpad)
+    slope = (category[..., 1:] / degree_axis[1:]).amax(
+        dim=(2, 3)).clamp_min(0.0)
+    tilted = category - slope[:, :, None, None] * degree_axis
+    log_a = log_poly_tree_degree_native(
+        tilted.contiguous(), degrees.contiguous(), model.nmax)
+    log_a = log_a + slope.unsqueeze(-1) * degree_axis
+    size_axis = torch.arange(log_a.shape[-1], dtype=u.dtype, device=u.device)
+    log_size = (log_a[0] + size_axis * scale.unsqueeze(-1)
+                - model.rho_0()[:log_a.shape[-1]])[:, 1:]
+    return torch.logsumexp(log_size, dim=-1)
 
 
 # ---- exact vectorized sampler of S | u -------------------------------------------------------
 @torch.no_grad()
-def sample_slots(model, ix, u, gen, use_cpp: bool | None = None):
+def sample_slots(model, ix, u, gen, use_cpp: bool | None = None, z=None, beta=1.0):
     """One exact draw per trip from the additive Version-4 law at slot utilities u (category
-    penalty rho_c, size potential rho_0, 1 <= |S| <= nmax).  Returns a slot mask."""
+    penalty rho_c + f_extra, M2 category presence shift, size potential rho_0, 1 <= |S| <= nmax)."""
     B, nmax = ix.B, model.nmax
     L = int(ix.row_size.max())
     K = min(model.R, L, nmax)
+    cshift = row_cat_shift(model, ix, z, beta=beta)
     if USE_CPP_SAMPLER if use_cpp is None else use_cpp:
         from build_stress_sampler import load_stress_sampler
         T = len(ix.item)
         u_c = u.detach().contiguous()
         rho_c = model.rho_c.detach().contiguous()
         rho_0 = model.rho_0().detach().contiguous()
+        fe_c = model.f_extra.detach().contiguous() if getattr(model, "f_extra", None) is not None else None
+        cs_c = cshift.detach().contiguous() if cshift is not None else None
+        fe_ptr = fe_c.data_ptr() if fe_c is not None else 0
         seed = int(torch.randint(1, 2**62, (1,), generator=gen).item())
         out = torch.empty(T, dtype=torch.uint8)
         rc = load_stress_sampler().sample_slots_cpp(
             B, ix.n_rows, T, ix.Cpad, K, nmax, seed,
             u_c.data_ptr(), ix.row_of.data_ptr(), ix.item_pos.data_ptr(),
             ix.row_size.data_ptr(), ix.row_cat.data_ptr(), ix.flat_slot.data_ptr(),
-            rho_c.data_ptr(), rho_0.data_ptr(), out.data_ptr())
+            rho_c.data_ptr(), rho_0.data_ptr(), fe_ptr, out.data_ptr())
         if rc != 0:
             raise RuntimeError(f"native sample_slots_cpp failed with status {rc}")
         return out.bool()
@@ -152,6 +262,19 @@ def sample_slots(model, ix, u, gen, use_cpp: bool | None = None):
         E.append(e)
     k_axis = torch.arange(K + 1, dtype=u.dtype)
     g = e - model.rho_c[ix.row_cat][:, None] * model.pair_feature(k_axis)[None, :]
+    if getattr(model, "f_extra", None) is not None:
+        fe = model.f_extra[ix.row_cat]
+        fe_pad = torch.zeros(ix.n_rows, K + 1, dtype=u.dtype)
+        if K >= 2:
+            fe_pad[:, 2] = fe[:, 0]
+        if K >= 3:
+            fe_pad[:, 3] = fe[:, 1]
+        if K >= 4:
+            fe_pad[:, 4:] = fe[:, 2:3]
+        g = g - fe_pad
+    if cshift is not None:
+        km1 = (k_axis - 1.0).clamp_min(0.0)
+        g = g - cshift[:, None] * km1[None, :]
     G = torch.full((B * ix.Cpad, K + 1), NEG)
     G[:, 0] = 0.0
     G[ix.flat_slot] = g
@@ -205,6 +328,9 @@ def gibbs(model, ix, X, r, gen, sweeps=1, beta=1.0, use_cpp: bool | None = None)
         b_base = (model.b_flat(ix).detach() - 0.5 * beta * ph.square().sum(-1)).contiguous()
         rho_c = model.rho_c.detach().contiguous()
         rho_0 = model.rho_0().detach().contiguous()
+        fe_c = model.f_extra.detach().contiguous() if getattr(model, "f_extra", None) is not None else None
+        psi_c = model.psi_cat.detach().contiguous() if getattr(model, "presence_phi", False) else None
+        fe_ptr = fe_c.data_ptr() if fe_c is not None else 0
         seed = int(torch.randint(1, 2**62, (1,), generator=gen).item())
         mask = X.to(torch.uint8).contiguous().clone()
         rc = load_stress_sampler().gibbs_sweeps_cpp(
@@ -212,27 +338,46 @@ def gibbs(model, ix, X, r, gen, sweeps=1, beta=1.0, use_cpp: bool | None = None)
             b_base.data_ptr(), ph.data_ptr(), ix.item_trip.data_ptr(), ix.row_of.data_ptr(),
             ix.item_pos.data_ptr(), ix.row_size.data_ptr(), ix.row_cat.data_ptr(),
             ix.row_trip.data_ptr(), ix.flat_slot.data_ptr(), rho_c.data_ptr(),
-            rho_0.data_ptr(), mask.data_ptr())
+            rho_0.data_ptr(), fe_ptr, mask.data_ptr())
         if rc != 0:
             raise RuntimeError(f"native gibbs_sweeps_cpp failed with status {rc}")
         return mask.bool()
     for _ in range(sweeps):
         z = basket_field(model, ix, X, r) + torch.randn(ix.B, r, generator=gen)
-        X = sample_slots(model, ix, slot_utilities(model, ix, z, r, beta), gen, use_cpp=False)
+        X = sample_slots(model, ix, slot_utilities(model, ix, z, r, beta), gen, use_cpp=False, z=z, beta=beta)
     return X
 
 
 # ---- objectives -------------------------------------------------------------------------------
 def pseudo_loglik(model, ix, X, r):
-    """Mean over trips of sum_j log P(x_j | rest) (exact Version-4 conditionals)."""
+    """Mean over trips of sum_j log P(x_j | rest) (exact conditionals including M1/M2)."""
     x = X.double()
     ph = phi_r(model, r)[ix.item]
-    s = torch.zeros(ix.B, r).index_add(0, ix.item_trip, ph * x[:, None])
-    pair = (ph * s[ix.item_trip]).sum(-1) - x * ph.square().sum(-1)
     n_row = torch.zeros(ix.n_rows).index_add(0, ix.row_of, x)
     nc_wo = n_row[ix.row_of] - x
+    slot_cat = ix.row_cat[ix.row_of]
+    if getattr(model, "presence_phi", False):
+        s = basket_field(model, ix, X, r)
+        psi_slot = model.psi_cat[slot_cat]
+        dlt_slot = ph - psi_slot
+        has_other = (nc_wo >= 1.0).double()
+        eff_vec = torch.where(has_other[:, None] > 0.5, dlt_slot, ph)
+        self_sub = torch.where(has_other > 0.5, dlt_slot.square().sum(-1), ph.square().sum(-1))
+        s_wo = s[ix.item_trip] - x[:, None] * eff_vec
+        pair = (eff_vec * s_wo).sum(-1) - has_other * (psi_slot * dlt_slot).sum(-1)
+    else:
+        s = torch.zeros(ix.B, r).index_add(0, ix.item_trip, ph * x[:, None])
+        pair = (ph * s[ix.item_trip]).sum(-1) - x * ph.square().sum(-1)
     pf = model.pair_feature
-    dcat = model.rho_c[ix.row_cat[ix.row_of]] * (pf(nc_wo + 1) - pf(nc_wo))
+    dcat = model.rho_c[slot_cat] * (pf(nc_wo + 1) - pf(nc_wo))
+    if getattr(model, "f_extra", None) is not None:
+        fe_slot = model.f_extra[slot_cat]
+        dfe = (
+            (nc_wo == 1).double() * fe_slot[:, 0]
+            + (nc_wo == 2).double() * (fe_slot[:, 1] - fe_slot[:, 0])
+            + (nc_wo == 3).double() * (fe_slot[:, 2] - fe_slot[:, 1])
+        )
+        dcat = dcat + dfe
     n_trip = torch.zeros(ix.B).index_add(0, ix.item_trip, x)
     n_wo = (n_trip[ix.item_trip] - x).long()
     rho0 = model.rho_0()
@@ -254,7 +399,10 @@ def penalties(model, args, n_train, r, tied=None):
     else:                       # phi_j = psi_c(j) + delta_j: category vector plus a shrunk product deviation
         psi, dlt, _ = tied
         phi_prior = args.phi_prec * psi.square().sum() + args.delta_prec * dlt.square().sum()
-    loss = loss + 0.5 * (phi_prior + args.rho_c_prec * model.rho_c.square().sum()) / n_train
+    extra_prior = 0.0
+    if getattr(model, "f_extra", None) is not None:
+        extra_prior = args.f_extra_prec * model.f_extra.square().sum()
+    loss = loss + 0.5 * (phi_prior + args.rho_c_prec * model.rho_c.square().sum() + extra_prior) / n_train
     return loss
 
 
@@ -268,6 +416,11 @@ def project(model, caps, optimizer, r):
         model.phi[:, r:] = 0.0
     model.project_rho_c(-1.5)
     project_category_reward_(model, caps, 1.5, optimizer=optimizer)
+    if getattr(model, "f_extra", None) is not None:
+        with torch.no_grad():
+            mult = torch.tensor([1.0, 3.0, 6.0], dtype=model.rho_c.dtype, device=model.rho_c.device)
+            floor_fe = -1.5 - model.rho_c[:, None] * mult[None, :]
+            model.f_extra.copy_(torch.maximum(model.f_extra, floor_fe))
 
 
 # ---- train ------------------------------------------------------------------------------------
@@ -300,10 +453,13 @@ def train(args):
           "batches": len(batches), "batching_seconds": round(time.time() - t0, 1),
           "args": {k: str(v) for k, v in vars(args).items()}})
     torch.manual_seed(args.seed)
+    if args.f_extra:
+        model.register_parameter("f_extra", torch.nn.Parameter(torch.zeros(C, 3)))
     tied = None
     if args.tie_phi:
         cat = model.cat_of.long()
-        psi = (args.phi_init * torch.randn(C, r)).requires_grad_(True)
+        psi_init = args.phi_init * torch.randn(C, r)
+        psi = psi_init.requires_grad_(True)
         dlt = torch.zeros(J, r, requires_grad=True)
         tied = (psi, dlt, cat)
         with torch.no_grad():
@@ -350,20 +506,25 @@ def train(args):
         for vbt in val_batches:
             vbt.bind(model)
             est, _, ess, _ = is_log_z(model, vbt, r, vgen, burn=80, components=32, thin=2, draws=256)
-            e = model.energy(vbt.li, vbt.lt, vbt.lc, vbt.ix.B, vbt.line_ctx)
+            e = obs_energy(model, vbt, r)
             lls.append((e - est).numpy())
             ess_list.append(ess.numpy())
         return float(np.concatenate(lls).mean()), float(np.concatenate(ess_list).mean())
 
     def run_stage(name, epochs, lr_b, lr_l, lr_rho, lr_rho0, lr_phi, step_fn, average, mm_rho=0.0, mm_rho0=0.0, mm_lam=0.0,
                   monitor_val=False):
-        opt = torch.optim.Adam([
+        param_groups = [
             {"params": other_base, "lr": lr_b},
             {"params": [model.lam], "lr": lr_l},
             {"params": [model.rho_c], "lr": lr_rho},
             {"params": [model.rho_0_free], "lr": lr_rho0},
             {"params": [model.phi] if tied is None else [tied[0], tied[1]], "lr": lr_phi},
-        ])
+        ]
+        extra_params = []
+        if getattr(model, "f_extra", None) is not None:
+            param_groups.append({"params": [model.f_extra], "lr": 0.2 * lr_rho})
+            extra_params.append(model.f_extra)
+        opt = torch.optim.Adam(param_groups)
         phi_params = opt.param_groups[4]["params"]
         total = epochs * len(batches)
         decay = (args.lr_final_ratio) ** (1.0 / max(total - 1, 1))
@@ -398,7 +559,7 @@ def train(args):
                 g_r0_sum.add_(g_r0)
                 g_rc_sum.add_(g_rc)
                 g_lam_sum.add_(g_lam)
-                torch.nn.utils.clip_grad_norm_(base + list(phi_params), 10.0)
+                torch.nn.utils.clip_grad_norm_(base + extra_params + list(phi_params), 10.0)
                 opt.step()
                 if tied is not None:
                     with torch.no_grad():
@@ -485,6 +646,7 @@ def train(args):
     run_stage("pseudo-likelihood", args.pl_epochs, args.lr_base, lr_lam, args.lr_rho, args.lr_rho0, args.lr_phi_pl,
               lambda bt: (pseudo_loglik(model, bt.ix, bt.obs, r), None), average=False)
     torch.save({"model": {k: v.detach().clone() for k, v in model.state_dict().items()}, "rank": r,
+                "use_f_extra": bool(args.f_extra), "presence_phi": False,
                 "stage": "pseudo-likelihood"}, args.out.with_name(args.out.stem + "_pl.pt"))
 
     # stage B: stochastic maximum likelihood with persistent per-trip chains (data-initialized)
@@ -500,8 +662,8 @@ def train(args):
             z = basket_field(model, ix, X, r) + torch.randn(ix.B, r, generator=gen)
             nc_mod = torch.zeros(ix.n_rows).index_add_(0, ix.row_of, X.double())
             cat_pres_b = torch.zeros(C).index_add_(0, ix.row_cat, (nc_mod > 0).double())
-        e_obs = model.energy(bt.li, bt.lt, bt.lc, ix.B, bt.line_ctx)
-        lz = log_zc(model, ix, slot_utilities(model, ix, z, r))
+        e_obs = obs_energy(model, bt, r)
+        lz = log_zc(model, ix, slot_utilities(model, ix, z, r), z=z)
         size_chain = float(torch.zeros(ix.B).index_add_(0, ix.item_trip, X.double()).mean())
         return (e_obs - lz).mean(), (size_chain, float(bt.obs.sum()) / ix.B, cat_pres_b)
 
@@ -514,6 +676,7 @@ def train(args):
         v_ll, v_ess = eval_val_ll()
         emit({"event": "final_val", "val_ll": round(v_ll, 4), "val_ess": round(v_ess, 4)})
     torch.save({"model": {k: v.detach().clone() for k, v in model.state_dict().items()}, "rank": r,
+                "use_f_extra": bool(args.f_extra), "presence_phi": False,
                 "stage": "sml", "seconds": time.time() - started, "args": {k: str(v) for k, v in vars(args).items()}},
                args.out.with_suffix(".pt"))
     emit({"event": "trained", "seconds": round(time.time() - started, 1)})
@@ -524,7 +687,7 @@ def train(args):
 def is_log_z_orig(model, bt, r, gen, burn, components, thin, draws, defensive=0.1):
     """Original single-chain importance-sampled log Z per trip."""
     ix = bt.ix
-    X = sample_slots(model, ix, slot_utilities(model, ix, None, r, beta=0.0), gen)
+    X = sample_slots(model, ix, slot_utilities(model, ix, None, r, beta=0.0), gen, beta=0.0)
     X = gibbs(model, ix, X, r, gen, sweeps=burn)
     centres = []
     for k in range(components * thin):
@@ -544,7 +707,7 @@ def is_log_z_orig(model, bt, r, gen, burn, components, thin, draws, defensive=0.
         comp = -0.5 * (z[:, None, :] - centres).square().sum(2) - half
         lq = torch.logaddexp(math.log1p(-defensive) + torch.logsumexp(comp, 1) - math.log(Kc),
                              math.log(defensive) + lp)
-        log_w.append(lp + log_zc(model, ix, slot_utilities(model, ix, z, r)) - lq)
+        log_w.append(lp + log_zc(model, ix, slot_utilities(model, ix, z, r), z=z) - lq)
     log_w = torch.stack(log_w, 1)
     est = torch.logsumexp(log_w, 1) - math.log(draws)
     h = draws // 2
@@ -569,7 +732,7 @@ def is_log_z(model, bt, r, gen, burn, components, thin, draws, defensive=0.1):
     log_det_def = sig_def.log().sum()
 
     # Chain 0: exact standard burn-in from beta=0 so returned X has unchanged law for classifier test
-    X = sample_slots(model, ix, slot_utilities(model, ix, None, r, beta=0.0), gen)
+    X = sample_slots(model, ix, slot_utilities(model, ix, None, r, beta=0.0), gen, beta=0.0)
     X = gibbs(model, ix, X, r, gen, sweeps=burn)
     centres = []
     n_ch = 4
@@ -590,13 +753,14 @@ def is_log_z(model, bt, r, gen, burn, components, thin, draws, defensive=0.1):
     t_sweeps = max(burn // 8, 25)
     for ch in range(1, n_ch):
         if ch == 1:
-            Xc = sample_slots(model, ix, slot_utilities(model, ix, torch.zeros(B, r), r, beta=1.0), gen)
+            z0 = torch.zeros(B, r)
+            Xc = sample_slots(model, ix, slot_utilities(model, ix, z0, r, beta=1.0), gen, z=z0, beta=1.0)
         elif ch in (2, 3) and float(sv[0]) > 1.0:
             sgn = 1.0 if ch == 2 else -1.0
             z_seed = (sgn * 1.5 * sv[0] * Vt[0])[None, :].expand(B, r)
-            Xc = sample_slots(model, ix, slot_utilities(model, ix, z_seed, r, beta=1.0), gen)
+            Xc = sample_slots(model, ix, slot_utilities(model, ix, z_seed, r, beta=1.0), gen, z=z_seed, beta=1.0)
         else:
-            Xc = sample_slots(model, ix, slot_utilities(model, ix, None, r, beta=0.0), gen)
+            Xc = sample_slots(model, ix, slot_utilities(model, ix, None, r, beta=0.0), gen, beta=0.0)
         for b_temp in (0.25, 0.5, 0.75, 1.0):
             Xc = gibbs(model, ix, Xc, r, gen, sweeps=t_sweeps, beta=b_temp)
         for k in range(k_per_ch * thin_c):
@@ -643,8 +807,9 @@ def is_log_z(model, bt, r, gen, burn, components, thin, draws, defensive=0.1):
     u0_slot = model.b_flat(ix) - 0.5 * ph_slot.square().sum(-1)
     lzc_list = []
     for d_idx in range(draws):
-        u_d = u0_slot + (z_all[:, d_idx][ix.item_trip] * ph_slot).sum(-1)
-        lzc_list.append(log_zc(model, ix, u_d))
+        z_d = z_all[:, d_idx]
+        u_d = u0_slot + (z_d[ix.item_trip] * ph_slot).sum(-1)
+        lzc_list.append(log_zc(model, ix, u_d, z=z_d))
     log_w = lp_all + torch.stack(lzc_list, 1) - lq_all
     est = torch.logsumexp(log_w, 1) - math.log(draws)
     est_a = torch.logsumexp(log_w[:, :h], 1) - math.log(h)
@@ -692,7 +857,7 @@ def evaluate(args):
     data, model, meta, batcher = setup(args.initialization, args.additive, args.threads)
     blob = torch.load(args.out.with_suffix(".pt") if args.checkpoint is None else args.checkpoint,
                       map_location="cpu", weights_only=False)
-    model.load_state_dict(blob["model"])
+    configure_model_from_blob(model, blob)
     model.eval()
     for q in model.parameters():
         q.requires_grad_(False)
@@ -704,7 +869,9 @@ def evaluate(args):
     tag = args.out.stem if args.checkpoint is None else Path(args.checkpoint).stem
     report = {"checkpoint": str(args.checkpoint or args.out.with_suffix(".pt")),
               "phi_eigenvalues": (torch.linalg.svdvals(phi_r(model, r)) ** 2).tolist(),
-              "rho_c_min": float(model.rho_c.min())}
+              "rho_c_min": float(model.rho_c.min()),
+              "use_f_extra": getattr(model, "f_extra", None) is not None,
+              "presence_phi": bool(getattr(model, "presence_phi", False))}
     t0 = time.time()
 
     # 1. held-out log-likelihood on the certified reference trips
@@ -717,7 +884,7 @@ def evaluate(args):
         bt = Batch(batcher, trips[s:s + args.eval_batch], J)
         bt.bind(model)
         est, dhalf, ess, X = is_log_z(model, bt, r, gen, args.burn, args.components, args.thin, args.draws)
-        e = model.energy(bt.li, bt.lt, bt.lc, bt.ix.B, bt.line_ctx)
+        e = obs_energy(model, bt, r)
         ll.append((e - est).numpy()); half_diff.append(dhalf.numpy()); ess_all.append(ess.numpy())
         items = bt.ix.item.numpy(); xt = bt.ix.item_trip.numpy(); Xn = X.numpy()
         for b, t in enumerate(bt.trips):
@@ -755,7 +922,7 @@ def evaluate(args):
             continue
         bt = Batch(batcher, part, J)
         bt.bind(model)
-        X = sample_slots(model, bt.ix, slot_utilities(model, bt.ix, None, r, beta=0.0), gen)
+        X = sample_slots(model, bt.ix, slot_utilities(model, bt.ix, None, r, beta=0.0), gen, beta=0.0)
         X = gibbs(model, bt.ix, X, r, gen, sweeps=args.burn).numpy()
         items, xt = bt.ix.item.numpy(), bt.ix.item_trip.numpy()
         generated += [np.sort(items[X & (xt == b)]) for b in range(len(part))]
@@ -783,7 +950,7 @@ def evaluate(args):
     for s in range(0, len(rows), args.eval_batch):
         bt = Batch(batcher, rows[s:s + args.eval_batch], J)
         bt.bind(model)
-        X = sample_slots(model, bt.ix, slot_utilities(model, bt.ix, None, r, beta=0.0), gen)
+        X = sample_slots(model, bt.ix, slot_utilities(model, bt.ix, None, r, beta=0.0), gen, beta=0.0)
         X = gibbs(model, bt.ix, X, r, gen, sweeps=args.burn)
         zs = []
         for k in range(args.scenario_draws * args.thin):
@@ -805,12 +972,12 @@ def evaluate(args):
                 bt.bind(model, ctx)
                 u = slot_utilities(model, ix, z, r).detach().requires_grad_(True)
                 with torch.enable_grad():
-                    lz = log_zc(model, ix, u)
+                    lz = log_zc(model, ix, u, z=z)
                     g, = torch.autograd.grad(lz.sum(), u)
                 lzs.append(lz.detach()); grads.append(g)
                 if product is not None:
                     bt.bind(model)
-                    lzb.append(log_zc(model, ix, slot_utilities(model, ix, z, r)))
+                    lzb.append(log_zc(model, ix, slot_utilities(model, ix, z, r), z=z))
             lzs = torch.stack(lzs, 1)                                # B x K
             logw = (lzs - torch.stack(lzb, 1)) if product is not None else torch.zeros_like(lzs)
             w = torch.softmax(logw, 1)                               # per-trip self-normalized weights
@@ -902,6 +1069,8 @@ def main():
     p.add_argument("--rho-c-prec", type=float, default=0.2)
     p.add_argument("--tie-phi", action="store_true", help="phi_j = psi_category(j) + delta_j")
     p.add_argument("--delta-prec", type=float, default=200.0, help="prior precision on delta (with --tie-phi)")
+    p.add_argument("--f-extra", action="store_true", help="M1: free per-category count potential f_c(n_c) with >=4 pooled")
+    p.add_argument("--f-extra-prec", type=float, default=2.0, help="prior precision on f_extra deviations from quadratic")
     p.add_argument("--cpp-sampler", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--eval-batch", type=int, default=256)
     p.add_argument("--ll-trips", type=int, default=0)

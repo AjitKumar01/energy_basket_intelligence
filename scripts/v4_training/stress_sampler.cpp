@@ -28,6 +28,14 @@ struct SplitMix64 {
     }
 };
 
+inline double extra_count_pen(const double* f_extra, int64_t c, int64_t k) {
+    if (!f_extra || k < 2) return 0.0;
+    const double* fe = &f_extra[c * 3];
+    if (k == 2) return fe[0];
+    if (k == 3) return fe[1];
+    return fe[2];
+}
+
 }  // namespace
 
 extern "C" int sample_slots_cpp(
@@ -46,6 +54,7 @@ extern "C" int sample_slots_cpp(
     const int64_t* flat_slot,
     const double* rho_c,
     const double* rho_0,
+    const double* f_extra,
     uint8_t* out_mask
 ) {
     const double neg_inf = -1.0 / 0.0;
@@ -93,12 +102,14 @@ extern "C" int sample_slots_cpp(
         }
         int64_t fslot = flat_slot[r];
         slot_row[fslot] = r;
-        double rc = rho_c[row_cat[r]];
+        int64_t cat = row_cat[r];
+        double rc = rho_c[cat];
         double* g_ptr = &G[fslot * K1];
         g_ptr[0] = 0.0;
         for (int64_t k = 1; k <= Kr; ++k) {
+            double pen = rc * (0.5 * k * (k - 1)) + extra_count_pen(f_extra, cat, k);
             g_ptr[k] = (e_cur[k] > 0.0)
-                           ? (std::log(e_cur[k]) + k * rmax - rc * (0.5 * k * (k - 1)))
+                           ? (std::log(e_cur[k]) + k * rmax - pen)
                            : neg_inf;
         }
     }
@@ -275,6 +286,7 @@ extern "C" int gibbs_sweeps_cpp(
     const int64_t* flat_slot,
     const double* rho_c,
     const double* rho_0,
+    const double* f_extra,
     uint8_t* mask
 ) {
     const double neg_inf = -1.0 / 0.0;
@@ -367,12 +379,14 @@ extern "C" int gibbs_sweeps_cpp(
                 }
             }
             int64_t fslot = flat_slot[r];
-            double rc = rho_c[row_cat[r]];
+            int64_t cat = row_cat[r];
+            double rc = rho_c[cat];
             double* g_ptr = &G[fslot * K1];
             g_ptr[0] = 0.0;
             for (int64_t k = 1; k <= Kr; ++k) {
-                g_ptr[k] = (e_cur[k] > 0.0)
-                               ? (std::log(e_cur[k]) + k * rmax - rc * (0.5 * k * (k - 1)))
+                double pen = rc * (0.5 * k * (k - 1)) + extra_count_pen(f_extra, cat, k);
+                    g_ptr[k] = (e_cur[k] > 0.0)
+                               ? (std::log(e_cur[k]) + k * rmax - pen)
                                : neg_inf;
             }
         }
@@ -483,8 +497,9 @@ extern "C" int gibbs_sweeps_cpp(
         if (last_sw) std::fill(mask, mask + T, 0);
 
         for (int64_t r = 0; r < n_rows; ++r) {
-            int64_t need = need_row[r];
-            if (need <= 0) continue;
+            int64_t need_orig = need_row[r];
+            if (need_orig <= 0) continue;
+            int64_t need = need_orig;
             int64_t len = row_size[r];
             int64_t base = row_start[r];
             double* sb = &s[row_trip[r] * rank];
@@ -495,46 +510,46 @@ extern "C" int gibbs_sweeps_cpp(
                     for (int64_t d = 0; d < rank; ++d) sb[d] += po[d];
                     if (last_sw) mask[slot_at[idx]] = 1;
                 }
-                continue;
-            }
-            int64_t Kr = need;
-            int64_t stride = Kr + 1;
-            E_row.assign((len + 1) * stride, 0.0);
-            E_row[0] = 1.0;
-            for (int64_t p = 0; p < len; ++p) {
-                double we = We[base + p];
-                const double* ep = &E_row[p * stride];
-                double* en = &E_row[(p + 1) * stride];
-                en[0] = 1.0;
-                int64_t hi = std::min(p + 1, Kr);
-                for (int64_t k = 1; k <= hi; ++k) {
-                    en[k] = ep[k] + ep[k - 1] * we;
-                }
-            }
-            for (int64_t p = len - 1; p >= 0 && need > 0; --p) {
-                int64_t idx = base + p;
-                if (p + 1 == need) {
-                    for (int64_t q = 0; q <= p; ++q) {
-                        int64_t iq = base + q;
-                        const double* po = &phi_ord[iq * rank];
-                        for (int64_t d = 0; d < rank; ++d) sb[d] += po[d];
-                        if (last_sw) mask[slot_at[iq]] = 1;
+            } else {
+                int64_t Kr = need;
+                int64_t stride = Kr + 1;
+                E_row.assign((len + 1) * stride, 0.0);
+                E_row[0] = 1.0;
+                for (int64_t p = 0; p < len; ++p) {
+                    double we = We[base + p];
+                    const double* ep = &E_row[p * stride];
+                    double* en = &E_row[(p + 1) * stride];
+                    en[0] = 1.0;
+                    int64_t hi = std::min(p + 1, Kr);
+                    for (int64_t k = 1; k <= hi; ++k) {
+                        en[k] = ep[k] + ep[k - 1] * we;
                     }
-                    need = 0;
-                    break;
                 }
-                double we = We[idx];
-                double num = we * E_row[p * stride + (need - 1)];
-                double den = E_row[(p + 1) * stride + need];
-                double prob = (den > 0.0) ? std::min(1.0, num / den) : 0.0;
-                if (rng.uniform() < prob) {
-                    const double* po = &phi_ord[idx * rank];
-                    for (int64_t d = 0; d < rank; ++d) sb[d] += po[d];
-                    if (last_sw) mask[slot_at[idx]] = 1;
-                    need -= 1;
+                for (int64_t p = len - 1; p >= 0 && need > 0; --p) {
+                    int64_t idx = base + p;
+                    if (p + 1 == need) {
+                        for (int64_t q = 0; q <= p; ++q) {
+                            int64_t iq = base + q;
+                            const double* po = &phi_ord[iq * rank];
+                            for (int64_t d = 0; d < rank; ++d) sb[d] += po[d];
+                            if (last_sw) mask[slot_at[iq]] = 1;
+                        }
+                        need = 0;
+                        break;
+                    }
+                    double we = We[idx];
+                    double num = we * E_row[p * stride + (need - 1)];
+                    double den = E_row[(p + 1) * stride + need];
+                    double prob = (den > 0.0) ? std::min(1.0, num / den) : 0.0;
+                    if (rng.uniform() < prob) {
+                        const double* po = &phi_ord[idx * rank];
+                        for (int64_t d = 0; d < rank; ++d) sb[d] += po[d];
+                        if (last_sw) mask[slot_at[idx]] = 1;
+                        need -= 1;
+                    }
                 }
+                if (need != 0) return -2;
             }
-            if (need != 0) return -2;
         }
     }
     return 0;

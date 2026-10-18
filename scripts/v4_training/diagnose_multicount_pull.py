@@ -162,7 +162,7 @@ def main():
     t0 = time.time()
     data, model, meta, batcher = setup(args.initialization, args.additive, args.threads)
     blob = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
-    model.load_state_dict(blob["model"])
+    stress.configure_model_from_blob(model, blob)
     model.eval()
     for q in model.parameters():
         q.requires_grad_(False)
@@ -188,7 +188,7 @@ def main():
     with torch.no_grad():
         for bt in batches:
             bt.bind(model)
-            X_mod = sample_slots(model, bt.ix, slot_utilities(model, bt.ix, None, r, beta=0.0), gen)
+            X_mod = sample_slots(model, bt.ix, slot_utilities(model, bt.ix, None, r, beta=0.0), gen, beta=0.0)
             X_mod = gibbs(model, bt.ix, X_mod, r, gen, sweeps=args.burn)
             for mask, dest in ((bt.obs, nc_real_list), (X_mod, nc_mod_list)):
                 nc_row = torch.zeros(bt.ix.n_rows).index_add_(0, bt.ix.row_of, mask.double())

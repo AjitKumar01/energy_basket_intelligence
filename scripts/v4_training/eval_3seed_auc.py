@@ -43,10 +43,7 @@ def main():
     stress.USE_CPP_SAMPLER = True
     data, model, meta, batcher = setup(args.initialization, args.additive, args.threads)
     blob = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
-    if hasattr(stress, "load_checkpoint_into_model"):
-        stress.load_checkpoint_into_model(model, blob)
-    else:
-        model.load_state_dict(blob["model"])
+    stress.configure_model_from_blob(model, blob)
     model.eval()
     for q in model.parameters():
         q.requires_grad_(False)
@@ -69,7 +66,7 @@ def main():
         with torch.no_grad():
             for bt in test_batches:
                 bt.bind(model)
-                X = sample_slots(model, bt.ix, slot_utilities(model, bt.ix, None, r, beta=0.0), gen)
+                X = sample_slots(model, bt.ix, slot_utilities(model, bt.ix, None, r, beta=0.0), gen, beta=0.0)
                 X = gibbs(model, bt.ix, X, r, gen, sweeps=args.burn).numpy()
                 items, xt = bt.ix.item.numpy(), bt.ix.item_trip.numpy()
                 generated += [np.sort(items[X & (xt == b)]) for b in range(len(bt.trips))]

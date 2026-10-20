@@ -41,13 +41,14 @@ def main():
     p.add_argument("--out", type=Path, required=True)
     p.add_argument("--set", nargs="*", default=[], metavar="KEY=VALUE", help="argument overrides (stress.py names)")
     p.add_argument("--skip-train", action="store_true")
+    p.add_argument("--skip-eval", action="store_true", help="train only (choose on validation before opening test)")
     a = p.parse_args()
     start = next(json.loads(line) for line in a.log.open() if '"event": "start"' in line)
     args = dict(start["args"])
     for item in a.set:
         k, v = item.split("=", 1)
         args[k.replace("-", "_")] = v
-    for command in (() if a.skip_train else ("train",)) + ("eval",):
+    for command in (() if a.skip_train else ("train",)) + (() if a.skip_eval else ("eval",)):
         cmd = [sys.executable, "-u", "-W", "ignore", str(HERE / "stress.py"), command, "--out", str(a.out)] + cli(args)
         print(json.dumps({"event": "run", "command": command, "argv": cmd[4:]}), flush=True)
         subprocess.run(cmd, check=True)

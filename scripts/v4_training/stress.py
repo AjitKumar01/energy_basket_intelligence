@@ -55,7 +55,68 @@ sys.modules.setdefault("stress", sys.modules[__name__])
 
 
 # ---- setup ------------------------------------------------------------------------------------
-def setup(initialization, additive, threads):
+class PurchaseHistory:
+    """Product-level purchase history strictly before each trip's day, from the observed baskets.
+
+    Three features per (household, product, day), all from earlier trips of the same household:
+      ever    the household bought this product before
+      last    this product was in the household's most recent purchase of its category
+      decay   exp(-days since the household last bought this product / 28)
+    Keys pack (group, day) as group * 1024 + day, so a strictly-before lookup is one searchsorted,
+    as in Features.recency.  They are fixed data: they shift b linearly and leave the normaliser exact.
+    """
+
+    STRIDE = 1024
+
+    def __init__(self, data):
+        J, C = int(data["n_item"]), int(data["n_cat"])
+        line_trip = np.repeat(np.arange(len(data["trip_user"])), np.diff(data["line_ptr"]))
+        user = data["trip_user"][line_trip].astype(np.int64)
+        day = data["trip_day"][line_trip].astype(np.int64)
+        if int(day.max()) >= self.STRIDE:
+            raise RuntimeError("trip days exceed the purchase-history key stride")
+        item = data["line_item"].astype(np.int64)
+        cat = data["line_cat"].astype(np.int64)
+        self.J, self.C = J, C
+        self.item_keys = torch.from_numpy(np.unique((user * J + item) * self.STRIDE + day))
+        self.cat_keys = torch.from_numpy(np.unique((user * C + cat) * self.STRIDE + day))
+
+    @staticmethod
+    def _previous(keys, group, day, stride):
+        idx = torch.searchsorted(keys, group * stride + day)
+        prev = keys[(idx - 1).clamp(min=0)]
+        return (idx > 0) & (torch.div(prev, stride, rounding_mode="floor") == group), prev % stride
+
+    def features(self, item, cat, user, day):
+        S = self.STRIDE
+        item, cat, user, day = item.long(), cat.long(), user.long(), day.long()
+        g_item = user * self.J + item
+        seen, last_item_day = self._previous(self.item_keys, g_item, day, S)
+        decay = torch.where(seen, torch.exp(-(day - last_item_day).double() / 28.0),
+                            torch.zeros((), dtype=torch.float64))
+        cat_seen, last_cat_day = self._previous(self.cat_keys, user * self.C + cat, day, S)
+        q = g_item * S + last_cat_day
+        hit = self.item_keys[torch.searchsorted(self.item_keys, q).clamp(max=len(self.item_keys) - 1)] == q
+        return torch.stack([seen.double(), (cat_seen & hit).double(), decay], dim=-1)
+
+
+def attach_purchase_history(batcher, history, cat_of):
+    """Add ctx['rec_item'] at every assortment slot and every purchased line of each batch."""
+    make = batcher.make
+
+    def make_with_history(trips):
+        out = make(trips)
+        ix, ctx, lctx, _, LI, LT = out[:6]
+        user = torch.as_tensor(batcher.D["trip_user"][trips], dtype=torch.long)
+        day = torch.as_tensor(batcher.D["trip_day"][trips], dtype=torch.long)
+        ctx["rec_item"] = history.features(ix.item, cat_of[ix.item], user[ix.item_trip], day[ix.item_trip])
+        lctx["rec_item"] = history.features(LI, cat_of[LI], user[LT], day[LT])
+        return out
+
+    batcher.make = make_with_history
+
+
+def setup(initialization, additive, threads, recency=False):
     from data import build
     from features import Features
     from fit import Batcher
@@ -77,18 +138,32 @@ def setup(initialization, additive, threads):
             hh = model.house[trip]
             theta = model.theta_c()
             b = b + (theta[hh] * model.u_cat[model.cat_of[it]]).sum(-1)
+        if c is not None and "rec_item" in c and getattr(model, "psi_item", None) is not None:
+            b = b + (model.psi_item[model.cat_of[it]] * c["rec_item"]).sum(-1)
         return b
 
     model.b_at = b_at_with_u_cat
-    features = Features(int(data["n_item"]), int(data["n_store"]), include_recency=False,
+    features = Features(int(data["n_item"]), int(data["n_store"]), include_recency=recency,
                         include_store_price=True)
-    batcher = Batcher(data, features, int(meta["nmax"]), include_recency=False)
+    batcher = Batcher(data, features, int(meta["nmax"]), include_recency=recency)
+    model.recency = bool(recency)
+    if recency:
+        attach_purchase_history(batcher, PurchaseHistory(data), model.cat_of.long())
     return data, model, meta, batcher
+
+
+def checkpoint_uses_recency(path):
+    return bool(torch.load(path, map_location="cpu", weights_only=False).get("recency", False))
 
 
 def configure_model_from_blob(model, blob):
     """Attach optional M1 (f_extra), M2 (psi_cat, presence_phi), M3 (cat_rho0), and M4a (u_cat) parameters from checkpoint blob and load state."""
     st = blob["model"]
+    if bool(blob.get("recency", False)) != bool(getattr(model, "recency", False)):
+        raise RuntimeError("the checkpoint and setup() disagree on recency features; "
+                           "call setup(..., recency=checkpoint_uses_recency(path))")
+    if "psi_item" in st and getattr(model, "psi_item", None) is None:
+        model.psi_item = torch.nn.Parameter(torch.zeros_like(st["psi_item"]))
     if "f_extra" in st and st["f_extra"] is not None:
         if getattr(model, "f_extra", None) is None:
             model.f_extra = torch.nn.Parameter(torch.zeros_like(st["f_extra"]))
@@ -549,7 +624,11 @@ def penalties(model, args, n_train, r, tied=None, price_init=None):
     u_cat_prior = 0.0
     if getattr(model, "u_cat", None) is not None:
         u_cat_prior = args.u_cat_prec * model.u_cat.square().sum()
-    loss = loss + 0.5 * (phi_prior + args.rho_c_prec * model.rho_c.square().sum() + extra_prior + price_prior + u_cat_prior) / n_train
+    rec_prior = 0.0
+    if getattr(args, "recency", False):
+        rec_prior = args.rec_prec * (model.psi.square().sum() + model.psi_item.square().sum())
+    loss = loss + 0.5 * (phi_prior + args.rho_c_prec * model.rho_c.square().sum() + extra_prior + price_prior
+                         + u_cat_prior + rec_prior) / n_train
     return loss
 
 
@@ -577,7 +656,7 @@ def project(model, caps, optimizer, r):
 def train(args):
     from category_safety import category_capacities
     from pipeline_support import supported_trips
-    data, model, meta, batcher = setup(args.initialization, args.additive, args.threads)
+    data, model, meta, batcher = setup(args.initialization, args.additive, args.threads, recency=args.recency)
     J, C, nmax, r = int(data["n_item"]), int(data["n_cat"]), int(meta["nmax"]), args.rank
     all_train_trips = supported_trips(data, 0, nmax)
     rng = np.random.default_rng(args.seed)
@@ -607,6 +686,11 @@ def train(args):
         model.register_parameter("f_extra", torch.nn.Parameter(torch.zeros(C, 3)))
     if args.u_cat:
         model.register_parameter("u_cat", torch.nn.Parameter(torch.zeros(C, model.theta.shape[1])))
+    if args.recency:
+        # sub-commodity recency (psi, J x 4) and product purchase history (psi_item, C x 3), from zero
+        model.register_parameter("psi_item", torch.nn.Parameter(torch.zeros(C, 3)))
+        with torch.no_grad():
+            model.psi.zero_()
     if args.presence_phi:
         args.tie_phi = True
         model.presence_phi = True
@@ -634,9 +718,14 @@ def train(args):
     else:
         with torch.no_grad():
             model.phi[:, :r] = args.phi_init * torch.randn(J, r)
-    price_init = {n: getattr(model, n).detach().clone() for n in ("gamma", "beta", "price_kappa", "psi")}
-    for n in ("gamma", "beta", "price_kappa", "psi"):
+    # with --recency, psi is trained in its own group (from stage A) instead of with the T1 price block
+    price_names = ("gamma", "beta", "price_kappa") + (() if args.recency else ("psi",))
+    price_init = {n: getattr(model, n).detach().clone() for n in price_names}
+    for n in price_names:
         getattr(model, n).requires_grad_(False)
+    rec_params = [model.psi, model.psi_item] if args.recency else []
+    for q in rec_params:
+        q.requires_grad_(True)
     base = [getattr(model, n) for n in BASE_NAMES]
     other_base = [getattr(model, n) for n in OTHER_BASE_NAMES]
     model.phi.requires_grad_(True)
@@ -683,7 +772,7 @@ def train(args):
         return float(np.concatenate(lls).mean()), float(np.concatenate(ess_list).mean())
 
     def run_stage(name, epochs, lr_b, lr_l, lr_rho, lr_rho0, lr_phi, step_fn, average, mm_rho=0.0, mm_rho0=0.0, mm_lam=0.0,
-                  monitor_val=False, lr_price=0.0, lr_u_cat=0.0):
+                  monitor_val=False, lr_price=0.0, lr_u_cat=0.0, lr_rec=0.0):
         param_groups = [
             {"params": other_base, "lr": lr_b},
             {"params": [model.lam], "lr": lr_l},
@@ -698,7 +787,10 @@ def train(args):
         if getattr(model, "u_cat", None) is not None and lr_u_cat > 0.0:
             param_groups.append({"params": [model.u_cat], "lr": lr_u_cat})
             extra_params.append(model.u_cat)
-        price_params = [getattr(model, n) for n in ("gamma", "beta", "price_kappa", "psi") if getattr(model, n).requires_grad]
+        if rec_params and lr_rec > 0.0:
+            param_groups.append({"params": rec_params, "lr": lr_rec})
+            extra_params.extend(rec_params)
+        price_params = [getattr(model, n) for n in price_names if getattr(model, n).requires_grad]
         if price_params and lr_price > 0.0:
             param_groups.append({"params": price_params, "lr": lr_price})
             extra_params.extend(price_params)
@@ -825,15 +917,16 @@ def train(args):
     lr_u_cal = 0.5 * args.lr_u_cat if args.u_cat else 0.0
     # stage A: pseudo-likelihood (gentle Phi warm-up with separate rho_0 / rho_c / lam learning rates)
     run_stage("pseudo-likelihood", args.pl_epochs, args.lr_base, lr_lam, args.lr_rho, args.lr_rho0, args.lr_phi_pl,
-              lambda bt: (pseudo_loglik(model, bt.ix, bt.obs, r), None), average=False, lr_u_cat=lr_u_pl)
+              lambda bt: (pseudo_loglik(model, bt.ix, bt.obs, r), None), average=False, lr_u_cat=lr_u_pl,
+              lr_rec=args.lr_rec)
     torch.save({"model": {k: v.detach().clone() for k, v in model.state_dict().items()}, "rank": r,
                 "use_f_extra": bool(args.f_extra), "presence_phi": bool(args.presence_phi),
-                "cat_rho0": bool(args.cat_rho0), "u_cat": bool(args.u_cat),
+                "cat_rho0": bool(args.cat_rho0), "u_cat": bool(args.u_cat), "recency": bool(args.recency),
                 "stage": "pseudo-likelihood"}, args.out.with_name(args.out.stem + "_pl.pt"))
 
     # stage B: stochastic maximum likelihood with persistent per-trip chains (data-initialized)
     if args.unfreeze_price:
-        for n in ("gamma", "beta", "price_kappa", "psi"):
+        for n in price_names:
             getattr(model, n).requires_grad_(True)
     lr_price_sml = args.lr_price if args.unfreeze_price else 0.0
     lr_price_cal = 0.5 * args.lr_price if args.unfreeze_price else 0.0
@@ -856,18 +949,18 @@ def train(args):
 
     run_stage("sml", args.sml_epochs, args.lr_base, lr_lam, args.lr_rho, args.lr_rho0, args.lr_phi_sml, sml_step,
               average=True, mm_rho=args.mm_rho, mm_rho0=args.mm_rho0, mm_lam=args.mm_lam, monitor_val=True,
-              lr_price=lr_price_sml, lr_u_cat=lr_u_sml)
+              lr_price=lr_price_sml, lr_u_cat=lr_u_sml, lr_rec=args.lr_rec)
     if args.cal_epochs > 0:
         run_stage("calibrate", args.cal_epochs, 0.0, 0.5 * lr_lam, args.lr_rho, args.lr_rho0, 0.0, sml_step,
                   average=False, mm_rho=args.mm_rho, mm_rho0=args.mm_rho0, mm_lam=args.mm_lam,
-                  lr_price=lr_price_cal, lr_u_cat=lr_u_cal)
+                  lr_price=lr_price_cal, lr_u_cat=lr_u_cal, lr_rec=0.5 * args.lr_rec)
     if val_batches:
         v_ll, v_ess = eval_val_ll()
         emit({"event": "final_val", "val_ll": round(v_ll, 4), "val_ess": round(v_ess, 4)})
     torch.save({"model": {k: v.detach().clone() for k, v in model.state_dict().items()}, "rank": r,
                 "use_f_extra": bool(args.f_extra), "presence_phi": bool(args.presence_phi),
                 "cat_rho0": bool(args.cat_rho0), "unfreeze_price": bool(args.unfreeze_price),
-                "u_cat": bool(args.u_cat),
+                "u_cat": bool(args.u_cat), "recency": bool(args.recency),
                 "stage": "sml", "seconds": time.time() - started, "args": {k: str(v) for k, v in vars(args).items()}},
                args.out.with_suffix(".pt"))
     emit({"event": "trained", "seconds": round(time.time() - started, 1)})
@@ -1044,9 +1137,10 @@ def classifier_auc(real, generated, groups, n_item, item_cat, n_cat, kind):
 
 def evaluate(args):
     from price_response import changed_price_context
-    data, model, meta, batcher = setup(args.initialization, args.additive, args.threads)
     blob = torch.load(args.out.with_suffix(".pt") if args.checkpoint is None else args.checkpoint,
                       map_location="cpu", weights_only=False)
+    data, model, meta, batcher = setup(args.initialization, args.additive, args.threads,
+                                       recency=bool(blob.get("recency", False)))
     configure_model_from_blob(model, blob)
     model.eval()
     for q in model.parameters():
@@ -1269,6 +1363,10 @@ def main():
     p.add_argument("--u-cat", action="store_true", help="M4a: household taste per category b_tj += theta_h . U_c(j)")
     p.add_argument("--lr-u-cat", type=float, default=5e-3, help="M4a: learning rate for U_c in PL and SML (halved in calibrate)")
     p.add_argument("--u-cat-prec", type=float, default=2.0, help="M4a: weak prior precision on U_c centred at 0")
+    p.add_argument("--recency", action="store_true",
+                   help="purchase history: sub-commodity recency (psi) and product history (psi_item), trained from stage A")
+    p.add_argument("--lr-rec", type=float, default=5e-3, help="learning rate for psi and psi_item (halved in calibrate)")
+    p.add_argument("--rec-prec", type=float, default=2.0, help="weak prior precision on psi and psi_item centred at 0")
     p.add_argument("--cpp-sampler", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--eval-batch", type=int, default=256)
     p.add_argument("--ll-trips", type=int, default=0)

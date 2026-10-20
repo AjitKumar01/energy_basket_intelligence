@@ -29,11 +29,13 @@ def main():
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     p.add_argument("--checkpoint", type=Path, required=True)
     p.add_argument("--trips", type=int, default=4096)
+    p.add_argument("--initialization", type=Path, default=A / "artifacts/initialization.pt")
+    p.add_argument("--additive", type=Path, default=A / "out/v3_pipeline_additive_best.pt")
     p.add_argument("--output", type=Path, required=True)
     a = p.parse_args()
     torch.set_num_threads(4)
     blob = torch.load(a.checkpoint, map_location="cpu", weights_only=False)
-    data, model, meta, batcher = stress.setup(A / "artifacts/initialization.pt", A / "out/v3_pipeline_additive_best.pt", 4,
+    data, model, meta, batcher = stress.setup(a.initialization, a.additive, 4,
                                               recency=bool(blob.get("recency", False)))
     stress.configure_model_from_blob(model, blob); model.eval()
     cache = np.load(Path(os.environ["ENERGY_MODEL_DATA_ROOT"]) / "basket_input/v3_index_affinity.npz")

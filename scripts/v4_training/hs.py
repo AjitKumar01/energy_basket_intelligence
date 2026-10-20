@@ -63,9 +63,9 @@ def cat_count_penalty_matrix(n_c: torch.Tensor, rho_c: torch.Tensor, f_extra: to
     return pen
 
 
-def _category_polys(u, part: Partition, rho_c, f_extra=None, cat_shift=None):
+def _category_polys(u, part: Partition, rho_c, f_extra=None, cat_shift=None, iv_shift=None):
     """Per category: within-category log ESP tables (for sampling) and the category polynomial
-    log sum_{|T|=k, T in c} exp(sum_T u) - f_c(k) - (k-1)*cat_shift, k = 0..min(|c|, nmax).  u: B x J."""
+    log sum_{|T|=k, T in c} exp(sum_T u) - f_c(k) - (k-1)*cat_shift + 1(k>=1)*iv_shift, k = 0..min(|c|, nmax).  u: B x J."""
     B = u.shape[0]
     polys, prefixes = [], []
     for c, items in enumerate(part.members):
@@ -83,6 +83,9 @@ def _category_polys(u, part: Partition, rho_c, f_extra=None, cat_shift=None):
         if cat_shift is not None and top >= 2:
             km1 = (k - 1.0).clamp_min(0.0)[None, :]
             pen = pen + km1 * cat_shift[:, c:c + 1]
+        if iv_shift is not None and top >= 1:
+            pos_k = (k >= 1.0).double()[None, :]
+            pen = pen - pos_k * iv_shift[:, c:c + 1]
         polys.append(e - pen)
     return polys, prefixes
 
@@ -100,11 +103,11 @@ def _convolve(a, b, nmax):
     return out
 
 
-def log_zc(u, part: Partition, rho_c, rho0, return_tables=False, f_extra=None, cat_shift=None, cat_rho0=False):
+def log_zc(u, part: Partition, rho_c, rho0, return_tables=False, f_extra=None, cat_shift=None, cat_rho0=False, iv_shift=None):
     """log Zc over nonempty baskets of size <= nmax, given per-trip utilities u (B x J).
     rho0: length-nmax tensor, rho0[n-1] is the size potential of size n (or active category count m when cat_rho0=True)."""
     if return_tables and not cat_rho0:
-        polys, prefixes = _category_polys(u, part, rho_c, f_extra=f_extra, cat_shift=cat_shift)
+        polys, prefixes = _category_polys(u, part, rho_c, f_extra=f_extra, cat_shift=cat_shift, iv_shift=iv_shift)
         prefix = [torch.zeros(u.shape[0], 1)]
         for p in polys:
             prefix.append(_convolve(prefix[-1], p, part.nmax))
@@ -128,6 +131,8 @@ def log_zc(u, part: Partition, rho_c, rho0, return_tables=False, f_extra=None, c
             m = len(items)
             if m == 1:
                 wc = w[:, items[0]:items[0] + 1, None]
+                if iv_shift is not None:
+                    wc = wc * torch.exp(iv_shift[:, c:c + 1, None])
                 new_deg = min(deg_tot + 1, nmax)
                 new_cat = min(cat_tot + 1, mmax)
                 out = tot2d.clone()
@@ -152,6 +157,9 @@ def log_zc(u, part: Partition, rho_c, rho0, return_tables=False, f_extra=None, c
                 if cat_shift is not None and top_c >= 2:
                     km1 = (ks - 1.0).clamp_min(0.0)[None, :]
                     pen = pen + km1 * cat_shift[:, c:c + 1]
+                if iv_shift is not None and top_c >= 1:
+                    pos_k = (ks >= 1.0).double()[None, :]
+                    pen = pen - pos_k * iv_shift[:, c:c + 1]
                 pc = ec * torch.exp(-pen)
                 new_deg = min(deg_tot + top_c, nmax)
                 new_cat = min(cat_tot + 1, mmax)
@@ -184,6 +192,8 @@ def log_zc(u, part: Partition, rho_c, rho0, return_tables=False, f_extra=None, c
         m = len(items)
         if m == 1:
             wc = w[:, items[0]:items[0] + 1]
+            if iv_shift is not None:
+                wc = wc * torch.exp(iv_shift[:, c:c + 1])
             top = min(deg_tot + 1, nmax)
             tot_prev = tot[:, :top].clone()
             tot[:, 1:top + 1] = tot[:, 1:top + 1] + tot_prev * wc
@@ -204,6 +214,9 @@ def log_zc(u, part: Partition, rho_c, rho0, return_tables=False, f_extra=None, c
             if cat_shift is not None and top_c >= 2:
                 km1 = (ks - 1.0).clamp_min(0.0)[None, :]
                 pen = pen + km1 * cat_shift[:, c:c + 1]
+            if iv_shift is not None and top_c >= 1:
+                pos_k = (ks >= 1.0).double()[None, :]
+                pen = pen - pos_k * iv_shift[:, c:c + 1]
             pc = ec * torch.exp(-pen)
             new_deg = min(deg_tot + top_c, nmax)
             out = torch.zeros((B, nmax + 1), dtype=u.dtype)
@@ -222,7 +235,7 @@ def log_zc(u, part: Partition, rho_c, rho0, return_tables=False, f_extra=None, c
 
 
 @torch.no_grad()
-def sample_given_u(u, part: Partition, rho_c, rho0, gen, f_extra=None, cat_shift=None, cat_rho0=False):
+def sample_given_u(u, part: Partition, rho_c, rho0, gen, f_extra=None, cat_shift=None, cat_rho0=False, iv_shift=None):
     """Exact draws S ~ additive law at utilities u (B x J), nonempty, |S| <= nmax. Returns B x J 0/1."""
     B, J = u.shape
     nmax = part.nmax
@@ -251,13 +264,16 @@ def sample_given_u(u, part: Partition, rho_c, rho0, gen, f_extra=None, cat_shift
                 steps.append(e.clone())
             prefixes.append(steps)
             if m == 1:
-                pc = e
+                pc = e if iv_shift is None else torch.cat([e[:, :1], e[:, 1:] * torch.exp(iv_shift[:, c:c + 1])], dim=1)
             else:
                 ks = torch.arange(top_c + 1, dtype=u.dtype)
                 pen = cat_count_penalty(c, ks, rho_c, f_extra)[None, :]
                 if cat_shift is not None and top_c >= 2:
                     km1 = (ks - 1.0).clamp_min(0.0)[None, :]
                     pen = pen + km1 * cat_shift[:, c:c + 1]
+                if iv_shift is not None and top_c >= 1:
+                    pos_k = (ks >= 1.0).double()[None, :]
+                    pen = pen - pos_k * iv_shift[:, c:c + 1]
                 pc = e * torch.exp(-pen)
             polys.append(pc)
 
@@ -338,13 +354,16 @@ def sample_given_u(u, part: Partition, rho_c, rho0, gen, f_extra=None, cat_shift
             steps.append(e.clone())
         prefixes.append(steps)
         if m == 1:
-            pc = e
+            pc = e if iv_shift is None else torch.cat([e[:, :1], e[:, 1:] * torch.exp(iv_shift[:, c:c + 1])], dim=1)
         else:
             ks = torch.arange(top_c + 1, dtype=u.dtype)
             pen = cat_count_penalty(c, ks, rho_c, f_extra)[None, :]
             if cat_shift is not None and top_c >= 2:
                 km1 = (ks - 1.0).clamp_min(0.0)[None, :]
                 pen = pen + km1 * cat_shift[:, c:c + 1]
+            if iv_shift is not None and top_c >= 1:
+                pos_k = (ks >= 1.0).double()[None, :]
+                pen = pen - pos_k * iv_shift[:, c:c + 1]
             pc = e * torch.exp(-pen)
         polys.append(pc)
 
@@ -398,15 +417,16 @@ def sample_given_u(u, part: Partition, rho_c, rho0, gen, f_extra=None, cat_shift
 
 class V4:
     """Version-4 parameters for a small world.  b_tj = lam_j + theta_h.alpha_j - exp(delta_h) g_j price_wj.
-    Supports M1 (f_extra), M2 (presence_phi), M3 (cat_rho0), and M4a (u_cat)."""
+    Supports M1 (f_extra), M2 (presence_phi), M3 (cat_rho0), M4a (u_cat), and M4b (iv_slope)."""
 
-    def __init__(self, J, H, K, r, part: Partition, seed=0, requires_grad=True, use_f_extra=False, presence_phi=False, cat_rho0=False, u_cat=False):
+    def __init__(self, J, H, K, r, part: Partition, seed=0, requires_grad=True, use_f_extra=False, presence_phi=False, cat_rho0=False, u_cat=False, iv_slope=False):
         g = torch.Generator().manual_seed(seed)
         self.part = part
         self.use_f_extra = use_f_extra
         self.presence_phi = presence_phi
         self.cat_rho0 = cat_rho0
         self.u_cat = u_cat
+        self.iv_slope = iv_slope
         self.p = {
             "lam": torch.zeros(J),
             "theta": 0.1 * torch.randn(H, K, generator=g),
@@ -424,6 +444,8 @@ class V4:
             self.p["delta_phi"] = 0.01 * torch.randn(J, r, generator=g)
         if u_cat:
             self.p["u_cat"] = torch.zeros(part.C, K)
+        if iv_slope:
+            self.p["iv_slope_raw"] = torch.zeros(part.C)
         for v in self.p.values():
             v.requires_grad_(requires_grad)
 
@@ -450,6 +472,20 @@ class V4:
         psi = self.p["psi"]
         return z @ psi.T - 0.5 * psi.square().sum(1)[None, :]
 
+    def iv_shift_from_b(self, b_mat):
+        """Per-category M4b presence shift (lambda_c - 1) * IV_c(b) of shape (B, C) (or None)."""
+        if not getattr(self, "iv_slope", False) or "iv_slope_raw" not in self.p:
+            return None
+        lam_c = torch.sigmoid(self.p["iv_slope_raw"])
+        iv_cols = [torch.logsumexp(b_mat[:, items], dim=1) for items in self.part.members]
+        iv_bc = torch.stack(iv_cols, dim=1)
+        return iv_bc * (lam_c - 1.0)[None, :]
+
+    def iv_shift(self, h, price):
+        if not getattr(self, "iv_slope", False) or "iv_slope_raw" not in self.p:
+            return None
+        return self.iv_shift_from_b(self.b(h, price))
+
     def g(self):
         return F.softplus(self.p["graw"])
 
@@ -467,6 +503,7 @@ class V4:
     def energy(self, X, h, price):
         """E(S) for 0/1 baskets X (B x J)."""
         p = self.p
+        b_mat = self.b(h, price)
         phi = self.eff_phi()
         n_c = X @ self.part.onehot
         s = self.basket_s(X)
@@ -476,7 +513,11 @@ class V4:
             diag = diag - extra_c @ p["psi"].square().sum(1)
         pair = 0.5 * (s.square().sum(1) - diag)
         size_idx = (n_c > 0).sum(1).long() if self.cat_rho0 else X.sum(1).long()
-        return (X * self.b(h, price)).sum(1) + pair - cat_count_penalty_matrix(n_c, p["rho_c"], self.f_extra()) - self.rho0()[size_idx - 1]
+        e = (X * b_mat).sum(1) + pair - cat_count_penalty_matrix(n_c, p["rho_c"], self.f_extra()) - self.rho0()[size_idx - 1]
+        iv_sh = self.iv_shift_from_b(b_mat)
+        if iv_sh is not None:
+            e = e + ((n_c > 0).double() * iv_sh).sum(1)
+        return e
 
     def utilities(self, h, price, z):
         phi = self.eff_phi()
@@ -717,17 +758,18 @@ def is_log_z_orig(model: V4, h, price, gen, burn=200, components=64, thin=2, dra
     B, r = h.shape[0], phi.shape[1]
     rho_c, rho0, f_ext = model.p["rho_c"], model.rho0(), model.f_extra()
     b0 = model.b(h, price)
+    iv_sh = model.iv_shift_from_b(b0)
     u0 = b0 - 0.5 * phi.square().sum(1)[None, :]
-    X = sample_given_u(b0, model.part, rho_c, rho0, gen, f_extra=f_ext, cat_rho0=model.cat_rho0)
+    X = sample_given_u(b0, model.part, rho_c, rho0, gen, f_extra=f_ext, cat_rho0=model.cat_rho0, iv_shift=iv_sh)
     for _ in range(burn):
         z_b = model.basket_s(X) + torch.randn(B, r, generator=gen)
         X = sample_given_u(u0 + z_b @ phi.T, model.part, rho_c, rho0, gen,
-                           f_extra=f_ext, cat_shift=model.cat_shift(z_b), cat_rho0=model.cat_rho0)
+                           f_extra=f_ext, cat_shift=model.cat_shift(z_b), cat_rho0=model.cat_rho0, iv_shift=iv_sh)
     centres = []
     for k in range(components * thin):
         z_b = model.basket_s(X) + torch.randn(B, r, generator=gen)
         X = sample_given_u(u0 + z_b @ phi.T, model.part, rho_c, rho0, gen,
-                           f_extra=f_ext, cat_shift=model.cat_shift(z_b), cat_rho0=model.cat_rho0)
+                           f_extra=f_ext, cat_shift=model.cat_shift(z_b), cat_rho0=model.cat_rho0, iv_shift=iv_sh)
         if (k + 1) % thin == 0:
             centres.append(model.basket_s(X))
     centres = torch.stack(centres, 1)                                       # B x K x r
@@ -748,8 +790,9 @@ def is_log_z_orig(model: V4, h, price, gen, burn=200, components=64, thin=2, dra
                                 math.log(defensive) + log_prior)
         z_flat = z.reshape(B * d_cur, r)
         u_flat = (u0[:, None, :] + z @ phi.T).reshape(B * d_cur, -1)
+        iv_sh_d = iv_sh.repeat_interleave(d_cur, dim=0) if iv_sh is not None else None
         lzc = log_zc(u_flat, model.part, rho_c, rho0,
-                     f_extra=f_ext, cat_shift=model.cat_shift(z_flat), cat_rho0=model.cat_rho0).view(B, d_cur)
+                     f_extra=f_ext, cat_shift=model.cat_shift(z_flat), cat_rho0=model.cat_rho0, iv_shift=iv_sh_d).view(B, d_cur)
         log_w.append(log_prior + lzc - log_q)
     log_w = torch.cat(log_w, 1)
     est = torch.logsumexp(log_w, 1) - math.log(draws)
@@ -766,6 +809,7 @@ def is_log_z(model: V4, h, price, gen, burn=200, components=64, thin=2, draws=51
     B, r = h.shape[0], phi.shape[1]
     rho_c, rho0, f_ext = model.p["rho_c"], model.rho0(), model.f_extra()
     b0 = model.b(h, price)
+    iv_sh = model.iv_shift_from_b(b0)
     phi_sq = phi.square().sum(1)[None, :]
     u0 = b0 - 0.5 * phi_sq
 
@@ -784,22 +828,23 @@ def is_log_z(model: V4, h, price, gen, burn=200, components=64, thin=2, draws=51
     X_seeds = []
     for m_i in range(M):
         X_seeds.append(sample_given_u(seed_u[m_i], model.part, rho_c, rho0, gen,
-                                      f_extra=f_ext, cat_shift=model.cat_shift(seed_z[m_i]), cat_rho0=model.cat_rho0))
+                                      f_extra=f_ext, cat_shift=model.cat_shift(seed_z[m_i]), cat_rho0=model.cat_rho0, iv_shift=iv_sh))
     X_flat = torch.stack(X_seeds, dim=1).reshape(B * M, -1)
     u0_M = u0.repeat_interleave(M, dim=0)
+    iv_sh_M = iv_sh.repeat_interleave(M, dim=0) if iv_sh is not None else None
 
     burn_per_chain = max(burn // 4, 25)
     for _ in range(burn_per_chain):
         z_b = model.basket_s(X_flat) + torch.randn(B * M, r, generator=gen)
         X_flat = sample_given_u(u0_M + z_b @ phi.T, model.part, rho_c, rho0, gen,
-                                f_extra=f_ext, cat_shift=model.cat_shift(z_b), cat_rho0=model.cat_rho0)
+                                f_extra=f_ext, cat_shift=model.cat_shift(z_b), cat_rho0=model.cat_rho0, iv_shift=iv_sh_M)
 
     k_per_chain = max((components + M - 1) // M, 4)
     centres = []
     for k in range(k_per_chain * thin):
         z_b = model.basket_s(X_flat) + torch.randn(B * M, r, generator=gen)
         X_flat = sample_given_u(u0_M + z_b @ phi.T, model.part, rho_c, rho0, gen,
-                                f_extra=f_ext, cat_shift=model.cat_shift(z_b), cat_rho0=model.cat_rho0)
+                                f_extra=f_ext, cat_shift=model.cat_shift(z_b), cat_rho0=model.cat_rho0, iv_shift=iv_sh_M)
         if (k + 1) % thin == 0:
             centres.append(model.basket_s(X_flat).view(B, M, r))
     centres = torch.cat(centres, dim=1)[:, :max(components, M * 4), :]
@@ -810,8 +855,9 @@ def is_log_z(model: V4, h, price, gen, burn=200, components=64, thin=2, draws=51
     mult = same_c.sum(2).clamp_min(1.0)
     c_flat = centres.reshape(B * K, r)
     u_centres = (u0[:, None, :] + centres @ phi.T).reshape(B * K, -1)
+    iv_sh_K = iv_sh.repeat_interleave(K, dim=0) if iv_sh is not None else None
     lzc_c = log_zc(u_centres, model.part, rho_c, rho0,
-                   f_extra=f_ext, cat_shift=model.cat_shift(c_flat), cat_rho0=model.cat_rho0).view(B, K)
+                   f_extra=f_ext, cat_shift=model.cat_shift(c_flat), cat_rho0=model.cat_rho0, iv_shift=iv_sh_K).view(B, K)
     lp_c = -0.5 * centres.square().sum(2)
     log_v = lzc_c + lp_c - torch.log(mult)
     w_mode = torch.softmax(log_v, dim=1)
@@ -841,8 +887,9 @@ def is_log_z(model: V4, h, price, gen, burn=200, components=64, thin=2, draws=51
                                 math.log(defensive) + log_prior)
         z_flat = z.reshape(B * d_cur, r)
         u_flat = (u0[:, None, :] + z @ phi.T).reshape(B * d_cur, -1)
+        iv_sh_d = iv_sh.repeat_interleave(d_cur, dim=0) if iv_sh is not None else None
         lzc = log_zc(u_flat, model.part, rho_c, rho0,
-                     f_extra=f_ext, cat_shift=model.cat_shift(z_flat), cat_rho0=model.cat_rho0).view(B, d_cur)
+                     f_extra=f_ext, cat_shift=model.cat_shift(z_flat), cat_rho0=model.cat_rho0, iv_shift=iv_sh_d).view(B, d_cur)
         log_w.append(log_prior + lzc - log_q)
     log_w = torch.cat(log_w, 1)
     est = torch.logsumexp(log_w, 1) - math.log(draws)

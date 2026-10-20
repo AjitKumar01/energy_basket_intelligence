@@ -47,10 +47,10 @@ def partition(J, nmax):
     return Partition(group, nmax)
 
 
-def make_truth(seed, strength, J=18, H=100, W=8, K=3, r=3, nmax=5, use_f_extra=False, presence_phi=False, cat_rho0=False, u_cat=False):
+def make_truth(seed, strength, J=18, H=100, W=8, K=3, r=3, nmax=5, use_f_extra=False, presence_phi=False, cat_rho0=False, u_cat=False, iv_slope=False):
     g = torch.Generator().manual_seed(seed)
     part = partition(J, nmax)
-    t = V4(J, H, K, r, part, requires_grad=False, use_f_extra=use_f_extra, presence_phi=presence_phi, cat_rho0=cat_rho0, u_cat=u_cat)
+    t = V4(J, H, K, r, part, requires_grad=False, use_f_extra=use_f_extra, presence_phi=presence_phi, cat_rho0=cat_rho0, u_cat=u_cat, iv_slope=iv_slope)
     phi = 0.25 * torch.randn(J, r, generator=g)
     for d, items in enumerate(MISSIONS):
         phi[items, d] += 1.0
@@ -84,6 +84,8 @@ def make_truth(seed, strength, J=18, H=100, W=8, K=3, r=3, nmax=5, use_f_extra=F
             t.p["delta_phi"].copy_(delta_phi)
         if u_cat:
             t.p["u_cat"].copy_(0.4 * torch.randn(part.C, K, generator=g))
+        if iv_slope:
+            t.p["iv_slope_raw"].copy_(-0.3 + 0.75 * torch.randn(part.C, generator=g))
     price = 0.35 * torch.randn(W, J, generator=g)
     return t, price
 
@@ -102,7 +104,12 @@ def energy_table(model: V4, sup: Support, h, price):
     pair = 0.5 * (s.square().sum(1) - diag)
     size_idx = (n_c > 0).sum(1).long() if getattr(model, "cat_rho0", False) else sup.size
     rest = pair - cat_count_penalty_matrix(n_c, p["rho_c"], model.f_extra()) - model.rho0()[size_idx - 1]
-    return b @ sup.M.T + rest[None, :]
+    out = b @ sup.M.T + rest[None, :]
+    iv_sh = model.iv_shift_from_b(b)
+    if iv_sh is not None:
+        pres_c = (n_c > 0).double()
+        out = out + iv_sh @ pres_c.T
+    return out
 
 
 def exact_log_z(model, sup, h, price, chunk=200):

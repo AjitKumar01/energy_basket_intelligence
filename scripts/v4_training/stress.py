@@ -116,7 +116,7 @@ def attach_purchase_history(batcher, history, cat_of):
     batcher.make = make_with_history
 
 
-def setup(initialization, additive, threads, recency=False):
+def setup(initialization, additive, threads, recency=False, iv_slope=False):
     from data import build
     from features import Features
     from fit import Batcher
@@ -130,6 +130,7 @@ def setup(initialization, additive, threads, recency=False):
         model.phi.zero_()
     model.presence_phi = False
     model.cat_rho0 = False
+    model.has_iv_slope = False
     orig_b_at = model.b_at
 
     def b_at_with_u_cat(it, trip, c):
@@ -176,6 +177,12 @@ def configure_model_from_blob(model, blob):
     if "u_cat" in st and st["u_cat"] is not None:
         if getattr(model, "u_cat", None) is None:
             model.u_cat = torch.nn.Parameter(torch.zeros_like(st["u_cat"]))
+    if "iv_slope_raw" in st and st["iv_slope_raw"] is not None:
+        model.has_iv_slope = bool(blob.get("iv_slope", True))
+        if getattr(model, "iv_slope_raw", None) is None:
+            model.iv_slope_raw = torch.nn.Parameter(torch.zeros_like(st["iv_slope_raw"]))
+    else:
+        model.has_iv_slope = False
     model.cat_rho0 = bool(blob.get("cat_rho0", False))
     model.load_state_dict(st)
 
@@ -280,6 +287,29 @@ def row_cat_shift(model, ix, z, beta=1.0):
     return shift
 
 
+def iv_slope_lambda(model):
+    if getattr(model, "iv_slope_override", None) is not None:
+        return model.iv_slope_override
+    if getattr(model, "has_iv_slope", False) and getattr(model, "iv_slope_raw", None) is not None:
+        return torch.sigmoid(model.iv_slope_raw)
+    return None
+
+
+def row_iv_shift(model, ix, b_slot=None):
+    """Per-row M4b category inclusive-value presence shift (lambda_c - 1) * IV_{tc}(b)."""
+    lam_c = iv_slope_lambda(model)
+    if lam_c is None:
+        return None
+    if b_slot is None:
+        b_slot = model.b_flat(ix)
+    from ragged import seg_max, seg_sum
+    m_r = seg_max(b_slot.unsqueeze(0), ix.row_of, ix.n_rows)[0].detach()
+    w_s = torch.exp(b_slot - m_r[ix.row_of])
+    sum_r = seg_sum(w_s.unsqueeze(0), ix.row_of, ix.n_rows)[0]
+    iv_r = m_r + torch.log(sum_r.clamp_min(1e-300))
+    return (lam_c[ix.row_cat] - 1.0) * iv_r
+
+
 def basket_field(model, ix, X, r):
     """s = sum of phi over the basket (or M2 presence-based coupling), B x r."""
     x = X.double()
@@ -293,12 +323,14 @@ def basket_field(model, ix, X, r):
 
 
 def obs_energy(model, bt, r):
-    """Exact energy of observed baskets in batch bt, including optional M1 (f_extra), M2 (presence_phi), and M3 (cat_rho0)."""
+    """Exact energy of observed baskets in batch bt, including optional M1 (f_extra), M2 (presence_phi), M3 (cat_rho0), and M4b (iv_slope)."""
     e = model.energy(bt.li, bt.lt, bt.lc, bt.ix.B, bt.line_ctx)
     has_f = getattr(model, "f_extra", None) is not None
     has_m2 = getattr(model, "presence_phi", False)
     has_m3 = getattr(model, "cat_rho0", False)
-    if not has_f and not has_m2 and not has_m3:
+    iv_sh = row_iv_shift(model, bt.ix)
+    has_m4b = iv_sh is not None
+    if not has_f and not has_m2 and not has_m3 and not has_m4b:
         return e
     ix = bt.ix
     nc_row = torch.zeros(ix.n_rows, dtype=e.dtype).index_add_(0, ix.row_of, bt.obs.to(e.dtype))
@@ -322,14 +354,19 @@ def obs_energy(model, bt, r):
         k_b = torch.zeros(ix.B, dtype=torch.long).index_add_(0, ix.row_trip, (nc_row > 0).long())
         rho0 = model.rho_0()
         e = e + rho0[n_b] - rho0[k_b]
+    if has_m4b:
+        pres_row = (nc_row > 0).to(e.dtype)
+        e = e + torch.zeros(ix.B, dtype=e.dtype).index_add_(0, ix.row_trip, pres_row * iv_sh)
     return e
 
 
-def log_zc(model, ix, u, z=None, beta=1.0):
+def log_zc(model, ix, u, z=None, beta=1.0, b_slot=None, iv_shift=None):
     has_f = getattr(model, "f_extra", None) is not None
     has_m2 = getattr(model, "presence_phi", False) and beta != 0.0
     has_m3 = getattr(model, "cat_rho0", False)
-    if not has_f and not has_m2 and not has_m3:
+    iv_sh = row_iv_shift(model, ix, b_slot=b_slot) if iv_shift is None else iv_shift
+    has_m4b = iv_sh is not None
+    if not has_f and not has_m2 and not has_m3 and not has_m4b:
         from interaction_particles import differentiable_logz_beta0
         return differentiable_logz_beta0(model, ix, u)
     from poly_degree_native import log_poly_tree_degree_native
@@ -357,6 +394,8 @@ def log_zc(model, ix, u, z=None, beta=1.0):
         if cshift is not None:
             km1 = (degree_axis - 1.0).clamp_min(0.0)
             log_g = log_g - cshift[:, None] * km1[None, :]
+    if has_m4b:
+        log_g = torch.cat([log_g[:, :1], log_g[:, 1:] + iv_sh[:, None]], dim=1)
     category = torch.full((1, ix.B * ix.Cpad, model.R + 1), -float("inf"),
                           dtype=u.dtype, device=u.device)
     category[..., 0] = 0.0
@@ -389,13 +428,14 @@ def log_zc(model, ix, u, z=None, beta=1.0):
 
 # ---- exact vectorized sampler of S | u -------------------------------------------------------
 @torch.no_grad()
-def sample_slots(model, ix, u, gen, use_cpp: bool | None = None, z=None, beta=1.0):
+def sample_slots(model, ix, u, gen, use_cpp: bool | None = None, z=None, beta=1.0, iv_shift=None):
     """One exact draw per trip from the additive Version-4 law at slot utilities u (category
-    penalty rho_c + f_extra, M2 category presence shift, size/category potential rho_0, 1 <= |S| <= nmax)."""
+    penalty rho_c + f_extra, M2 category presence shift, M4b IV shift, size/category potential rho_0, 1 <= |S| <= nmax)."""
     B, nmax = ix.B, model.nmax
     L = int(ix.row_size.max())
     K = min(model.R, L, nmax)
     cshift = row_cat_shift(model, ix, z, beta=beta)
+    iv_sh = row_iv_shift(model, ix) if iv_shift is None else iv_shift
     has_m3 = bool(getattr(model, "cat_rho0", False))
     if USE_CPP_SAMPLER if use_cpp is None else use_cpp:
         from build_stress_sampler import load_stress_sampler
@@ -405,15 +445,17 @@ def sample_slots(model, ix, u, gen, use_cpp: bool | None = None, z=None, beta=1.
         rho_0 = model.rho_0().detach().contiguous()
         fe_c = model.f_extra.detach().contiguous() if getattr(model, "f_extra", None) is not None else None
         cs_c = cshift.detach().contiguous() if cshift is not None else None
+        iv_c = iv_sh.detach().contiguous() if iv_sh is not None else None
         fe_ptr = fe_c.data_ptr() if fe_c is not None else 0
         cs_ptr = cs_c.data_ptr() if cs_c is not None else 0
+        iv_ptr = iv_c.data_ptr() if iv_c is not None else 0
         seed = int(torch.randint(1, 2**62, (1,), generator=gen).item())
         out = torch.empty(T, dtype=torch.uint8)
         rc = load_stress_sampler().sample_slots_cpp(
             B, ix.n_rows, T, ix.Cpad, K, nmax, int(has_m3), seed,
             u_c.data_ptr(), ix.row_of.data_ptr(), ix.item_pos.data_ptr(),
             ix.row_size.data_ptr(), ix.row_cat.data_ptr(), ix.flat_slot.data_ptr(),
-            rho_c.data_ptr(), rho_0.data_ptr(), fe_ptr, cs_ptr, out.data_ptr())
+            rho_c.data_ptr(), rho_0.data_ptr(), fe_ptr, cs_ptr, iv_ptr, out.data_ptr())
         if rc != 0:
             raise RuntimeError(f"native sample_slots_cpp failed with status {rc}")
         return out.bool()
@@ -444,6 +486,8 @@ def sample_slots(model, ix, u, gen, use_cpp: bool | None = None, z=None, beta=1.
     if cshift is not None:
         km1 = (k_axis - 1.0).clamp_min(0.0)
         g = g - cshift[:, None] * km1[None, :]
+    if iv_sh is not None:
+        g[:, 1:] = g[:, 1:] + iv_sh[:, None]
     G = torch.full((B * ix.Cpad, K + 1), NEG)
     G[:, 0] = 0.0
     G[ix.flat_slot] = g
@@ -523,20 +567,24 @@ def sample_slots(model, ix, u, gen, use_cpp: bool | None = None, z=None, beta=1.
 
 
 @torch.no_grad()
-def gibbs(model, ix, X, r, gen, sweeps=1, beta=1.0, use_cpp: bool | None = None):
+def gibbs(model, ix, X, r, gen, sweeps=1, beta=1.0, use_cpp: bool | None = None, iv_shift=None):
+    b_slot = model.b_flat(ix).detach()
+    iv_sh = row_iv_shift(model, ix, b_slot=b_slot) if iv_shift is None else iv_shift
     if USE_CPP_SAMPLER if use_cpp is None else use_cpp:
         from build_stress_sampler import load_stress_sampler
         B, nmax, T = ix.B, model.nmax, len(ix.item)
         L = int(ix.row_size.max())
         K = min(model.R, L, nmax)
         ph = phi_r(model, r)[ix.item].detach().contiguous()
-        b_base = (model.b_flat(ix).detach() - 0.5 * beta * ph.square().sum(-1)).contiguous()
+        b_base = (b_slot - 0.5 * beta * ph.square().sum(-1)).contiguous()
         rho_c = model.rho_c.detach().contiguous()
         rho_0 = model.rho_0().detach().contiguous()
         fe_c = model.f_extra.detach().contiguous() if getattr(model, "f_extra", None) is not None else None
         psi_c = model.psi_cat.detach().contiguous() if getattr(model, "presence_phi", False) else None
+        iv_c = iv_sh.detach().contiguous() if iv_sh is not None else None
         fe_ptr = fe_c.data_ptr() if fe_c is not None else 0
         psi_ptr = psi_c.data_ptr() if psi_c is not None else 0
+        iv_ptr = iv_c.data_ptr() if iv_c is not None else 0
         has_m3 = bool(getattr(model, "cat_rho0", False))
         seed = int(torch.randint(1, 2**62, (1,), generator=gen).item())
         mask = X.to(torch.uint8).contiguous().clone()
@@ -545,13 +593,13 @@ def gibbs(model, ix, X, r, gen, sweeps=1, beta=1.0, use_cpp: bool | None = None)
             b_base.data_ptr(), ph.data_ptr(), ix.item_trip.data_ptr(), ix.row_of.data_ptr(),
             ix.item_pos.data_ptr(), ix.row_size.data_ptr(), ix.row_cat.data_ptr(),
             ix.row_trip.data_ptr(), ix.flat_slot.data_ptr(), rho_c.data_ptr(),
-            rho_0.data_ptr(), fe_ptr, psi_ptr, mask.data_ptr())
+            rho_0.data_ptr(), fe_ptr, psi_ptr, iv_ptr, mask.data_ptr())
         if rc != 0:
             raise RuntimeError(f"native gibbs_sweeps_cpp failed with status {rc}")
         return mask.bool()
     for _ in range(sweeps):
         z = basket_field(model, ix, X, r) + torch.randn(ix.B, r, generator=gen)
-        X = sample_slots(model, ix, slot_utilities(model, ix, z, r, beta), gen, use_cpp=False, z=z, beta=beta)
+        X = sample_slots(model, ix, slot_utilities(model, ix, z, r, beta), gen, use_cpp=False, z=z, beta=beta, iv_shift=iv_sh)
     return X
 
 
@@ -588,14 +636,18 @@ def pseudo_loglik(model, ix, X, r):
     n_trip = torch.zeros(ix.B).index_add(0, ix.item_trip, x)
     n_wo = (n_trip[ix.item_trip] - x).long()
     rho0 = model.rho_0()
+    new_cat = (nc_wo == 0)
     if getattr(model, "cat_rho0", False):
         k_trip = torch.zeros(ix.B, dtype=torch.long).index_add(0, ix.row_trip, (n_row > 0).long())
-        new_cat = (nc_wo == 0)
         k_wo = (k_trip[ix.item_trip] - X.long() * new_cat.long()).clamp(min=0)
         dsize = new_cat.double() * (rho0[(k_wo + 1).clamp(max=model.nmax)] - rho0[k_wo])
     else:
         dsize = rho0[(n_wo + 1).clamp(max=model.nmax)] - rho0[n_wo]
-    d = model.b_flat(ix) + pair - dcat - dsize
+    b_slot = model.b_flat(ix)
+    d = b_slot + pair - dcat - dsize
+    iv_sh = row_iv_shift(model, ix, b_slot=b_slot)
+    if iv_sh is not None:
+        d = d + new_cat.double() * iv_sh[ix.row_of]
     valid = (n_wo > 0) & (n_wo < model.nmax)
     lp = F.logsigmoid(torch.where(X, d, -d))
     return (lp * valid).sum() / ix.B
@@ -686,6 +738,9 @@ def train(args):
         model.register_parameter("f_extra", torch.nn.Parameter(torch.zeros(C, 3)))
     if args.u_cat:
         model.register_parameter("u_cat", torch.nn.Parameter(torch.zeros(C, model.theta.shape[1])))
+    if args.iv_slope:
+        model.register_parameter("iv_slope_raw", torch.nn.Parameter(torch.full((C,), float(args.iv_slope_init))))
+        model.has_iv_slope = True
     if args.recency:
         # sub-commodity recency (psi, J x 4) and product purchase history (psi_item, C x 3), from zero
         model.register_parameter("psi_item", torch.nn.Parameter(torch.zeros(C, 3)))
@@ -772,7 +827,7 @@ def train(args):
         return float(np.concatenate(lls).mean()), float(np.concatenate(ess_list).mean())
 
     def run_stage(name, epochs, lr_b, lr_l, lr_rho, lr_rho0, lr_phi, step_fn, average, mm_rho=0.0, mm_rho0=0.0, mm_lam=0.0,
-                  monitor_val=False, lr_price=0.0, lr_u_cat=0.0, lr_rec=0.0):
+                  monitor_val=False, lr_price=0.0, lr_u_cat=0.0, lr_rec=0.0, lr_iv_slope=0.0):
         param_groups = [
             {"params": other_base, "lr": lr_b},
             {"params": [model.lam], "lr": lr_l},
@@ -787,6 +842,9 @@ def train(args):
         if getattr(model, "u_cat", None) is not None and lr_u_cat > 0.0:
             param_groups.append({"params": [model.u_cat], "lr": lr_u_cat})
             extra_params.append(model.u_cat)
+        if getattr(model, "iv_slope_raw", None) is not None and lr_iv_slope > 0.0:
+            param_groups.append({"params": [model.iv_slope_raw], "lr": lr_iv_slope})
+            extra_params.append(model.iv_slope_raw)
         if rec_params and lr_rec > 0.0:
             param_groups.append({"params": rec_params, "lr": lr_rec})
             extra_params.extend(rec_params)
@@ -874,6 +932,11 @@ def train(args):
                    "lr_phi": opt.param_groups[4]["lr"],
                    "epoch_seconds": round(time.time() - t_ep, 2),
                    "seconds": round(time.time() - started, 1)}
+            if getattr(model, "has_iv_slope", False) and getattr(model, "iv_slope_raw", None) is not None:
+                lam_c = torch.sigmoid(model.iv_slope_raw.detach())
+                row["iv_slope_mean"] = round(float(lam_c.mean()), 4)
+                row["iv_slope_min"] = round(float(lam_c.min()), 4)
+                row["iv_slope_max"] = round(float(lam_c.max()), 4)
             if sizes:
                 row["chain_mean_size"] = float(np.mean([s[0] for s in sizes]))
                 row["data_mean_size"] = float(np.mean([s[1] for s in sizes]))
@@ -915,13 +978,17 @@ def train(args):
     lr_u_pl = args.lr_u_cat if args.u_cat else 0.0
     lr_u_sml = args.lr_u_cat if args.u_cat else 0.0
     lr_u_cal = 0.5 * args.lr_u_cat if args.u_cat else 0.0
+    lr_iv_pl = args.lr_iv_slope if args.iv_slope else 0.0
+    lr_iv_sml = args.lr_iv_slope if args.iv_slope else 0.0
+    lr_iv_cal = 0.5 * args.lr_iv_slope if args.iv_slope else 0.0
     # stage A: pseudo-likelihood (gentle Phi warm-up with separate rho_0 / rho_c / lam learning rates)
     run_stage("pseudo-likelihood", args.pl_epochs, args.lr_base, lr_lam, args.lr_rho, args.lr_rho0, args.lr_phi_pl,
               lambda bt: (pseudo_loglik(model, bt.ix, bt.obs, r), None), average=False, lr_u_cat=lr_u_pl,
-              lr_rec=args.lr_rec)
+              lr_rec=args.lr_rec, lr_iv_slope=lr_iv_pl)
     torch.save({"model": {k: v.detach().clone() for k, v in model.state_dict().items()}, "rank": r,
                 "use_f_extra": bool(args.f_extra), "presence_phi": bool(args.presence_phi),
                 "cat_rho0": bool(args.cat_rho0), "u_cat": bool(args.u_cat), "recency": bool(args.recency),
+                "iv_slope": bool(args.iv_slope),
                 "stage": "pseudo-likelihood"}, args.out.with_name(args.out.stem + "_pl.pt"))
 
     # stage B: stochastic maximum likelihood with persistent per-trip chains (data-initialized)
@@ -949,18 +1016,18 @@ def train(args):
 
     run_stage("sml", args.sml_epochs, args.lr_base, lr_lam, args.lr_rho, args.lr_rho0, args.lr_phi_sml, sml_step,
               average=True, mm_rho=args.mm_rho, mm_rho0=args.mm_rho0, mm_lam=args.mm_lam, monitor_val=True,
-              lr_price=lr_price_sml, lr_u_cat=lr_u_sml, lr_rec=args.lr_rec)
+              lr_price=lr_price_sml, lr_u_cat=lr_u_sml, lr_rec=args.lr_rec, lr_iv_slope=lr_iv_sml)
     if args.cal_epochs > 0:
         run_stage("calibrate", args.cal_epochs, 0.0, 0.5 * lr_lam, args.lr_rho, args.lr_rho0, 0.0, sml_step,
                   average=False, mm_rho=args.mm_rho, mm_rho0=args.mm_rho0, mm_lam=args.mm_lam,
-                  lr_price=lr_price_cal, lr_u_cat=lr_u_cal, lr_rec=0.5 * args.lr_rec)
+                  lr_price=lr_price_cal, lr_u_cat=lr_u_cal, lr_rec=0.5 * args.lr_rec, lr_iv_slope=lr_iv_cal)
     if val_batches:
         v_ll, v_ess = eval_val_ll()
         emit({"event": "final_val", "val_ll": round(v_ll, 4), "val_ess": round(v_ess, 4)})
     torch.save({"model": {k: v.detach().clone() for k, v in model.state_dict().items()}, "rank": r,
                 "use_f_extra": bool(args.f_extra), "presence_phi": bool(args.presence_phi),
                 "cat_rho0": bool(args.cat_rho0), "unfreeze_price": bool(args.unfreeze_price),
-                "u_cat": bool(args.u_cat), "recency": bool(args.recency),
+                "u_cat": bool(args.u_cat), "recency": bool(args.recency), "iv_slope": bool(args.iv_slope),
                 "stage": "sml", "seconds": time.time() - started, "args": {k: str(v) for k, v in vars(args).items()}},
                args.out.with_suffix(".pt"))
     emit({"event": "trained", "seconds": round(time.time() - started, 1)})
@@ -1088,12 +1155,14 @@ def is_log_z(model, bt, r, gen, burn, components, thin, draws, defensive=0.1):
     lq_all = torch.logaddexp(math.log1p(-defensive) + torch.logsumexp(comp_all, 2) - math.log(Kc),
                              math.log(defensive) + lp_def_all)
     ph_slot = ph_full[ix.item]
-    u0_slot = model.b_flat(ix) - 0.5 * ph_slot.square().sum(-1)
+    b_slot = model.b_flat(ix)
+    u0_slot = b_slot - 0.5 * ph_slot.square().sum(-1)
+    iv_sh = row_iv_shift(model, ix, b_slot=b_slot)
     lzc_list = []
     for d_idx in range(draws):
         z_d = z_all[:, d_idx]
         u_d = u0_slot + (z_d[ix.item_trip] * ph_slot).sum(-1)
-        lzc_list.append(log_zc(model, ix, u_d, z=z_d))
+        lzc_list.append(log_zc(model, ix, u_d, z=z_d, iv_shift=iv_sh))
     log_w = lp_all + torch.stack(lzc_list, 1) - lq_all
     est = torch.logsumexp(log_w, 1) - math.log(draws)
     est_a = torch.logsumexp(log_w[:, :h], 1) - math.log(h)
@@ -1156,7 +1225,16 @@ def evaluate(args):
               "rho_c_min": float(model.rho_c.min()),
               "use_f_extra": getattr(model, "f_extra", None) is not None,
               "presence_phi": bool(getattr(model, "presence_phi", False)),
-              "cat_rho0": bool(getattr(model, "cat_rho0", False))}
+              "cat_rho0": bool(getattr(model, "cat_rho0", False)),
+              "iv_slope": bool(getattr(model, "has_iv_slope", False))}
+    if getattr(model, "has_iv_slope", False) and getattr(model, "iv_slope_raw", None) is not None:
+        lam_c = torch.sigmoid(model.iv_slope_raw.detach())
+        report["iv_slope_lambda"] = {
+            "mean": float(lam_c.mean()),
+            "min": float(lam_c.min()),
+            "max": float(lam_c.max()),
+            "values": [round(float(v), 4) for v in lam_c],
+        }
     t0 = time.time()
 
     # 1. held-out log-likelihood on the certified reference trips
@@ -1247,17 +1325,27 @@ def evaluate(args):
             if product is not None:
                 change = torch.where(ix.item == product, math.log(multiplier), 0.0)
                 ctx = changed_price_context(bt.ctx, ix.item_trip, change)
+            bt.bind(model, ctx)
+            iv_sh_alt = row_iv_shift(model, ix)
+            if iv_sh_alt is not None:
+                iv_sh_alt = iv_sh_alt.detach()
+            iv_sh_base = None
+            if product is not None:
+                bt.bind(model)
+                iv_sh_base = row_iv_shift(model, ix)
+                if iv_sh_base is not None:
+                    iv_sh_base = iv_sh_base.detach()
             lzs, grads, lzb = [], [], []
             for z in zs:
                 bt.bind(model, ctx)
                 u = slot_utilities(model, ix, z, r).detach().requires_grad_(True)
                 with torch.enable_grad():
-                    lz = log_zc(model, ix, u, z=z)
+                    lz = log_zc(model, ix, u, z=z, iv_shift=iv_sh_alt)
                     g, = torch.autograd.grad(lz.sum(), u)
                 lzs.append(lz.detach()); grads.append(g)
                 if product is not None:
                     bt.bind(model)
-                    lzb.append(log_zc(model, ix, slot_utilities(model, ix, z, r), z=z))
+                    lzb.append(log_zc(model, ix, slot_utilities(model, ix, z, r), z=z, iv_shift=iv_sh_base))
             lzs = torch.stack(lzs, 1)                                # B x K
             logw = (lzs - torch.stack(lzb, 1)) if product is not None else torch.zeros_like(lzs)
             w = torch.softmax(logw, 1)                               # per-trip self-normalized weights
@@ -1367,6 +1455,12 @@ def main():
                    help="purchase history: sub-commodity recency (psi) and product history (psi_item), trained from stage A")
     p.add_argument("--lr-rec", type=float, default=5e-3, help="learning rate for psi and psi_item (halved in calibrate)")
     p.add_argument("--rec-prec", type=float, default=2.0, help="weak prior precision on psi and psi_item centred at 0")
+    p.add_argument("--iv-slope", action="store_true",
+                   help="M4b: per-category presence term (lambda_c - 1) * IV_c(x) with lambda_c = sigmoid(raw) in (0, 1]")
+    p.add_argument("--lr-iv-slope", type=float, default=0.05,
+                   help="M4b: learning rate for iv_slope_raw in PL and SML (halved in calibrate)")
+    p.add_argument("--iv-slope-init", type=float, default=0.0,
+                   help="M4b: initial raw logit for lambda_c = sigmoid(iv_slope_raw)")
     p.add_argument("--cpp-sampler", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--eval-batch", type=int, default=256)
     p.add_argument("--ll-trips", type=int, default=0)

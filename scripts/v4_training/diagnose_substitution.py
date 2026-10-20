@@ -108,7 +108,7 @@ def log_zc_with_cat_presence_shift(
     has_f = getattr(model, "f_extra", None) is not None
     has_m2 = getattr(model, "presence_phi", False) and beta != 0.0
     has_m3 = getattr(model, "cat_rho0", False)
-    has_m4b = getattr(model, "iv_slope", False) and getattr(model, "iv_slope_raw", None) is not None
+    has_m4b = getattr(model, "has_iv_slope", False)
 
     scale = seg_max(u.unsqueeze(0), ix.item_trip, ix.B)[0]
     centred = u - scale[ix.item_trip]
@@ -136,6 +136,7 @@ def log_zc_with_cat_presence_shift(
     if has_m4b and hasattr(stress, "row_iv_shift"):
         iv_sh = stress.row_iv_shift(model, ix)
         if iv_sh is not None:
+            iv_sh = iv_sh.detach()
             log_g = torch.cat([log_g[:, :1], log_g[:, 1:] + iv_sh[:, None]], dim=1)
 
     log_g = torch.cat([log_g[:, :1], log_g[:, 1:] + row_pres_shift[:, None]], dim=1)
@@ -323,7 +324,11 @@ def evaluate_model_substitution(
     stress.USE_CPP_SAMPLER = True
     blob = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
     data, model, meta, batcher = setup(
-        initialization, additive, threads, recency=bool(blob.get("recency", False))
+        initialization,
+        additive,
+        threads,
+        recency=bool(blob.get("recency", False)),
+        iv_slope=bool(blob.get("iv_slope", False)),
     )
     configure_model_from_blob(model, blob)
     model.eval()

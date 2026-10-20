@@ -93,8 +93,9 @@ def main():
     args = p.parse_args()
 
     stress.USE_CPP_SAMPLER = True
-    data, model, meta, batcher = setup(args.initialization, args.additive, args.threads)
     blob = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
+    data, model, meta, batcher = setup(args.initialization, args.additive, args.threads,
+                                       recency=bool(blob.get("recency", False)))
     stress.configure_model_from_blob(model, blob)
     model.eval()
     for q in model.parameters():

@@ -131,6 +131,7 @@ def setup(initialization, additive, threads, recency=False, iv_slope=False):
     model.presence_phi = False
     model.cat_rho0 = False
     model.has_iv_slope = False
+    model.iv_price_only = False
     orig_b_at = model.b_at
 
     def b_at_with_u_cat(it, trip, c):
@@ -183,6 +184,7 @@ def configure_model_from_blob(model, blob):
             model.iv_slope_raw = torch.nn.Parameter(torch.zeros_like(st["iv_slope_raw"]))
     else:
         model.has_iv_slope = False
+    model.iv_price_only = bool(blob.get("iv_price_only", False))
     model.cat_rho0 = bool(blob.get("cat_rho0", False))
     model.load_state_dict(st)
 
@@ -295,18 +297,30 @@ def iv_slope_lambda(model):
     return None
 
 
+PRICE_KEYS = ("dlp", "dlp_bar", "disp", "mail")
+
+
+def row_logsumexp(ix, b_slot):
+    from ragged import seg_max, seg_sum
+    m_r = seg_max(b_slot.unsqueeze(0), ix.row_of, ix.n_rows)[0].detach()
+    w_s = torch.exp(b_slot - m_r[ix.row_of])
+    return m_r + torch.log(seg_sum(w_s.unsqueeze(0), ix.row_of, ix.n_rows)[0].clamp_min(1e-300))
+
+
 def row_iv_shift(model, ix, b_slot=None):
-    """Per-row M4b category inclusive-value presence shift (lambda_c - 1) * IV_{tc}(b)."""
+    """Per-row category inclusive-value presence shift (lambda_c - 1) * IV_{tc}(b) (M4b), or with
+    model.iv_price_only (M4c) (lambda_c - 1) * [IV_{tc}(b) - IV_{tc}(b at regular price)], the
+    regular price being no price deviation, display or mailer.  Either way a function of the
+    context only, so the normaliser stays exact."""
     lam_c = iv_slope_lambda(model)
     if lam_c is None:
         return None
     if b_slot is None:
         b_slot = model.b_flat(ix)
-    from ragged import seg_max, seg_sum
-    m_r = seg_max(b_slot.unsqueeze(0), ix.row_of, ix.n_rows)[0].detach()
-    w_s = torch.exp(b_slot - m_r[ix.row_of])
-    sum_r = seg_sum(w_s.unsqueeze(0), ix.row_of, ix.n_rows)[0]
-    iv_r = m_r + torch.log(sum_r.clamp_min(1e-300))
+    iv_r = row_logsumexp(ix, b_slot)
+    if getattr(model, "iv_price_only", False):
+        regular = {k: (torch.zeros_like(v) if k in PRICE_KEYS else v) for k, v in model.ctx.items()}
+        iv_r = iv_r - row_logsumexp(ix, model.b_at(ix.item, ix.item_trip, regular))
     return (lam_c[ix.row_cat] - 1.0) * iv_r
 
 
@@ -741,6 +755,7 @@ def train(args):
     if args.iv_slope:
         model.register_parameter("iv_slope_raw", torch.nn.Parameter(torch.full((C,), float(args.iv_slope_init))))
         model.has_iv_slope = True
+        model.iv_price_only = bool(args.iv_price_only)
     if args.recency:
         # sub-commodity recency (psi, J x 4) and product purchase history (psi_item, C x 3), from zero
         model.register_parameter("psi_item", torch.nn.Parameter(torch.zeros(C, 3)))
@@ -988,7 +1003,7 @@ def train(args):
     torch.save({"model": {k: v.detach().clone() for k, v in model.state_dict().items()}, "rank": r,
                 "use_f_extra": bool(args.f_extra), "presence_phi": bool(args.presence_phi),
                 "cat_rho0": bool(args.cat_rho0), "u_cat": bool(args.u_cat), "recency": bool(args.recency),
-                "iv_slope": bool(args.iv_slope),
+                "iv_slope": bool(args.iv_slope), "iv_price_only": bool(args.iv_price_only),
                 "stage": "pseudo-likelihood"}, args.out.with_name(args.out.stem + "_pl.pt"))
 
     # stage B: stochastic maximum likelihood with persistent per-trip chains (data-initialized)
@@ -1027,7 +1042,7 @@ def train(args):
     torch.save({"model": {k: v.detach().clone() for k, v in model.state_dict().items()}, "rank": r,
                 "use_f_extra": bool(args.f_extra), "presence_phi": bool(args.presence_phi),
                 "cat_rho0": bool(args.cat_rho0), "unfreeze_price": bool(args.unfreeze_price),
-                "u_cat": bool(args.u_cat), "recency": bool(args.recency), "iv_slope": bool(args.iv_slope),
+                "u_cat": bool(args.u_cat), "recency": bool(args.recency), "iv_slope": bool(args.iv_slope), "iv_price_only": bool(args.iv_price_only),
                 "stage": "sml", "seconds": time.time() - started, "args": {k: str(v) for k, v in vars(args).items()}},
                args.out.with_suffix(".pt"))
     emit({"event": "trained", "seconds": round(time.time() - started, 1)})
@@ -1226,7 +1241,8 @@ def evaluate(args):
               "use_f_extra": getattr(model, "f_extra", None) is not None,
               "presence_phi": bool(getattr(model, "presence_phi", False)),
               "cat_rho0": bool(getattr(model, "cat_rho0", False)),
-              "iv_slope": bool(getattr(model, "has_iv_slope", False))}
+              "iv_slope": bool(getattr(model, "has_iv_slope", False)),
+              "iv_price_only": bool(getattr(model, "iv_price_only", False))}
     if getattr(model, "has_iv_slope", False) and getattr(model, "iv_slope_raw", None) is not None:
         lam_c = torch.sigmoid(model.iv_slope_raw.detach())
         report["iv_slope_lambda"] = {
@@ -1459,6 +1475,8 @@ def main():
                    help="M4b: per-category presence term (lambda_c - 1) * IV_c(x) with lambda_c = sigmoid(raw) in (0, 1]")
     p.add_argument("--lr-iv-slope", type=float, default=0.05,
                    help="M4b: learning rate for iv_slope_raw in PL and SML (halved in calibrate)")
+    p.add_argument("--iv-price-only", action="store_true",
+                   help="M4c: with --iv-slope, discount only the price part of IV (actual minus regular price)")
     p.add_argument("--iv-slope-init", type=float, default=0.0,
                    help="M4b: initial raw logit for lambda_c = sigmoid(iv_slope_raw)")
     p.add_argument("--cpp-sampler", action=argparse.BooleanOptionalAction, default=True)

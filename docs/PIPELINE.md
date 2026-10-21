@@ -1,7 +1,7 @@
 # The Version-4 pipeline
 
 This is the write-up of the pipeline as it stands on 2026-10-21: what the model is, the stages
-that fit it, which parameters each stage learns, how models are chosen and checked, where it
+that fit it, which parameters each stage learns, what is decided on validation data, how it is checked, where it
 works well and where it does not yet. Every command is in `run/`. The code is in `v4/` (the
 model), `scripts/` (one script per stage), `checks/` (the real-data discount and promotion check),
 `shopper/` (the SHOPPER baseline) and `tests/` (exact checks that need no data).
@@ -128,18 +128,26 @@ presence, category pairs and product rates.
 
 Without `--recency` the unused recency loading psi sits with the price block.
 
-## 5. How models are chosen
+## 5. What is decided on validation data
 
-- Every choice uses **validation** only: the additive fit's early stopping (validation weeks),
-  Version-4's early stopping (held-out training trips), and the choice between variants (e.g.
-  with or without M4c), which uses the validation log-likelihood and the validation discount check.
-- **Test weeks are opened once per final model** (`run/dunnhumby.sh` stage 5, only when
-  `CHOSEN` is set).
-- On the stress world the rules are fixed in advance: paired held-out log-likelihood above
+There is one model. Fitting it involves a few decisions about which fitted version to keep,
+and all of them use validation data only:
+
+- **When to stop training.** Each fit saves checkpoints along the way, and the one with the
+  best held-out score is kept: validation weeks for the additive fit, 2,048 held-out training
+  trips for the Version-4 fit.
+- **Whether to switch on an optional block.** M4c (and recency) are parts of the same model
+  that can be switched off, which makes them zero. Whether to keep M4c is decided by the
+  validation log-likelihood and the validation discount check.
+- **The test weeks are used once**, only for the final fitted model (`run/dunnhumby.sh` stage 5,
+  only when `CHOSEN` is set), so nothing is ever picked by looking at test results.
+
+Two related fixed rules:
+- On the stress world the pass rules were fixed in advance: paired held-out log-likelihood above
   the certified model (household-clustered 95% interval above 0), category-presence realism AUC
   of at most 0.80, and own-price scenario correlation of at least 0.85.
-- SHOPPER follows its own locked protocol (`docs/SHOPPER_BASELINE_PROTOCOL.md`); changes need a
-  dated amendment.
+- SHOPPER, the comparison model, has one setting chosen on validation (its taste size K) under
+  its own locked protocol (`docs/SHOPPER_BASELINE_PROTOCOL.md`); changes need a dated amendment.
 
 ## 6. The checks
 

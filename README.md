@@ -5,7 +5,7 @@ transaction data, used for basket likelihood, realistic basket generation and pr
 promotion counterfactuals (own product and substitutes).
 
 - **Write-up:** [`docs/PIPELINE.md`](docs/PIPELINE.md): the model, the stages, which parameters
-  each stage learns, how models are chosen and checked, current results and known weaknesses.
+  each stage learns, what is decided on validation data, the checks, current results and known weaknesses.
 - **Run:** `run/dunnhumby.sh`, `run/stress_world.sh`, `run/shopper.sh` (see the write-up, §8).
 - **Check:** `python3 -m pytest -q`: exact tests against enumeration on a tiny world (no data).
 

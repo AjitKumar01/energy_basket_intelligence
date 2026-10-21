@@ -388,8 +388,11 @@ def main():
             z = model.basket_field(ix, X) + torch.randn(ix.B, args.rank, generator=gen)
             n_row = torch.zeros(ix.n_rows).index_add_(0, ix.row_of, X.double())
             present = torch.zeros(C).index_add_(0, ix.row_cat, (n_row > 0).double())
-        value = (model.energy(bt) - log_partition(model, ix, model.slot_utilities_given_z(ix, z), z=z,
-                                                  iv=model.iv_shift(ix))).mean()
+        # Utilities and the M4c shift once per step, shared by the energy and the normaliser.
+        b = model.slot_utilities(ix)
+        iv = model.iv_shift(ix, b_slot=b)
+        value = (model.energy(bt, iv=iv)
+                 - log_partition(model, ix, model.slot_utilities_given_z(ix, z, b=b), z=z, iv=iv)).mean()
         chain_size = float(torch.zeros(ix.B).index_add_(0, ix.item_trip, X.double()).mean())
         return value, (chain_size, float(bt.observed.sum()) / ix.B, present)
 

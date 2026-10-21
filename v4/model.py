@@ -178,15 +178,16 @@ class BasketModel(torch.nn.Module):
         """b at every offered slot of the bound batch."""
         return self.utilities(ix.item, ix.item_trip, self.ctx)
 
-    def slot_utilities_given_z(self, ix, z, beta=1.0):
+    def slot_utilities_given_z(self, ix, z, beta=1.0, b=None):
         """Utilities of the law of S given the latent z (B x rank):
 
             b - beta |phi_j|^2 / 2 + sqrt(beta) z . phi_j.
 
         Writing exp(sum_{i<j} phi_i.phi_j) = E_z exp(z . sum_j phi_j - sum_j |phi_j|^2 / 2),
-        z ~ N(s, I) given S, removes the pairwise term.  beta in [0, 1] tempers it."""
+        z ~ N(s, I) given S, removes the pairwise term.  beta in [0, 1] tempers it.
+        ``b``: the slot utilities, if already computed."""
         ph = self.phi_r()[ix.item]
-        u = self.slot_utilities(ix) - 0.5 * beta * ph.square().sum(-1)
+        u = (self.slot_utilities(ix) if b is None else b) - 0.5 * beta * ph.square().sum(-1)
         if z is not None:
             u = u + math.sqrt(beta) * (z[ix.item_trip] * ph).sum(-1)
         return u
@@ -250,11 +251,12 @@ class BasketModel(torch.nn.Module):
             raise ValueError(f"a basket of size {int(n.max())} is outside 1..{self.nmax}")
         return lin + pair - category - self.rho_0()[n]
 
-    def energy(self, batch):
-        """E(S) of each observed basket in a bound batch, with every Version-4 term present."""
+    def energy(self, batch, iv=None):
+        """E(S) of each observed basket in a bound batch, with every Version-4 term present.
+        ``iv``: the M4c shift of the batch, if already computed."""
         e = self.additive_energy(batch.line_item, batch.line_trip, batch.line_cat,
                                  batch.ix.B, batch.line_ctx)
-        iv = self.iv_shift(batch.ix)
+        iv = self.iv_shift(batch.ix) if iv is None else iv
         if (self.f_extra is None and self.psi_cat is None and not self.size_on_categories
                 and iv is None):
             return e

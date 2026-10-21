@@ -4,6 +4,8 @@ One joint probability model of shopping baskets with an exact normaliser, fitted
 transaction data, used for basket likelihood, realistic basket generation and price and
 promotion counterfactuals (own product and substitutes).
 
+- **Theory:** [`docs/THEORY.md`](docs/THEORY.md): the model, the exact normaliser, interactions through a
+  Gaussian latent, exact sampling and generation, counterfactuals, estimation, with all formulas.
 - **Write-up:** [`docs/PIPELINE.md`](docs/PIPELINE.md): the model, the stages, which parameters
   each stage learns, what is decided on validation data, the checks, current results and known weaknesses.
 - **Run:** `run/dunnhumby.sh`, `run/stress_world.sh`, `run/shopper.sh` (see the write-up, §8).

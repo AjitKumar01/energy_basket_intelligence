@@ -20,8 +20,8 @@ the model gives every possible non-empty basket a probability:
 
 A product's utility b_j adds its popularity, the household's taste, its price (relative to the
 trip's other prices, with discounts priced separately), display and mailer, the season, the
-store, and the household's purchase history. All formulas are written out at the top of
-`v4/model.py`.
+store, and the household's purchase history. The full theory, with every formula and derivation, is in
+[`THEORY.md`](THEORY.md).
 
 The normaliser Z is computed **exactly**: with phi = 0 by a dynamic program over categories and
 basket sizes (`v4/exact.py`); with phi != 0 the pair term is written as an average over a

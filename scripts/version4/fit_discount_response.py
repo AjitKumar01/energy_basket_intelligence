@@ -1419,6 +1419,7 @@ def evaluate_version4_counterfactual_q4(
     rank5_ckpt: Path,
     init_ckpt: Path,
     empirical_depth_slopes: dict[str, float] | None = None,
+    empirical_promotion_coefficients: dict | None = None,
     threads: int = 8,
     burn: int = 200,
     draws: int = 64,
@@ -1573,6 +1574,11 @@ def evaluate_version4_counterfactual_q4(
     add_item_single_cf_prev_price = np.zeros((J, n_stores, 102), dtype=np.float64)
     add_item_chain_cf_prev_price = np.zeros((J, n_stores, 102), dtype=np.float64)
     add_cat_item_chain_cf_prev_price = np.zeros((n_merch_cats, n_stores, 102), dtype=np.float64)
+    # Additive model with only the product's display (or mailer) switched on / off, everything
+    # else as observed.  One utility changes, so the exact incidence follows from the factual
+    # one by the single-utility tilt p(du) = p e^du / (1 - p + p e^du).
+    add_item_promo = {key: np.zeros((J, n_stores, 102), dtype=np.float64)
+                      for key in ("disp_on", "disp_off", "mail_on", "mail_off")}
 
     gen = torch.Generator().manual_seed(seed + 17)
     batch_size = 128
@@ -1642,6 +1648,13 @@ def evaluate_version4_counterfactual_q4(
         p_add_0_np = p_add_0.numpy()
         np.add.at(add_item_factual, (slot_item, slot_store, slot_week), p_add_0_np)
         np.add.at(add_cat_item_factual, (slot_cat, slot_store, slot_week), p_add_0_np)
+        for name, weight in (("disp", model_add.w_dsp), ("mail", model_add.w_mlr)):
+            w_slot = weight.detach()[ix.item].double()
+            state = bt.ctx[name].double()
+            for side, du in (("on", w_slot * (1.0 - state)), ("off", -w_slot * state)):
+                tilted = p_add_0 * torch.exp(du) / (1.0 - p_add_0 + p_add_0 * torch.exp(du))
+                np.add.at(add_item_promo[f"{name}_{side}"], (slot_item, slot_store, slot_week),
+                          tilted.numpy())
 
         if need_cf:
             # The additive model's own price slopes and multiplier (they may differ from rank-5's).
@@ -1979,6 +1992,36 @@ def evaluate_version4_counterfactual_q4(
         add_cat_item_chain_cf_prev_price,
     )
 
+    def promotion_effect(name):
+        """Model log ratio of the product's within-category share (and purchase rate) with its
+        display/mailer on vs off, everything else as observed in the event's week; compare with
+        the empirical conditional-binomial coefficient of display_change / mailer_change."""
+        f_cat = add_cat_item_factual[ev_cat, ev_store, ev_week]
+        f_item = add_item_factual[ev_item, ev_store, ev_week]
+        on = add_item_promo[f"{name}_on"][ev_item, ev_store, ev_week]
+        off = add_item_promo[f"{name}_off"][ev_item, ev_store, ev_week]
+        rest = np.maximum(f_cat - f_item, 0.0)
+        ok = (on > 0) & (off > 0) & (rest > 0)
+        share = np.log(on[ok] / (rest[ok] + on[ok])) - np.log(off[ok] / (rest[ok] + off[ok]))
+        rate = np.log(on[ok]) - np.log(off[ok])
+        wt = f_item[ok] / f_item[ok].sum()
+        weight = (model_add.w_dsp if name == "disp" else model_add.w_mlr).detach().numpy()
+        return {"events": int(ok.sum()),
+                "choice_share_log_ratio_mean": float(share.mean()),
+                "choice_share_log_ratio_purchase_weighted": float((wt * share).sum()),
+                "purchase_rate_log_ratio_mean": float(rate.mean()),
+                "purchase_rate_log_ratio_purchase_weighted": float((wt * rate).sum()),
+                "share_of_events_with_negative_effect": float((share < 0).mean()),
+                "event_products_weight_mean": float(weight[ev_item[ok]].mean()),
+                "catalogue_weight_mean": float(weight.mean()),
+                "catalogue_share_negative_weight": float((weight < 0).mean())}
+
+    additive_results["promotion_on_vs_off"] = {
+        "display": promotion_effect("disp"), "mailer": promotion_effect("mail"),
+        "empirical_coefficients": {
+            split: {k: float(v) for k, v in coefs.items()}
+            for split, coefs in (empirical_promotion_coefficients or {}).items()}}
+
     s_inf_r5 = rank5_results["single_item_exact_price_counterfactual_choice_share"][
         "informative_test_events"
     ]
@@ -2156,12 +2199,17 @@ def main() -> None:
             for split_name in ("train", "validation", "test")
             if split_name in report.get("estimated_promotion_effects", {})
         }
+        emp_promo = {
+            split_name: {k: v["estimate"] for k, v in effects["effects"].items()}
+            for split_name, effects in report.get("estimated_promotion_effects", {}).items()
+        }
         model_check = evaluate_version4_counterfactual_q4(
             test_events=test,
             additive_ckpt=args.additive_checkpoint.resolve(),
             rank5_ckpt=args.rank5_checkpoint.resolve(),
             init_ckpt=args.init_checkpoint.resolve(),
             empirical_depth_slopes=emp_slopes,
+            empirical_promotion_coefficients=emp_promo,
             threads=args.threads,
             burn=args.burn,
             draws=args.draws,
@@ -2413,12 +2461,17 @@ def main() -> None:
             )
             for split_name in ("train", "validation", "test")
         }
+        emp_promo = {
+            split_name: {k: v["estimate"] for k, v in effects["effects"].items()}
+            for split_name, effects in q3_analysis["joint_choice_effects_by_split"].items()
+        }
         model_check = evaluate_version4_counterfactual_q4(
             test_events=test,
             additive_ckpt=args.additive_checkpoint.resolve(),
             rank5_ckpt=args.rank5_checkpoint.resolve(),
             init_ckpt=args.init_checkpoint.resolve(),
             empirical_depth_slopes=emp_slopes,
+            empirical_promotion_coefficients=emp_promo,
             threads=args.threads,
             burn=args.burn,
             draws=args.draws,

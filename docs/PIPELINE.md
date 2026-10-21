@@ -48,7 +48,7 @@ A bundle is a directory prepared by a dataset adapter (outside this repository):
 Dunnhumby: 5,455 products, 1,920 households, 115 stores, 300 model categories, 200,698
 baskets, basket sizes 1–120; training weeks 9–82, validation 83–90, test 91–101.
 Stress world (synthetic, known truth): 476 products, 2,802 households, 15 stores, 48 categories,
-sizes 1–34.
+sizes 1–34; how it is generated is in [`STRESS_WORLD.md`](STRESS_WORLD.md).
 
 ## 3. The stages
 

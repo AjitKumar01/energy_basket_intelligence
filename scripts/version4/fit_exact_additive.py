@@ -105,6 +105,20 @@ def parse_args():
         "--disable-price-response", action="store_true",
         help=("fix every price sensitivity to zero when held-out observational price "
               "evidence is not certified"))
+    parser.add_argument(
+        "--price-feature-contract", choices=("chain_and_store", "chain_product_week_only"),
+        help=("price panel: chain_product_week_only drops the store deviations, which exist "
+              "only where the product sold (default: the certified coefficients' contract, "
+              "else chain_and_store)"))
+    parser.add_argument(
+        "--discount-panel", type=Path,
+        help=("centred discount-depth panel (scripts/v4_training/build_discount_panel.py) "
+              "that splits each price deviation into regular and discount parts"))
+    parser.add_argument("--disc-kappa", action="store_true",
+                        help="with --discount-panel: own relative multiplier for the discount part")
+    parser.add_argument("--disc-common", action="store_true",
+                        help="with --discount-panel: a common discount slope for all households "
+                             "and products, starting at zero")
     parser.add_argument("--pool-prod", type=float, default=0.0)
     parser.add_argument("--lam-centre", type=int, default=0)
     parser.add_argument("--lam-sd-max", type=float, default=0.0)
@@ -162,6 +176,8 @@ def fitted_parameters(model):
     # blocks are absent because this file fits incidence baskets, not line-unit counts.
     names = ("lam", "alpha", "theta", "rho_c", "rho_0_free", "price_kappa",
              "gamma", "beta", "w_dsp", "w_mlr", "mu", "delta", "zeta", "xi")
+    names = names + tuple(n for n in ("disc_kappa", "disc_common")
+                          if getattr(model, n, None) is not None)
     return [getattr(model, name) for name in names
             if getattr(model, name).requires_grad]
 
@@ -357,12 +373,28 @@ def main():
     price_feature_contract = (
         price_provenance.get("price_feature_contract", "chain_and_store")
         if price_provenance is not None else "chain_and_store")
+    if args.price_feature_contract is not None:
+        if price_provenance is not None and args.price_feature_contract != price_feature_contract:
+            raise SystemExit("--price-feature-contract differs from the certified coefficients' contract")
+        price_feature_contract = args.price_feature_contract
     if price_feature_contract not in {"chain_and_store", "chain_product_week_only"}:
         raise RuntimeError(f"unknown price feature contract {price_feature_contract!r}")
+    if (args.disc_kappa or args.disc_common) and args.discount_panel is None:
+        raise SystemExit("--disc-kappa and --disc-common need --discount-panel")
+    discount_panel = args.discount_panel.resolve() if args.discount_panel is not None else None
     features = Features(
         int(data["n_item"]), int(data["n_store"]),
         include_recency=not bool(meta.get("no_rec", False)),
-        include_store_price=price_feature_contract == "chain_and_store")
+        include_store_price=price_feature_contract == "chain_and_store",
+        discount_panel=discount_panel or False)
+    # Optional discount split; its starting values reproduce the one-slope model exactly.
+    if args.disc_kappa:
+        model.disc_kappa = torch.nn.Parameter(model.price_kappa.detach().clone())
+    if args.disc_common:
+        model.disc_common = torch.nn.Parameter(torch.zeros((), dtype=model.lam.dtype))
+    discount_record = None if discount_panel is None else {
+        "discount_panel": str(discount_panel), "discount_panel_sha256": file_sha256(discount_panel),
+        "disc_kappa": bool(args.disc_kappa), "disc_common": bool(args.disc_common)}
     batcher = Batcher(data, features, int(meta["nmax"]),
                       include_recency=not bool(meta.get("no_rec", False)))
     train = supported_trips(data, 0, int(meta["nmax"]))
@@ -408,6 +440,10 @@ def main():
         for key in ("batch", "seed"):
             if int(prior[key]) != int(getattr(args, key)):
                 raise RuntimeError(f"--{key} must remain {prior[key]} when resuming")
+        if resumed.get("price_feature_contract", "chain_and_store") != price_feature_contract:
+            raise RuntimeError("the price feature contract must remain unchanged when resuming")
+        if resumed.get("discount_split") != discount_record:
+            raise RuntimeError("the discount split must remain unchanged when resuming")
         prior_reward = float(prior.get("rho_c_max_category_reward", 0.0))
         if prior_reward != float(args.rho_c_max_category_reward):
             raise RuntimeError(
@@ -508,6 +544,8 @@ def main():
                 "matched_store_conditional_binomial_hierarchy_v1"
                 if supported_price_audit is not None else "exact_dp_fourth_order"),
             "supported_price_component": supported_price_audit,
+            "price_feature_contract": price_feature_contract,
+            "discount_split": discount_record,
             "optimization_contract": "regularized fit with validation early stopping; not a stationarity certificate",
             "fresh_artifact_digest": restored["model_state_sha256"],
             "data_fingerprint_sha256": meta["data_fingerprint_sha256"],

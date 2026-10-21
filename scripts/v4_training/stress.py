@@ -146,8 +146,13 @@ def setup(initialization, additive, threads, recency=False, iv_slope=False):
         return b
 
     model.b_at = b_at_with_u_cat
+    # The parent's price panel: older parents record no contract and used store deviations.
+    contract = raw.get("price_feature_contract") or (
+        raw.get("supported_price_component") or {}).get("price_feature_contract", "chain_and_store")
+    split = raw.get("discount_split") or {}
     features = Features(int(data["n_item"]), int(data["n_store"]), include_recency=recency,
-                        include_store_price=True)
+                        include_store_price=contract == "chain_and_store",
+                        discount_panel=split.get("discount_panel"))
     batcher = Batcher(data, features, int(meta["nmax"]), include_recency=recency)
     if (getattr(model, "disc_kappa", None) is not None
             or getattr(model, "disc_common", None) is not None) and features.dsc is None:

@@ -5,7 +5,7 @@ entry under "Amendments" with the reason; results are reported against this prot
 
 ## Implementation
 
-`scripts/shopper/` is a PyTorch reimplementation of SHOPPER (Ruiz, Athey and Blei,
+`shopper/` is a PyTorch reimplementation of SHOPPER (Ruiz, Athey and Blei,
 arXiv 1711.03560; the released C++/CUDA code needs an NVIDIA GPU). Deliberate differences
 from the released code, stated with every result:
 

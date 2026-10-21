@@ -1,14 +1,13 @@
 # Python 3.11+ (developed and verified on 3.13.4).
 #
-# Exact pins are the clean-clone certification environment.  Change them only with a
+# Exact pins of the environment the pipeline was verified in.  Change them only with a
 # fresh smoke run because PyTorch C++ extensions are ABI-specific.
 
 numpy==2.3.5
 pandas==2.3.3
 pyarrow==21.0.0        # parquet engine for the model-data bundle
 scipy==1.16.3          # optimisation and sparse matrices
-scikit-learn==1.7.2    # deterministic household segmentation audit
+scikit-learn==1.7.2    # taste initialization (SVD) and the realism classifier
 torch==2.9.1           # model, exact normalizer and optimisation; CPU execution
-numba==0.63.1          # compiled exact basket sampler for joint refinement
 setuptools==80.9.0     # builds the local PyTorch C++ extension
 pytest==9.0.1          # unit tests

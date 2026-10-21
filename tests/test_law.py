@@ -69,8 +69,10 @@ def test_energy_matches_gaussian_identity(name):
         assert abs(float(e[t]) - full_energy(model, ix, b, iv, observed[t])) < 1e-10
 
 
-def test_sampler_matches_exact_marginals():
+@pytest.mark.parametrize("cap", [NMAX, 2])
+def test_sampler_matches_exact_marginals(cap):
     model = make_model(**BLOCKS["all"])
+    model.R = cap
     base = make_batch()
     reps = 20000
     batch = make_batch()
@@ -97,6 +99,7 @@ def test_sampler_matches_exact_marginals():
     assert float((freq - exact_p).abs().max()) < 4 * math.sqrt(0.25 / reps)
     sizes = torch.zeros(2 * reps).index_add_(0, ix.item_trip, X.double())
     assert int(sizes.min()) >= 1 and int(sizes.max()) <= NMAX
+    assert int(torch.zeros(ix.n_rows).index_add_(0, ix.row_of, X.double()).max()) <= cap
 
 
 def test_gibbs_and_importance_sampling_match_full_law():
@@ -180,3 +183,23 @@ def test_price_context_and_single_utility_tilt():
     _, p1 = exact.incidence(model, ix, u1)
     s = int(torch.nonzero(ix.item == 3)[0])
     assert abs(float(own_price_tilt(p0[s], u1[s] - u0[s])) - float(p1[s])) < 1e-12
+
+
+@pytest.mark.parametrize("name", ["additive", "all"])
+def test_cap_on_products_per_category(name):
+    """With R < nmax the law is the same law restricted to at most R products per category."""
+    model = make_model(**BLOCKS[name])
+    model.R = 2
+    batch = make_batch()
+    batch.bind(model)
+    ix = batch.ix
+    z = torch.randn(2, RANK, generator=torch.Generator().manual_seed(8))
+    u = model.slot_utilities_given_z(ix, z).detach()
+    iv = model.iv_shift(ix)
+    lz, p = exact.incidence(model, ix, u, z=z, iv=iv)
+    for t in range(2):
+        energies = {S: energy_given_z(model, ix, u, z, iv, S) for S in baskets_of(ix, t, max_per_category=2)}
+        lz_t = log_sum_exp(list(energies.values()))
+        assert abs(float(lz[t]) - lz_t) < 1e-10
+        for s in (s for s in range(len(ix.item)) if int(ix.item_trip[s]) == t):
+            assert abs(float(p[s]) - sum(math.exp(e - lz_t) for S, e in energies.items() if s in S)) < 1e-10

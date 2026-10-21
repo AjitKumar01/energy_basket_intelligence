@@ -107,7 +107,7 @@ def version4_flags(blob) -> dict:
     if "iv_slope_raw" in state and not blob.get("iv_price_only", False):
         raise ValueError("M4b (full inclusive value) checkpoints are not supported; only M4c")
     return {"rank": int(blob["rank"]), "size_on_categories": bool(blob.get("cat_rho0", False)),
-            "recency": bool(blob.get("recency", False))}
+            "recency": bool(blob.get("recency", False)), "max_per_category": blob.get("max_per_category")}
 
 
 def load_version4(path, data, root=None, *, initialization=None, additive=None):
@@ -123,6 +123,8 @@ def load_version4(path, data, root=None, *, initialization=None, additive=None):
     model.load_fitted_state(blob["model"])
     model.rank = flags["rank"]
     model.size_on_categories = flags["size_on_categories"]
+    if flags["max_per_category"] is not None:
+        model.R = int(flags["max_per_category"])
     batcher = batcher_for(data, root, parent, recency=flags["recency"],
                           purchase_history=flags["recency"])
     return model, batcher, blob, meta

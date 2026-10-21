@@ -86,11 +86,15 @@ def make_batch(basket=((0, 3), (1, 5)), seed=1):
                  torch.tensor([PRODUCT_CAT[j] for j in line_item.tolist()]), observed)
 
 
-def baskets_of(ix, trip):
-    """All baskets (tuples of slot indices) of a trip with 1..nmax products."""
+def baskets_of(ix, trip, max_per_category=NMAX):
+    """All baskets (tuples of slot indices) of a trip with 1..nmax products and at most
+    ``max_per_category`` from any one category."""
     slots = [s for s in range(len(ix.item)) if int(ix.item_trip[s]) == trip]
     for n in range(1, NMAX + 1):
-        yield from itertools.combinations(slots, n)
+        for S in itertools.combinations(slots, n):
+            rows = [int(ix.row_of[s]) for s in S]
+            if max(rows.count(r) for r in set(rows)) <= max_per_category:
+                yield S
 
 
 def energy_given_z(model, ix, u, z, iv, S):

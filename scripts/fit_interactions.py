@@ -59,6 +59,10 @@ def parse_args():
     p.add_argument("--m4c", action="store_true", help="add M4c (price-only inclusive value per category)")
     p.add_argument("--iv-init", type=float, default=0.0, help="M4c: starting logit of lambda_c")
     p.add_argument("--rank", type=int, default=16)
+    p.add_argument("--max-per-category", type=int,
+                   help="largest number of products from one category in a basket (default: nmax); "
+                        "a smaller cap makes the DP cheaper and drops the baskets above it from the law")
+    p.add_argument("--val-draws", type=int, default=256, help="importance draws per validation trip")
     p.add_argument("--batch", type=int, default=256)
     p.add_argument("--phi-init", type=float, default=0.05, help="scale of the random starting psi")
     p.add_argument("--pl-epochs", type=int, default=2)
@@ -163,6 +167,8 @@ def main():
 
     torch.manual_seed(args.seed)
     psi, delta, category = add_version4_blocks(model, args, J, C)
+    if args.max_per_category is not None:
+        model.R = min(model.R, args.max_per_category)
 
     # Price (and, without --recency, the unused recency loading psi) stays at the base
     # model's values during stage A and is trained from stage B under a centred prior.
@@ -191,6 +197,9 @@ def main():
             bt = batcher.make(trips)
             chains.append(bt.observed.clone())
             n_row = torch.zeros(bt.ix.n_rows).index_add_(0, bt.ix.row_of, bt.observed.double())
+            if int(n_row.max()) >= model.R:      # keeps every observed basket (and PL step) inside the cap
+                raise SystemExit(f"a training basket has {int(n_row.max())} products in one category; "
+                                 f"--max-per-category must exceed it")
             k = torch.zeros(bt.ix.B, dtype=torch.long).index_add_(0, bt.ix.row_trip, (n_row > 0).long())
             k_counts.index_add_(0, k.clamp(max=nmax), torch.ones_like(k, dtype=torch.float64))
             pair_sum.index_add_(0, bt.ix.row_cat, model.pair_feature(n_row))
@@ -212,7 +221,7 @@ def main():
         for trips in val_batches:
             vb = batcher.make(trips)
             vb.bind(model)
-            est, _, e, _ = importance_log_z(model, vb.ix, vgen, burn=80, components=32, thin=2, draws=256)
+            est, _, e, _ = importance_log_z(model, vb.ix, vgen, burn=80, components=32, thin=2, draws=args.val_draws)
             lls.append((model.energy(vb) - est).numpy())
             ess.append(e.numpy())
         return float(np.concatenate(lls).mean()), float(np.concatenate(ess).mean())
@@ -342,7 +351,7 @@ def main():
         torch.save({"model": {k: v.detach().clone() for k, v in model.state_dict().items()},
                     "initialization": str(args.initialization.resolve()),
                     "additive": str(args.additive.resolve()),
-                    "rank": args.rank, "use_f_extra": True, "presence_phi": True, "cat_rho0": True,
+                    "rank": args.rank, "max_per_category": model.R, "use_f_extra": True, "presence_phi": True, "cat_rho0": True,
                     "u_cat": True, "unfreeze_price": True, "recency": bool(args.recency),
                     "iv_slope": bool(args.m4c), "iv_price_only": bool(args.m4c), "stage": stage,
                     "seconds": time.time() - started, "args": {k: str(v) for k, v in vars(args).items()}},

@@ -237,6 +237,8 @@ def load_any(path, data, root, initialization, panel=None):
         flags = version4_flags(blob)
         model.load_fitted_state(blob["model"])
         model.rank, model.size_on_categories = flags["rank"], flags["size_on_categories"]
+        if flags["max_per_category"] is not None:
+            model.R = int(flags["max_per_category"])
     features = Features(root, int(data["n_item"]), int(data["n_store"]), recency=flags["recency"],
                         price_contract="chain_product_week_only", discount_panel=panel or discount_panel(parent))
     batcher = Batcher(data, features, recency=flags["recency"],

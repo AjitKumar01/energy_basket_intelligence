@@ -102,6 +102,8 @@ def _trip_grid(model, ix, log_g):
 def log_mass_by_size(model, ix, log_g, scale):
     """log total weight of baskets of each size n = 1..nmax, [B, nmax] (size potential on n)."""
     tilted, degree, slope = _trip_grid(model, ix, log_g)
+    if model.R < model.nmax:                  # the kernel wants a coefficient for every size
+        tilted = torch.nn.functional.pad(tilted, (0, model.nmax - model.R), value=-float("inf"))
     log_a = CategoryProduct.apply(tilted.contiguous(), degree.contiguous(), model.nmax)
     n = torch.arange(model.nmax + 1, dtype=log_g.dtype)
     log_a = log_a + slope.unsqueeze(-1) * n

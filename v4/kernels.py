@@ -121,31 +121,45 @@ class CategoryProduct(torch.autograd.Function):
 
 class CategoryProduct2D(torch.autograd.Function):
     """log coefficients over (size n, categories present m) of the product of category
-    polynomials.  log_polys [B, Cpad, R+1], degree [B, Cpad] -> [B, nmax+1, nmax+1]."""
+    polynomials.  log_polys [B, Cpad, R+1], degree [B, Cpad] -> [B, nmax+1, nmax+1].
+
+    The backward pass needs the DP's intermediate tables, B x (Cpad+1) x (nmax+1)^2 numbers
+    (about 9 GB for 256 Dunnhumby trips).  So the forward pass keeps only its inputs, and the
+    backward pass recomputes the tables for ``CHUNK`` trips at a time.  Trips are independent,
+    so the result is the same as keeping every table."""
+
+    CHUNK = 16
 
     @staticmethod
     def forward(ctx, log_polys, degree, nmax):
         lp, deg = log_polys.contiguous(), degree.contiguous()
         B, Cpad, stride = lp.shape
         out = torch.empty((B, nmax + 1, nmax + 1))
-        q = torch.empty_like(lp)
-        states = torch.empty((B, Cpad + 1, nmax + 1, nmax + 1))
         check(sampler().log_degree_2d_forward_cpp(B, Cpad, stride, nmax, ptr(lp), ptr(deg),
-                                                  ptr(out), ptr(q), ptr(states)), "2-D DP")
-        ctx.save_for_backward(q, deg, states)
+                                                  ptr(out), 0, 0), "2-D DP")
+        ctx.save_for_backward(lp, deg)
         ctx.nmax = nmax
         return out
 
     @staticmethod
     @torch.autograd.function.once_differentiable
     def backward(ctx, grad):
-        q, deg, states = ctx.saved_tensors
-        B, Cpad, stride = q.shape
-        grad_in = torch.empty_like(q)
+        lp, deg = ctx.saved_tensors
+        B, Cpad, stride = lp.shape
+        n = ctx.nmax + 1
         g = grad.contiguous()
-        check(sampler().log_degree_2d_backward_cpp(B, Cpad, stride, ctx.nmax, ptr(g), ptr(q),
-                                                   ptr(deg), ptr(states), ptr(grad_in)),
-              "2-D DP backward")
+        grad_in = torch.empty_like(lp)
+        step = CategoryProduct2D.CHUNK
+        states = torch.empty((min(step, B), Cpad + 1, n, n))
+        for s in range(0, B, step):
+            e = min(s + step, B)
+            lp_c, deg_c, g_c = lp[s:e], deg[s:e], g[s:e]
+            q_c, out_c, grad_c = torch.empty_like(lp_c), torch.empty((e - s, n, n)), torch.empty_like(lp_c)
+            check(sampler().log_degree_2d_forward_cpp(e - s, Cpad, stride, ctx.nmax, ptr(lp_c), ptr(deg_c),
+                                                      ptr(out_c), ptr(q_c), ptr(states)), "2-D DP")
+            check(sampler().log_degree_2d_backward_cpp(e - s, Cpad, stride, ctx.nmax, ptr(g_c), ptr(q_c),
+                                                       ptr(deg_c), ptr(states), ptr(grad_c)), "2-D DP backward")
+            grad_in[s:e] = grad_c
         return grad_in, None, None
 
 

@@ -137,15 +137,17 @@ def main():
     batcher = batcher_for(data, root, parent, recency=args.recency, purchase_history=args.recency)
     J, C, nmax = int(data["n_item"]), int(data["n_cat"]), int(meta["nmax"])
 
-    # Held-out training trips for early stopping, then shuffled training batches.
+    # Held-out training trips for early stopping, then shuffled training batches.  A batch
+    # is a fixed list of trips; its features are rebuilt whenever it is used (about 0.1 s),
+    # because keeping every batch in memory would not fit on a large catalogue.
     rng = np.random.default_rng(args.seed)
     started = time.time()
     held = np.random.default_rng(args.seed + 99).permutation(supported_trips(data, 0, nmax))
-    val_batches = [batcher.make(np.sort(held[:args.val_trips])[s:s + args.batch])
-                   for s in range(0, args.val_trips, args.batch)]
+    val_trips = np.sort(held[:args.val_trips])
+    val_batches = [val_trips[s:s + args.batch] for s in range(0, args.val_trips, args.batch)]
     train_trips = np.sort(held[args.val_trips:])
     order = rng.permutation(train_trips)
-    batches = [batcher.make(np.sort(order[s:s + args.batch])) for s in range(0, len(order), args.batch)]
+    batches = [np.sort(order[s:s + args.batch]) for s in range(0, len(order), args.batch)]
     N = len(train_trips)
     args.out.parent.mkdir(parents=True, exist_ok=True)
     log_file = open(args.out.with_suffix(".log"), "a")
@@ -184,7 +186,10 @@ def main():
     with torch.no_grad():
         k_counts, pair_sum, item_counts, cat_present = (
             torch.zeros(nmax + 1), torch.zeros(C), torch.zeros(J), torch.zeros(C))
-        for bt in batches:
+        chains = []                                         # persistent SML chains, from the data
+        for trips in batches:
+            bt = batcher.make(trips)
+            chains.append(bt.observed.clone())
             n_row = torch.zeros(bt.ix.n_rows).index_add_(0, bt.ix.row_of, bt.observed.double())
             k = torch.zeros(bt.ix.B, dtype=torch.long).index_add_(0, bt.ix.row_trip, (n_row > 0).long())
             k_counts.index_add_(0, k.clamp(max=nmax), torch.ones_like(k, dtype=torch.float64))
@@ -204,7 +209,8 @@ def main():
     def validation_ll():
         vgen = torch.Generator().manual_seed(args.seed + 777)
         lls, ess = [], []
-        for vb in val_batches:
+        for trips in val_batches:
+            vb = batcher.make(trips)
             vb.bind(model)
             est, _, e, _ = importance_log_z(model, vb.ix, vgen, burn=80, components=32, thin=2, draws=256)
             lls.append((model.energy(vb) - est).numpy())
@@ -240,7 +246,7 @@ def main():
                       torch.zeros_like(model.lam)]
             for i in rng.permutation(len(batches)):
                 step += 1
-                bt = batches[i]
+                bt = batcher.make(batches[i])
                 bt.bind(model)
                 value, stats = step_fn(i, bt)
                 loss = -value + penalties(model, priors, N, psi, delta, price_init, args.recency)
@@ -351,7 +357,6 @@ def main():
     # Stage B: SML.  Chains start at the observed baskets and persist across epochs.
     for n in price_names:
         getattr(model, n).requires_grad_(True)
-    chains = [bt.observed.clone() for bt in batches]
 
     def sml_step(i, bt):
         ix = bt.ix

@@ -3,7 +3,7 @@
 #   nohup run/stress_world.sh > runs/stress/pipeline.out 2>&1 &
 # The world has no regular-price series, so there is no discount split.
 #   WORLD      the stress-world directory (its bundle is WORLD/model_input_category)
-#   REFERENCE  reference test trips (.npz with trips, household), for stage 5
+#   REFERENCE  reference test trips for stage 5 (default: made by scripts/reference_trips.py)
 set -euo pipefail
 cd "$(dirname "$0")/.."
 WORLD=${WORLD:?set WORLD to the stress-world directory}
@@ -25,8 +25,11 @@ for VARIANT in rec m4c; do
     --out "$OUT/v4_$VARIANT" --recency "${EXTRA[@]}" --threads "$THREADS" > "$OUT/4_v4_$VARIANT.out" 2>&1
 done
 # Scoring on the world's test trips (known truth): likelihood, realism and the 32 price scenarios.
+REFERENCE=${REFERENCE:-$OUT/reference_test_trips.npz}
+stage 5 && [[ ! -e $REFERENCE ]] && python3 scripts/reference_trips.py --initialization "$OUT/initialization.pt" \
+  --base-model "$ADDITIVE" --out "$REFERENCE"
 for VARIANT in rec m4c; do
   stage 5 && python3 -u scripts/evaluate.py --checkpoint "$OUT/v4_$VARIANT.pt" \
-    --reference "${REFERENCE:?set REFERENCE to the reference test trips}" \
+    --reference "$REFERENCE" \
     --world "$WORLD" --threads "$THREADS" > "$OUT/5_evaluate_$VARIANT.log" 2>&1
 done

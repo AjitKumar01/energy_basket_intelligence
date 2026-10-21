@@ -173,8 +173,9 @@ the nested logit.
 
 ## 8. The model-data bundle
 
-The canonical output is converted into a model-data bundle (on `v4-training`,
-`scripts/prepare_model_bundle.py --config configs/datasets/stress_world_category.json`):
+The canonical output is converted into a model-data bundle by the general converter
+(`data_prep/canonical/prepare_bundle.py --config data_prep/configs/stress_world.json`;
+`run/prepare_stress_world.sh` runs the generator and the converter):
 
 - **categories:** the generator's 48 merchandise categories (largest 32 products), written as the
   model's partition;
@@ -187,13 +188,14 @@ The canonical output is converted into a model-data bundle (on `v4-training`,
   not sell early. Before confirmation, the product stays in the support with its utility
   shifted by $\log\epsilon$; $\epsilon$ is the training purchase rate of unconfirmed cells
   relative to confirmed ones (about $10^{-4}$ here);
-- **reference trips:** 4,096 test trips with the certified earlier model's per-trip
-  log-likelihoods, for paired comparisons.
+- **reference trips:** 4,096 test trips in a seeded order (`scripts/reference_trips.py`), with
+  the base model's exact per-trip log-likelihood for paired comparisons.
 
 ## 9. How a model is scored
 
-1. **Held-out likelihood** on the 4,096 reference test trips, paired per trip with the earlier
-   certified model, with a household-clustered 95% interval.
+1. **Held-out likelihood** on the 4,096 reference test trips, paired per trip with a comparison
+   model (the base model; earlier results used the certified earlier Version-4 model), with a
+   household-clustered 95% interval.
 2. **Realism**: one generated basket per test trip per seed (3 seeds). The AUC of a
    gradient-boosted classifier telling real from generated baskets, on all products and on
    category presence.
@@ -236,8 +238,11 @@ improving the model.
 ## 11. Regenerating
 
 ```bash
-python3 synthetic/generate_stress_world.py --output data/stress_world     # about 80 s
+OUT=data/stress_world run/prepare_stress_world.sh      # the world and its bundle, about 2 minutes
 ```
+
+The same seed reproduces the existing world byte for byte (checked: every canonical table,
+truth file and bundle array).
 
 `--households`, `--stores`, `--departments`, `--categories-per-department`, `--weeks`,
 `--train-weeks`, `--validation-weeks` and `--scenario-products` change the world. For larger

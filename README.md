@@ -19,6 +19,7 @@ as a baseline and scored the same way.
 | `scripts/` | one script per stage: partition, discount panel, initialize, base-model fit, Version-4 fit, evaluate |
 | `checks/` | the real-data discount and promotion check; the support-cap check |
 | `shopper/` | SHOPPER (PyTorch reimplementation), its exactness checks and evaluator |
+| `data_prep/` | building bundles: Dunnhumby from its raw CSVs; any dataset from a canonical directory |
 | `synthetic/` | the stress-world generator |
 | `run/` | the recipes below |
 | `tests/` | exact tests against enumeration |
@@ -38,29 +39,34 @@ threads per job (`THREADS`, default 4) and keep the total below the machine's co
 ## 2. Data
 
 The pipeline reads a **model-data bundle**: a folder with `basket_input/` and `data/` (contents in
-`docs/PIPELINE.md` §2). Checkpoints record the bundle's fingerprint and load only with it.
+`docs/PIPELINE.md` §2). Both bundles are built from scratch by this repository. Checkpoints
+record the bundle's fingerprint and load only with it.
 
-- **Dunnhumby.** Copy the prepared bundle, the folder that holds `basket_input/` and `data/`
-  (in this project, `energy_basket_intelligence/`). Building it from the raw Dunnhumby files is
-  done outside this repository.
-- **Stress world.** Either copy `data/stress_world/` (the world plus its bundle,
-  `model_input_category/`, 26 MB), or generate it:
+- **Dunnhumby**, from the raw "The Complete Journey" CSVs (about 5 minutes):
   ```bash
-  python3 synthetic/generate_stress_world.py --output data/stress_world        # about 80 s
+  RAW="/path/to/dunnhumby_The-Complete-Journey CSV" OUT=data/dunnhumby run/prepare_dunnhumby.sh
   ```
-  and then build the bundle with the branch `v4-training`:
-  `scripts/prepare_model_bundle.py --config configs/datasets/stress_world_category.json`.
-  That converter is not on this branch yet.
-- **Reference trips** for test-week scoring: an `.npz` with `trips` and `household`, and any
-  other model's per-trip log-likelihoods to compare with. Stress world:
-  `artifacts/stress_clean_confirm/reports/likelihood_test_paired_per_trip.npz` (4,096 test
-  trips). Dunnhumby: `artifacts/corrected_complete_rank5_20260913/reports/likelihood_test_per_trip.npz`.
+  It needs `transaction_data.csv`, `product.csv` and `causal_data.csv`. Four stages (base
+  tables, bundle, promotions, audit), then the co-purchase categories and the fingerprint
+  (`data_prep/dunnhumby/`). The result is byte-identical to the bundle every existing
+  Dunnhumby checkpoint was fitted on, fingerprint included.
+- **Stress world**, generated (about 2 minutes):
+  ```bash
+  OUT=data/stress_world run/prepare_stress_world.sh
+  ```
+  This runs `synthetic/generate_stress_world.py`, then the general canonical converter
+  `data_prep/canonical/prepare_bundle.py` with `data_prep/configs/stress_world.json`. Any other
+  dataset enters the same way: write its canonical directory (`data_prep/canonical/contract.py`)
+  and a config.
+- **Reference trips** for test-week scoring: the recipes make them with
+  `scripts/reference_trips.py` (4,096 test trips in a seeded order, with the base model's exact
+  per-trip log-likelihood for paired comparisons). These are the same trips every earlier
+  result used.
 
 ## 3. Stress world
 
 ```bash
-export WORLD=/path/to/data/stress_world        # holds model_input_category/, truth files
-export REFERENCE=/path/to/likelihood_test_paired_per_trip.npz
+export WORLD=$PWD/data/stress_world            # from run/prepare_stress_world.sh
 ```
 
 **Our model**: every stage, then both Version-4 variants scored on the test weeks with the
@@ -75,7 +81,7 @@ nohup run/stress_world.sh > runs/stress/pipeline.out 2>&1 &
 | 2 | `scripts/initialize.py` | `initialization.pt` |
 | 3 | `scripts/fit_additive.py` (base model) | `additive/v3_pipeline_additive_best.pt` |
 | 4 | `scripts/fit_interactions.py --recency [--m4c]` | `v4_rec.pt`, `v4_m4c.pt` and their `.log` |
-| 5 | `scripts/evaluate.py --world $WORLD` | `v4_*.eval.json`, `v4_*_3seed_auc.json`, `v4_*.per_trip.npz` |
+| 5 | `scripts/reference_trips.py`, then `scripts/evaluate.py --world $WORLD` | `reference_test_trips.npz`, `v4_*.eval.json`, `v4_*_3seed_auc.json`, `v4_*.per_trip.npz` |
 
 `FROM=4` starts at stage 4, and so on. The stress world has no regular-price series, so it has
 no discount split.
@@ -88,7 +94,7 @@ DATA=$WORLD/model_input_category CONTRACT=chain_and_store OUT=runs/shopper/stres
   nohup run/shopper.sh > runs/shopper/stress.out 2>&1 &
 # then, with K chosen from the printed validation scores:
 DATA=$WORLD/model_input_category CONTRACT=chain_and_store OUT=runs/shopper/stress \
-  CHOSEN=8 REFERENCE=$REFERENCE WORLD=$WORLD run/shopper.sh
+  CHOSEN=8 REFERENCE=runs/stress/reference_test_trips.npz WORLD=$WORLD run/shopper.sh
 ```
 
 **What to read:** `likelihood.mean_ll` and the `vs_*` paired differences;
@@ -98,7 +104,7 @@ DATA=$WORLD/model_input_category CONTRACT=chain_and_store OUT=runs/shopper/stres
 ## 4. Dunnhumby
 
 ```bash
-export DATA=/path/to/dunnhumby/bundle          # holds basket_input/ and data/
+export DATA=$PWD/data/dunnhumby                # from run/prepare_dunnhumby.sh
 ```
 
 **Our model, everything from the bundle** (about 6 hours for the base model plus 8–12 hours for
@@ -114,7 +120,7 @@ nohup run/dunnhumby.sh > runs/dunnhumby/pipeline.out 2>&1 &
 | 3 | `scripts/fit_additive.py` with chain-only prices and the discount split | `additive/` |
 | 3c | `checks/discount_promotion.py events`, then `model` on the base model | `discount_events/`, `additive/discount_check.json` |
 | 4 | `scripts/fit_interactions.py` (recency; recency + M4c), then the discount check and the support-cap check on each | `v4_rec.pt`, `v4_m4c.pt`, `v4_*_discount_check.json`, `v4_*_support_cap.json` |
-| 5 | test weeks, once, for the chosen variant: `CHOSEN=m4c REFERENCE=... FROM=5 run/dunnhumby.sh` | `v4_m4c.eval.json` |
+| 5 | test weeks, once, for the chosen variant: `CHOSEN=m4c FROM=5 run/dunnhumby.sh` | `reference_test_trips.npz`, `v4_m4c.eval.json` |
 
 **Version 4 only, from an existing base model** (the update-matched schedule, at most 40
 products per category):
@@ -130,7 +136,7 @@ INIT=/path/to/initialization.pt ADDITIVE=/path/to/v3_pipeline_additive_best.pt \
 CONTRACT=chain_product_week_only OUT=runs/shopper/dunnhumby \
   nohup run/shopper.sh > runs/shopper/dunnhumby.out 2>&1 &
 CONTRACT=chain_product_week_only OUT=runs/shopper/dunnhumby CHOSEN=8 \
-  REFERENCE=/path/to/likelihood_test_per_trip.npz run/shopper.sh
+  REFERENCE=runs/dunnhumby/reference_test_trips.npz run/shopper.sh
 ```
 
 Real data has no causal truth, so SHOPPER is scored on likelihood and realism. Its
@@ -148,5 +154,6 @@ tail -f runs/dunnhumby/4_v4_rec.out                               # everything, 
 ps -eo pid,etime,rss,pcpu,command | grep "[f]it_"                 # running jobs, memory, CPU
 ```
 
-This branch (`v4-pipeline`) holds only the current pipeline. The research history, diagnostics
-and earlier pipelines are on `v4-training`.
+This branch (`v4-pipeline`) is self-contained: from raw data to fitted, checked models, it needs
+nothing outside it. It was distilled from the research branch `v4-training`, which keeps the
+full history of experiments and diagnostics (see `docs/PIPELINE.md` §9).

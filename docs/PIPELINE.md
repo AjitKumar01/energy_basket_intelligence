@@ -31,7 +31,9 @@ counterfactuals (change a price, recompute the law).
 
 ## 2. Input: the model-data bundle
 
-A bundle is a directory prepared by a dataset adapter (outside this repository):
+A bundle is a directory built by `run/prepare_dunnhumby.sh` (from the raw Dunnhumby CSVs) or by
+`data_prep/canonical/prepare_bundle.py` (from any dataset's canonical directory, such as the
+stress world's):
 
 | File | Content |
 |---|---|
@@ -144,8 +146,10 @@ and all of them use validation data only:
 
 Two related fixed rules:
 - On the stress world the pass rules were fixed in advance: paired held-out log-likelihood above
-  the certified model (household-clustered 95% interval above 0), category-presence realism AUC
-  of at most 0.80, and own-price scenario correlation of at least 0.85.
+  the comparison model on the same reference trips (household-clustered 95% interval above 0),
+  category-presence realism AUC of at most 0.80, and own-price scenario correlation of at least
+  0.85. The comparison model was the earlier certified Version-4 model. In this branch it is the
+  base model, whose exact per-trip scores `scripts/reference_trips.py --base-model` stores.
 - SHOPPER, the comparison model, has one setting chosen on validation (its taste size K) under
   its own locked protocol (`docs/SHOPPER_BASELINE_PROTOCOL.md`); changes need a dated amendment.
 
@@ -179,7 +183,8 @@ Two related fixed rules:
 | Measure | Version 4 | SHOPPER (K = 8) |
 |---|---|---|
 | Held-out log-likelihood per basket | −24.66 (−24.61) | −28.04; about −3.0 behind once its ordering estimate's bias is allowed for |
-| vs the certified model, 95% interval | +4.27 [4.16, 4.37] | — |
+| vs the earlier certified model, 95% interval | +4.27 [4.16, 4.37] | — |
+| vs its base model (the same trips) | +4.62 (+4.67) | — |
 | Realism AUC, full basket / categories (0.5 is perfect) | 0.62 / 0.73 (0.62 / 0.73) | 0.92 / 0.89 |
 | Price scenarios, correlation with truth: own / same subcategory / rest of category | 0.88 / 0.51 / 0.92 (0.89 / 0.47 / 0.81) | 0.82 / ≈0 / ≈0 |
 
@@ -193,11 +198,18 @@ pattern, but its average size is near zero, against +0.026 in the truth.
 |---|---|---|---|---|
 | old parent (store prices, one slope) | −44.706 | 0.49 | 0.11 | 0.38 |
 | pilot: chain-only + discount split (price block only refitted) | −44.700 | 0.87 | 0.10 | 0.38 |
+| **refit: chain-only + discount split, everything refitted (Step 3)** | **−44.706** | **1.30** | **0.11** | **0.27** |
 | empirical (train / validation / test) | — | 1.07 / 0.64 / 1.00 | 0.43 / 0.38 / 0.41 | 0.31 / 0.35 / 0.23 |
 
-The full refit of the base model with chain-only prices and the discount split (stage 3, run
-on branch `v4-training` as Step 3) is in progress. At update 13,300 its validation log-likelihood
-was −44.711, still improving.
+The full refit converged at update 14,300 (best at 13,500). It fits validation no better than
+the old parent, but the discount response is no longer too weak: it now overshoots, at 1.30.
+In the refit the discount part has its own strong slope (about 0.97 on average) next to a
+regular-price slope of about 0.19.
+
+**Dunnhumby Version 4** (Step 4, from the refit; schedule matched to the stress world by
+updates, at most 40 products per category) is running. The recency variant's first SML epoch:
+validation log-likelihood −38.90 on held-out training trips, ESS 0.86, chain basket size 7.47
+against 7.65 in the data.
 
 **Known weaknesses**
 
@@ -207,28 +219,31 @@ was −44.711, still improving.
   is learned separately for each product with no pooling, while in Dunnhumby display nearly
   always comes with a discount. The likely fix, like the discount one, is a common display slope
   plus per-product variation shrunk toward it. Accepted for now.
-- The discount response (0.87) lies between the training and test empirical slopes (1.07, 1.00)
-  but above validation (0.64). The empirical slopes themselves move by split.
+- The refitted base model's discount response (1.30) is above every empirical slope (1.07 / 0.64 /
+  1.00); the pilot's (0.87) was between them. The empirical slopes themselves move by split.
 - On the stress world the substitution response is too small on average (above).
 
 ## 8. Commands
 
 ```bash
 python3 -m pytest -q                                     # exact checks, no data
-DATA=/path/to/bundle nohup run/dunnhumby.sh > runs/dunnhumby/pipeline.out 2>&1 &
+RAW=/path/to/raw/csvs OUT=data/dunnhumby run/prepare_dunnhumby.sh   # Dunnhumby bundle
+OUT=data/stress_world run/prepare_stress_world.sh                    # stress world and its bundle
+DATA=data/dunnhumby nohup run/dunnhumby.sh > runs/dunnhumby/pipeline.out 2>&1 &
 DATA=... INIT=... ADDITIVE=... nohup run/dunnhumby_step4.sh > runs/dunnhumby/step4.out 2>&1 &
-WORLD=/path/to/stress_world REFERENCE=... nohup run/stress_world.sh > runs/stress/pipeline.out 2>&1 &
-DATA=... nohup run/shopper.sh > runs/shopper/pipeline.out 2>&1 &
-DATA=... CHOSEN=m4c REFERENCE=... FROM=5 run/dunnhumby.sh   # test weeks, once, for the chosen model
+WORLD=data/stress_world nohup run/stress_world.sh > runs/stress/pipeline.out 2>&1 &
+DATA=... CONTRACT=... nohup run/shopper.sh > runs/shopper/pipeline.out 2>&1 &
+DATA=data/dunnhumby CHOSEN=m4c FROM=5 run/dunnhumby.sh       # test weeks, once, for the chosen model
 ```
 
 The native kernels (`v4/native/`) compile on first use into `build/native/` (`$CXX`, else clang++,
 else g++, and the PyTorch C++ extension). Setting up a new machine: see the README. Use at most 4 threads per job (`THREADS`).
 
-## 9. How this branch relates to `v4-training`
+## 9. History: how this branch relates to `v4-training`
 
-`v4-pipeline` contains only the current pipeline. It was rewritten from `v4-training`, with the
-same numerical results:
+`v4-training` is the research branch where this pipeline was worked out (every experiment,
+diagnostic and earlier pipeline). `v4-pipeline` is self-contained and needs nothing from it.
+It was rewritten from it, with the same numerical results:
 
 | Here | On `v4-training` |
 |---|---|

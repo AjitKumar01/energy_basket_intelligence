@@ -167,6 +167,38 @@ FINGERPRINT_FILES = {
 }
 
 
+OPTIONAL_FILES = ("observed_promotion_panel", "price_evidence_panel", "availability_panel")
+
+
+def write_fingerprint(root: str | Path | None = None, *, core_only: bool = False) -> str:
+    """Hash the bundle's model-facing files into basket_input/model_data_fingerprint.json and
+    return the digest.  Optional panels are included when present, unless ``core_only``
+    (the Dunnhumby bundle's fingerprint predates them)."""
+    root = data_root(root)
+    folder = root / "basket_input"
+    names = [n for n in FINGERPRINT_FILES if n not in OPTIONAL_FILES
+             or (not core_only and (root / FINGERPRINT_FILES[n]).is_file())]
+    missing = [FINGERPRINT_FILES[n] for n in names if not (root / FINGERPRINT_FILES[n]).is_file()]
+    if missing:
+        raise FileNotFoundError(f"cannot fingerprint the bundle; missing {missing}")
+    preprocessing = json.loads((folder / "preprocessing_manifest.json").read_text())
+    affinity = json.loads((folder / "affinity_manifest.json").read_text())
+    price_basis = json.loads((folder / "meta.json").read_text()).get("price_basis")
+    if not isinstance(price_basis, str) or not price_basis.strip():
+        raise ValueError("basket_input/meta.json declares no price_basis")
+    if json.loads((root / "data/build_meta.json").read_text()).get("price_basis") != price_basis:
+        raise ValueError("data/build_meta.json and basket_input/meta.json price bases differ")
+    if affinity.get("partition_sha256") != file_sha256(folder / "items_affinity.parquet"):
+        raise ValueError("items_affinity.parquet does not match affinity_manifest.json")
+    body = {"schema_version": 1, "price_basis": price_basis, "cohort": preprocessing.get("cohort"),
+            "raw_sha256": preprocessing.get("raw_sha256"), "derived_sha256": preprocessing.get("derived_sha256"),
+            "files": {n: file_sha256(root / FINGERPRINT_FILES[n]) for n in names}}
+    digest = _digest(body)
+    text = json.dumps({**body, "fingerprint_sha256": digest}, indent=2, allow_nan=False) + "\n"
+    (folder / "model_data_fingerprint.json").write_text(text)
+    return digest
+
+
 def data_fingerprint(root: str | Path | None = None) -> str:
     """Verify the bundle's fingerprint against its files and return the digest."""
     root = data_root(root)

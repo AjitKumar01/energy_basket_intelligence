@@ -6,7 +6,7 @@
 #   KS         taste sizes to fit (default "8 16 32"); choose the best validation log-likelihood
 #   OUT        where everything is written (default runs/shopper)
 # Then score the chosen fit once:
-#   CHOSEN=<K> REFERENCE=<reference trips .npz> [WORLD=<stress world dir>] run/shopper.sh
+#   CHOSEN=<K> REFERENCE=<reference trips .npz, from scripts/reference_trips.py> [WORLD=<stress world dir>] run/shopper.sh
 set -euo pipefail
 cd "$(dirname "$0")/.."
 export ENERGY_MODEL_DATA_ROOT=${DATA:?set DATA to the model-data bundle}

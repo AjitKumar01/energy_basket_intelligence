@@ -3,9 +3,9 @@
 #   nohup run/dunnhumby.sh > runs/dunnhumby/pipeline.out 2>&1 &
 # Each stage writes its own log under $OUT.  Set FROM=<stage number> to start later.
 #
-#   DATA       the model-data bundle (basket_input/, data/), prepared outside this repository (required)
+#   DATA       the model-data bundle (basket_input/, data/), built by run/prepare_dunnhumby.sh (required)
 #   OUT        where everything is written (default runs/dunnhumby)
-#   REFERENCE  held-out reference trips for stage 5 (.npz with trips, household)
+#   REFERENCE  reference test trips for stage 5 (default: made by scripts/reference_trips.py)
 set -euo pipefail
 cd "$(dirname "$0")/.."
 DATA=${DATA:?set DATA to the model-data bundle}
@@ -23,10 +23,9 @@ stage() { [[ $1 -ge $FROM ]]; }
 # 2. Discount panel (product x day), centred on training days.
 stage 2 && python3 scripts/build_discount_panel.py --output "$OUT/log_discount.npy" > "$OUT/2_discount_panel.log" 2>&1
 
-# 2b. Starting values.  INIT=<file> reuses an existing initialization instead; the Step 3
-#     refit on branch v4-training used artifacts/corrected_complete_rank5_20260913/artifacts/
-#     initialization.pt; a fresh one differs from it only in rho_0 (the old initializer set
-#     rho_0 with a random phi and store prices).
+# 2b. Starting values.  INIT=<file> reuses an existing initialization instead (a fresh one
+#     differs from the one the Step 3 refit used only in rho_0, which that older initializer
+#     set with a random phi and store prices).
 INIT=${INIT:-$OUT/initialization.pt}
 stage 2 && [[ ! -e $INIT ]] && python3 scripts/initialize.py --output "$INIT" --threads "$THREADS" \
   > "$OUT/2b_initialize.log" 2>&1
@@ -56,7 +55,10 @@ done
 # 5. Test weeks, once, for the chosen model only (likelihood on the reference test trips and
 #    realism); set CHOSEN=rec or m4c.
 if [[ -n ${CHOSEN:-} ]]; then
+  REFERENCE=${REFERENCE:-$OUT/reference_test_trips.npz}
+  [[ -e $REFERENCE ]] || python3 scripts/reference_trips.py --initialization "$INIT" --base-model "$ADDITIVE" \
+    --out "$REFERENCE"
   python3 -u scripts/evaluate.py --checkpoint "$OUT/v4_$CHOSEN.pt" \
-    --reference "${REFERENCE:?set REFERENCE to the reference test trips}" \
+    --reference "$REFERENCE" \
     --threads "$THREADS" > "$OUT/5_evaluate_$CHOSEN.log" 2>&1
 fi

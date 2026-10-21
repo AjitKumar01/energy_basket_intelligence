@@ -62,13 +62,17 @@ def parse_args():
     p.add_argument("--draws", type=int, default=1024)
     p.add_argument("--scenario-trips", type=int, default=400)
     p.add_argument("--scenario-draws", type=int, default=64)
+    p.add_argument("--ll-trips", type=int, default=0, help="score only the first N reference trips (0: all)")
+    p.add_argument("--likelihood-only", action="store_true", help="skip realism and price scenarios")
+    p.add_argument("--tag", help="name of the output files (default: the checkpoint's name)")
     p.add_argument("--seed", type=int, default=41001)
     p.add_argument("--threads", type=int, default=4)
     return p.parse_args()
 
 
 def likelihood(model, batcher, ref, args, gen, tag):
-    trips = ref["trips"].astype(np.int64)
+    n = args.ll_trips or len(ref["trips"])
+    trips = ref["trips"][:n].astype(np.int64)
     ll, half, ess = [], [], []
     started = time.time()
     for s in range(0, len(trips), args.eval_batch):
@@ -86,11 +90,11 @@ def likelihood(model, batcher, ref, args, gen, tag):
            "is_half_split_abs_mean": float(np.abs(half).mean()), "is_half_split_abs_max": float(np.abs(half).max()),
            "is_ess_fraction_mean": float(ess.mean()), "is_ess_fraction_min": float(ess.min())}
     for name in ref.files:                     # paired comparison with other models' scores
-        if name in ("trips", "household") or ref[name].shape != ll.shape or ref[name].dtype.kind != "f":
+        if name in ("trips", "household") or ref[name].shape != ref["trips"].shape or ref[name].dtype.kind != "f":
             continue
-        d = ll - ref[name]
+        d = ll - ref[name][:n]
         out[f"vs_{name}"] = float(d.mean())
-        out[f"vs_{name}_household_95"] = clustered_ci(d, ref["household"])
+        out[f"vs_{name}_household_95"] = clustered_ci(d, ref["household"][:n])
     return out, (trips, ll, half, ess)
 
 
@@ -187,7 +191,7 @@ def main():
     model, batcher, blob, _ = load_version4(args.checkpoint, data, root, initialization=args.initialization,
                                             additive=args.additive)
     freeze(model)
-    tag = args.checkpoint.stem
+    tag = args.tag or args.checkpoint.stem
     out_dir = args.out_dir or args.checkpoint.parent
     out_dir.mkdir(parents=True, exist_ok=True)
     gen = torch.Generator().manual_seed(args.seed + 5)
@@ -204,6 +208,9 @@ def main():
     np.savez(out_dir / f"{tag}.per_trip.npz", trips=trips, ll=ll, half_diff=half, ess=ess)
     print(json.dumps(report["likelihood"]), flush=True)
 
+    if args.likelihood_only:
+        (out_dir / f"{tag}.eval.json").write_text(json.dumps(report, indent=1) + "\n")
+        return
     aucs = realism(model, data, batcher, args)
     (out_dir / f"{tag}_3seed_auc.json").write_text(json.dumps({"checkpoint": str(args.checkpoint), **aucs},
                                                               indent=2) + "\n")

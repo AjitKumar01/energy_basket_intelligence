@@ -6,7 +6,7 @@ from setuptools import setup
 from torch.utils.cpp_extension import BuildExtension, CppExtension
 
 HERE = Path(__file__).resolve().parent
-if platform.system() == "Darwin" and platform.machine() == "arm64":
+if platform.machine() in ("arm64", "aarch64"):
     FLAGS = ["-O3", "-mcpu=native"]
 else:
     FLAGS = ["-O3", "-march=native"]

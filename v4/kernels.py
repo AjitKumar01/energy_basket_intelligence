@@ -5,12 +5,15 @@
     sampler     plain C library (ctypes): exact sampling, Gibbs sweeps, the 2-D size DP
 
 Both are written to build/native/ in the repository and rebuilt when their source changes.
+The compiler is $CXX if set, else clang++, else g++.
 """
 from __future__ import annotations
 
 import ctypes
 import importlib
+import os
 import platform
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -54,8 +57,11 @@ def sampler():
         lib = BUILD / f"libsampler{ext}"
         if _stale(lib, SOURCE / "sampler.cpp"):
             flags = ["-O3", "-std=c++17", "-shared", "-fPIC",
-                     "-mcpu=native" if platform.machine() == "arm64" else "-march=native"]
-            subprocess.run(["clang++", *flags, str(SOURCE / "sampler.cpp"), "-o", str(lib)], check=True)
+                     "-mcpu=native" if platform.machine() in ("arm64", "aarch64") else "-march=native"]
+            compiler = os.environ.get("CXX") or shutil.which("clang++") or shutil.which("g++")
+            if not compiler:
+                raise RuntimeError("no C++ compiler found; install clang++ or g++, or set CXX")
+            subprocess.run([compiler, *flags, str(SOURCE / "sampler.cpp"), "-o", str(lib), "-pthread"], check=True)
         so = ctypes.CDLL(str(lib))
         I, U, D, P = ctypes.c_int64, ctypes.c_uint64, ctypes.c_double, ctypes.c_void_p
         so.sample_slots_cpp.argtypes = [I] * 7 + [U] + [P] * 12

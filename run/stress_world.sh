@@ -2,9 +2,11 @@
 # The pipeline on the synthetic stress world, where the true price responses are known.
 #   nohup run/stress_world.sh > runs/stress/pipeline.out 2>&1 &
 # The world has no regular-price series, so there is no discount split.
+#   WORLD      the stress-world directory (its bundle is WORLD/model_input_category)
+#   REFERENCE  reference test trips (.npz with trips, household), for stage 5
 set -euo pipefail
 cd "$(dirname "$0")/.."
-WORLD=${WORLD:-/Users/ajit/Projects/nf_dunnhumby/ebi_v4t/data/stress_world}
+WORLD=${WORLD:?set WORLD to the stress-world directory}
 DATA=$WORLD/model_input_category
 OUT=${OUT:-runs/stress}
 FROM=${FROM:-2}
@@ -25,6 +27,6 @@ done
 # Scoring on the world's test trips (known truth): likelihood, realism and the 32 price scenarios.
 for VARIANT in rec m4c; do
   stage 5 && python3 -u scripts/evaluate.py --checkpoint "$OUT/v4_$VARIANT.pt" \
-    --reference "${REFERENCE:-/Users/ajit/Projects/nf_dunnhumby/energy_basket_intelligence/artifacts/stress_clean_confirm/reports/likelihood_test_paired_per_trip.npz}" \
+    --reference "${REFERENCE:?set REFERENCE to the reference test trips}" \
     --world "$WORLD" --threads "$THREADS" > "$OUT/5_evaluate_$VARIANT.log" 2>&1
 done

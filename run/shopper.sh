@@ -4,7 +4,7 @@
 #   nohup run/shopper.sh > runs/shopper/pipeline.out 2>&1 &
 set -euo pipefail
 cd "$(dirname "$0")/.."
-export ENERGY_MODEL_DATA_ROOT=${DATA:-/Users/ajit/Projects/nf_dunnhumby/energy_basket_intelligence}
+export ENERGY_MODEL_DATA_ROOT=${DATA:?set DATA to the model-data bundle}
 OUT=${OUT:-runs/shopper}
 THREADS=${THREADS:-4}
 export OMP_NUM_THREADS=$THREADS

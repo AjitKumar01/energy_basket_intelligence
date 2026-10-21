@@ -3,11 +3,12 @@
 #   nohup run/dunnhumby.sh > runs/dunnhumby/pipeline.out 2>&1 &
 # Each stage writes its own log under $OUT.  Set FROM=<stage number> to start later.
 #
-#   DATA   the model-data bundle (basket_input/, data/), prepared outside this repository
-#   OUT    where everything is written
+#   DATA       the model-data bundle (basket_input/, data/), prepared outside this repository (required)
+#   OUT        where everything is written (default runs/dunnhumby)
+#   REFERENCE  held-out reference trips for stage 5 (.npz with trips, household)
 set -euo pipefail
 cd "$(dirname "$0")/.."
-DATA=${DATA:-/Users/ajit/Projects/nf_dunnhumby/energy_basket_intelligence}
+DATA=${DATA:?set DATA to the model-data bundle}
 OUT=${OUT:-runs/dunnhumby}
 FROM=${FROM:-1}
 THREADS=${THREADS:-4}
@@ -54,6 +55,6 @@ done
 #    realism); set CHOSEN=rec or m4c.
 if [[ -n ${CHOSEN:-} ]]; then
   python3 -u scripts/evaluate.py --checkpoint "$OUT/v4_$CHOSEN.pt" \
-    --reference "$DATA/artifacts/corrected_complete_rank5_20260913/reports/likelihood_test_per_trip.npz" \
+    --reference "${REFERENCE:?set REFERENCE to the reference test trips}" \
     --threads "$THREADS" > "$OUT/5_evaluate_$CHOSEN.log" 2>&1
 fi

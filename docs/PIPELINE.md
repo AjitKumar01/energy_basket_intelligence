@@ -212,14 +212,15 @@ was −44.711, still improving.
 
 ```bash
 python3 -m pytest -q                                     # exact checks, no data
-nohup run/dunnhumby.sh > runs/dunnhumby/pipeline.out 2>&1 &
-nohup run/stress_world.sh > runs/stress/pipeline.out 2>&1 &
-nohup run/shopper.sh > runs/shopper/pipeline.out 2>&1 &
-CHOSEN=m4c FROM=5 run/dunnhumby.sh                       # test weeks, once, for the chosen model
+DATA=/path/to/bundle nohup run/dunnhumby.sh > runs/dunnhumby/pipeline.out 2>&1 &
+DATA=... INIT=... ADDITIVE=... nohup run/dunnhumby_step4.sh > runs/dunnhumby/step4.out 2>&1 &
+WORLD=/path/to/stress_world REFERENCE=... nohup run/stress_world.sh > runs/stress/pipeline.out 2>&1 &
+DATA=... nohup run/shopper.sh > runs/shopper/pipeline.out 2>&1 &
+DATA=... CHOSEN=m4c REFERENCE=... FROM=5 run/dunnhumby.sh   # test weeks, once, for the chosen model
 ```
 
-The native kernels (`v4/native/`) compile on first use into `build/native/` (clang++ and the
-PyTorch C++ extension). Use at most 4 threads per job (`THREADS`).
+The native kernels (`v4/native/`) compile on first use into `build/native/` (`$CXX`, else clang++,
+else g++, and the PyTorch C++ extension). Setting up a new machine: see the README. Use at most 4 threads per job (`THREADS`).
 
 ## 9. How this branch relates to `v4-training`
 

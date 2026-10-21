@@ -53,4 +53,11 @@ models only.
 
 ## Amendments
 
-(none)
+- 2026-10-21 (measurement only; no model or selection change). `check_shopper_ll_bias.py`
+  on 256 stress-world reference trips: the 256-ordering estimate of SHOPPER's log P(S) is
+  0.41 +/- 0.07 nats per basket too low against 8,192 orderings (0.14 for baskets of 1-5
+  items, 1.42 for 21+), and at 8,192 orderings two halves still differ by 0.41, so the true
+  value is higher again. The stress-world gap to the energy model is therefore reported as
+  about -3.0 (at least -2.5 allowing for the remaining bias), not -3.39. From now on SHOPPER's
+  log-likelihood uses at least 8,192 orderings with the half-split and this bias check
+  reported alongside.

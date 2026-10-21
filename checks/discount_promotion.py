@@ -311,10 +311,13 @@ def model_check(args):
     trips, cur_keys = representative_trips(data, events, int(meta["nmax"]), args.trips_per_store_week, args.seed + 101)
     log(f"{len(events)} {args.split} events, {len(trips)} trips, rank {model.rank}")
     J, S, Cm = int(data["n_item"]), int(data["n_store"]), int(merch_cat.max()) + 1
-    acc = {name: np.zeros((J, S, n_weeks)) for name in
+    # Accumulators cover only the weeks the events span (week w is stored at w - w0).
+    w0 = int(events.previous_WEEK_NO.min())
+    W = int(events.WEEK_NO.max()) - w0 + 1
+    acc = {name: np.zeros((J, S, W)) for name in
            ("fact", "single", "chain", "disp_on", "disp_off", "mail_on", "mail_off")}
-    acc_cat = {name: np.zeros((Cm, S, n_weeks)) for name in ("fact", "chain")}
-    trips_per_cell = np.zeros((S, n_weeks), dtype=np.int64)
+    acc_cat = {name: np.zeros((Cm, S, W)) for name in ("fact", "chain")}
+    trips_per_cell = np.zeros((S, W), dtype=np.int64)
     gen = torch.Generator().manual_seed(args.seed + 17)
     kappa = float(torch.nn.functional.softplus(model.price_kappa))
     started = time.time()
@@ -324,10 +327,10 @@ def model_check(args):
         ix = batch.ix
         st = data["trip_store"][batch.trips].astype(np.int64)
         wk = data["trip_week"][batch.trips].astype(np.int64)
-        np.add.at(trips_per_cell, (st, wk), 1)
+        np.add.at(trips_per_cell, (st, wk - w0), 1)
         slot_item, slot_store, slot_week = ix.item.numpy(), st[ix.item_trip.numpy()], wk[ix.item_trip.numpy()]
-        where = (slot_item, slot_store, slot_week)
-        where_cat = (merch_cat[slot_item], slot_store, slot_week)
+        where = (slot_item, slot_store, slot_week - w0)
+        where_cat = (merch_cat[slot_item], slot_store, slot_week - w0)
         inc = SlotIncidence(model, batch, gen, args.burn, args.draws, args.thin)
         p0 = inc.factual()
         np.add.at(acc["fact"], where, p0.numpy())
@@ -357,7 +360,7 @@ def model_check(args):
         np.add.at(acc_cat["chain"], where_cat, p_chain.numpy())
         log(f"{min(s + 128, len(trips))}/{len(trips)} trips ({time.time() - started:.0f}s)")
 
-    report = summarize(events, acc, acc_cat, trips_per_cell, model, empirical)
+    report = summarize(events, acc, acc_cat, trips_per_cell, model, empirical, w0)
     report.update(checkpoint=str(args.checkpoint), checkpoint_sha256=file_sha256(args.checkpoint),
                   split=args.split, rank=model.rank, trips=len(trips), seconds=time.time() - started)
     args.out.parent.mkdir(parents=True, exist_ok=True)
@@ -365,10 +368,10 @@ def model_check(args):
     log(f"wrote {args.out}")
 
 
-def summarize(events, acc, acc_cat, trips_per_cell, model, empirical):
+def summarize(events, acc, acc_cat, trips_per_cell, model, empirical, w0):
     i, c = events.item_id.to_numpy(np.int64), events.cat_id.to_numpy(np.int64)
-    s, w, wp = (events.store_id.to_numpy(np.int64), events.WEEK_NO.to_numpy(np.int64),
-                events.previous_WEEK_NO.to_numpy(np.int64))
+    s, w, wp = (events.store_id.to_numpy(np.int64), events.WEEK_NO.to_numpy(np.int64) - w0,
+                events.previous_WEEK_NO.to_numpy(np.int64) - w0)
     if (trips_per_cell[s, w] == 0).any() or (trips_per_cell[s, wp] == 0).any():
         raise RuntimeError("an event's store-week has no evaluated trip")
     depth = events.promotion_depth_change.to_numpy(np.float64)

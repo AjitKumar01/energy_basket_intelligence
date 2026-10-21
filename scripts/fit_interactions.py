@@ -96,6 +96,8 @@ def parse_args():
     p.add_argument("--price-prec", type=float, default=2.0)
     p.add_argument("--u-cat-prec", type=float, default=2.0)
     p.add_argument("--rec-prec", type=float, default=2.0)
+    p.add_argument("--progress-every", type=int, default=50,
+                   help="print a progress line (to stdout, not the .log) every this many updates")
     p.add_argument("--seed", type=int, default=41001)
     p.add_argument("--threads", type=int, default=4)
     return p.parse_args()
@@ -155,6 +157,9 @@ def main():
     N = len(train_trips)
     args.out.parent.mkdir(parents=True, exist_ok=True)
     log_file = open(args.out.with_suffix(".log"), "a")
+
+    def progress(text):
+        print(f"[progress {time.strftime('%H:%M')}] {text}", flush=True)
 
     def emit(row):
         print(json.dumps(row), flush=True)
@@ -218,7 +223,10 @@ def main():
     def validation_ll():
         vgen = torch.Generator().manual_seed(args.seed + 777)
         lls, ess = [], []
-        for trips in val_batches:
+        t_val = time.time()
+        for b, trips in enumerate(val_batches):
+            if b:
+                progress(f"validation batch {b + 1}/{len(val_batches)} ({time.time() - t_val:.0f}s so far)")
             vb = batcher.make(trips)
             vb.bind(model)
             est, _, e, _ = importance_log_z(model, vb.ix, vgen, burn=80, components=32, thin=2, draws=args.val_draws)
@@ -287,6 +295,12 @@ def main():
                 for group in opt.param_groups:
                     group["lr"] *= decay
                 values.append(float(value.detach()))
+                done = len(values)
+                if args.progress_every and done % args.progress_every == 0:
+                    rate = (time.time() - t_epoch) / done
+                    progress(f"{name} epoch {epoch}: {done}/{len(batches)} updates, objective "
+                             f"{np.mean(values[-args.progress_every:]):.4f}, {rate:.1f}s/update, "
+                             f"epoch done in ~{rate * (len(batches) - done) / 60:.0f} min")
                 if stats is not None:
                     sizes.append(stats[:2])
                     model_present.add_(stats[2])

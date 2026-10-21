@@ -49,6 +49,8 @@ for VARIANT in rec m4c; do
     --out "$OUT/v4_$VARIANT" --recency "${EXTRA[@]}" --threads "$THREADS" > "$OUT/4_v4_$VARIANT.out" 2>&1
   stage 4 && python3 checks/discount_promotion.py model --events "$OUT/discount_events" --checkpoint "$OUT/v4_$VARIANT.pt" \
     --out "$OUT/v4_${VARIANT}_discount_check.json" --threads "$THREADS" > "$OUT/4_v4_${VARIANT}_discount.log" 2>&1
+  stage 4 && python3 checks/support_cap.py --checkpoint "$OUT/v4_$VARIANT.pt" --threads "$THREADS" \
+    --out "$OUT/v4_${VARIANT}_support_cap.json" > "$OUT/4_v4_${VARIANT}_support_cap.log" 2>&1
 done
 
 # 5. Test weeks, once, for the chosen model only (likelihood on the reference test trips and

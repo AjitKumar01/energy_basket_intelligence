@@ -17,7 +17,7 @@ as a baseline and scored the same way.
 | `v4/` | the model: data bundle, features, batches, utilities and energy, exact normaliser, sampler |
 | `v4/native/` | C++ kernels, built on first use into `build/native/` |
 | `scripts/` | one script per stage: partition, discount panel, initialize, base-model fit, Version-4 fit, evaluate |
-| `checks/` | the real-data discount and promotion check |
+| `checks/` | the real-data discount and promotion check; the support-cap check |
 | `shopper/` | SHOPPER (PyTorch reimplementation), its exactness checks and evaluator |
 | `synthetic/` | the stress-world generator |
 | `run/` | the recipes below |
@@ -113,7 +113,7 @@ nohup run/dunnhumby.sh > runs/dunnhumby/pipeline.out 2>&1 &
 | 2 | `scripts/build_discount_panel.py`, `scripts/initialize.py` | `log_discount.npy`, `initialization.pt` |
 | 3 | `scripts/fit_additive.py` with chain-only prices and the discount split | `additive/` |
 | 3c | `checks/discount_promotion.py events`, then `model` on the base model | `discount_events/`, `additive/discount_check.json` |
-| 4 | `scripts/fit_interactions.py` (recency; recency + M4c), then the discount check on each | `v4_rec.pt`, `v4_m4c.pt`, `v4_*_discount_check.json` |
+| 4 | `scripts/fit_interactions.py` (recency; recency + M4c), then the discount check and the support-cap check on each | `v4_rec.pt`, `v4_m4c.pt`, `v4_*_discount_check.json`, `v4_*_support_cap.json` |
 | 5 | test weeks, once, for the chosen variant: `CHOSEN=m4c REFERENCE=... FROM=5 run/dunnhumby.sh` | `v4_m4c.eval.json` |
 
 **Version 4 only, from an existing base model** (the update-matched schedule, at most 40

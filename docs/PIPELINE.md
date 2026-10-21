@@ -166,7 +166,10 @@ Two related fixed rules:
    effect comes from moving that price back, or switching the display or mailer on and off.
    Compare the depth slope with the depth coefficient, and the promotion log ratios with the
    display and mailer coefficients.
-4. **SHOPPER baseline**: a sequential model (Ruiz, Athey and Blei), refitted in PyTorch on the
+4. **Support cap** (`checks/support_cap.py`): the probability the fitted parameters would put on
+   baskets beyond the per-category cap (and beyond 40 or 60 categories) if the cap were removed,
+   exact per trip and averaged over latent draws. It shows whether the cap is harmless.
+5. **SHOPPER baseline**: a sequential model (Ruiz, Athey and Blei), refitted in PyTorch on the
    same trips, scored the same way.
 
 ## 7. Where things stand (2026-10-21)

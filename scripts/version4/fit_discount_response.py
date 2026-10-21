@@ -1452,6 +1452,7 @@ def evaluate_version4_counterfactual_q4(
     # Keep a separate exact additive model (out/v3_pipeline_additive_best.pt) and rank-5 model (artifacts/candidate_rank1.pt)
     model_add, _, _ = load_model(Path(init_ckpt), data)
     raw_add = torch.load(additive_ckpt, map_location="cpu", weights_only=False)
+    stress.attach_discount_kappa(model_add, raw_add["model"])
     model_add.load_state_dict(raw_add["model"])
     with torch.no_grad():
         model_add.phi.zero_()
@@ -1462,6 +1463,9 @@ def evaluate_version4_counterfactual_q4(
         q.requires_grad_(False)
 
     blob_rank5 = torch.load(rank5_ckpt, map_location="cpu", weights_only=False)
+    for name in ("disc_kappa", "disc_common"):
+        if getattr(model, name, None) is not None and name not in blob_rank5["model"]:
+            delattr(model, name)   # the rank-5 model keeps its own single price slope
     stress.configure_model_from_blob(model, blob_rank5)
     model.eval()
     for q in model.parameters():
@@ -1496,8 +1500,11 @@ def evaluate_version4_counterfactual_q4(
     trip_week = data["trip_week"]
     trip_store = data["trip_store"]
     trip_nlines = data["trip_nlines"]
+    # Trip window spans the events' previous and current weeks (90..101 for the test events).
+    week_lo = int(ev_prev_week_arr.min())
+    week_hi = int(ev_week_arr.max())
     all_window_trips = np.flatnonzero(
-        (trip_week >= 90) & (trip_week <= 101) & (trip_nlines >= 1) & (trip_nlines <= nmax)
+        (trip_week >= week_lo) & (trip_week <= week_hi) & (trip_nlines >= 1) & (trip_nlines <= nmax)
     )
     rng_sw = np.random.default_rng(seed + 101)
     sw_keys = (
@@ -1508,7 +1515,7 @@ def evaluate_version4_counterfactual_q4(
     for sw_val in needed_all_keys:
         cell_trips = all_window_trips[sw_keys == sw_val]
         if len(cell_trips) == 0:
-            raise RuntimeError(f"store-week key {int(sw_val)} has no eligible trips in weeks 90..101")
+            raise RuntimeError(f"store-week key {int(sw_val)} has no eligible trips in weeks {week_lo}..{week_hi}")
         if len(cell_trips) > max_trips_per_store_week:
             cell_trips = np.sort(
                 rng_sw.choice(cell_trips, size=max_trips_per_store_week, replace=False)
@@ -1532,7 +1539,7 @@ def evaluate_version4_counterfactual_q4(
         f"rank={r}, burn={burn}, draws={draws})..."
     )
 
-    weekly = pd.read_parquet(DATA / "price_week.parquet", columns=["PRODUCT_ID", "WEEK_NO", "price"])
+    weekly = pd.read_parquet(DATA / "price_week.parquet", columns=["PRODUCT_ID", "WEEK_NO", "price", "base_price"])
     weekly = weekly.merge(items[["PRODUCT_ID", "item_id"]], on="PRODUCT_ID", how="inner")
     weekly = weekly[weekly.WEEK_NO.between(0, 101)]
     chain_price = np.full((J, 102), np.nan, dtype=np.float64)
@@ -1541,6 +1548,14 @@ def evaluate_version4_counterfactual_q4(
     )
     chain_price = pd.DataFrame(chain_price).ffill(axis=1).bfill(axis=1).to_numpy()
     log_chain_price = np.log(chain_price)
+    # Discount depth per product-week, carried like the price (build_discount_panel.py), so a
+    # move to last week's prices also moves the discount part for models that split it.
+    base_week = np.full((J, 102), np.nan, dtype=np.float64)
+    base_week[weekly.item_id.to_numpy(np.int64), weekly.WEEK_NO.to_numpy(np.int64)] = (
+        weekly.base_price.to_numpy(np.float64)
+    )
+    base_week = pd.DataFrame(base_week).ffill(axis=1).bfill(axis=1).to_numpy()
+    week_discount = np.minimum(np.log(chain_price / base_week), 0.0)
 
     n_stores = int(data["n_store"])
     sw_trip_count = np.zeros((n_stores, 102), dtype=np.int64)
@@ -1592,10 +1607,29 @@ def evaluate_version4_counterfactual_q4(
         counts_b = torch.bincount(ix.item_trip, minlength=B).to(torch.float64)
         own_mult = kappa + (1.0 - kappa) / counts_b[ix.item_trip]
         du_single_prev = -gb_slot * own_mult * delta_to_prev
+        disc_to_prev = torch.from_numpy(
+            week_discount[slot_item, np.maximum(slot_week - 1, 1)]
+            - week_discount[slot_item, slot_week]
+        ).to(torch.float64)
+
+        def discount_shift(m):
+            # Own-utility change from the discount part:
+            # -[g (softplus(disc_kappa) - kappa) + disc_common] d dsc.
+            shift = torch.zeros_like(delta_to_prev)
+            if "dsc" not in bt.ctx:
+                return shift
+            if getattr(m, "disc_kappa", None) is not None:
+                kd = float(torch.nn.functional.softplus(m.disc_kappa.detach()))
+                km = float(torch.nn.functional.softplus(m.price_kappa.detach()))
+                shift = shift - m.price_coefficients(ix.item, ix.item_trip).detach() * (kd - km) * disc_to_prev
+            if getattr(m, "disc_common", None) is not None:
+                shift = shift - float(m.disc_common.detach()) * disc_to_prev
+            return shift
 
         # Simultaneous chain-week price counterfactual context via changed_price_context
         ctx_chain_prev = (
-            changed_price_context(bt.ctx, ix.item_trip, delta_to_prev) if need_cf else None
+            changed_price_context(bt.ctx, ix.item_trip, delta_to_prev, discount_change=disc_to_prev)
+            if need_cf else None
         )
 
         # --- 1. Additive base model (out/v3_pipeline_additive_best.pt, exact DP) ---
@@ -1610,8 +1644,13 @@ def evaluate_version4_counterfactual_q4(
         np.add.at(add_cat_item_factual, (slot_cat, slot_store, slot_week), p_add_0_np)
 
         if need_cf:
-            scale_add = torch.clamp_min(du_single_prev, 0.0)
-            num_add = p_add_0 * torch.exp(du_single_prev - scale_add)
+            # The additive model's own price slopes and multiplier (they may differ from rank-5's).
+            k_add = float(torch.nn.functional.softplus(model_add.price_kappa.detach()))
+            du_add = (-model_add.price_coefficients(ix.item, ix.item_trip).detach()
+                      * (k_add + (1.0 - k_add) / counts_b[ix.item_trip]) * delta_to_prev
+                      + discount_shift(model_add))
+            scale_add = torch.clamp_min(du_add, 0.0)
+            num_add = p_add_0 * torch.exp(du_add - scale_add)
             den_add = (1.0 - p_add_0) * torch.exp(-scale_add) + num_add
             p_add_single_prev = (num_add / den_add.clamp_min(1e-30)).numpy()
 
@@ -1873,8 +1912,24 @@ def evaluate_version4_counterfactual_q4(
                 "mae": float(np.mean(np.abs(t_m - p_m))),
             }
 
+        def depth_slope(after, before):
+            # Slope of the model's log(after / before) on the discount-depth change over every
+            # event (model predictions need no purchase selection).  Comparable to the empirical
+            # conditional-binomial promotion_depth_change coefficient, whose offset removes the
+            # category's basket change.
+            ok = (after > 0) & (before > 0)
+            y = np.log(after[ok]) - np.log(before[ok])
+            x = d_depth[ok]
+            return {"events": int(ok.sum()),
+                    "slope": float(np.cov(x, y)[0, 1] / np.var(x, ddof=1)) if ok.sum() > 2 else None}
+
         all_mask = np.ones(len(test_events), dtype=bool)
         return {
+            "log_ratio_on_depth_change_slope": {
+                "single_item_choice_share": depth_slope(s_fact_w, s_single_prev_w),
+                "single_item_purchase_rate": depth_slope(f_item_w, cf_single_w),
+                "chain_week_choice_share": depth_slope(s_fact_w, s_chain_prev_item_w),
+            },
             "single_item_exact_price_counterfactual_choice_share": {
                 "all_test_events": score_vector(pred_single_cf_change, obs_change, all_mask),
                 "informative_test_events": score_vector(
@@ -2038,6 +2093,12 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Rerun only Q4 using existing events.parquet and report.json from --source-dir without rescoring Q1 test weeks.",
     )
+    parser.add_argument(
+        "--q4-split",
+        default="test",
+        choices=("validation", "test"),
+        help="With --q4-only: which held-out events to score (validation for model selection).",
+    )
     parser.add_argument("--min-depth-change", type=float, default=0.05)
     parser.add_argument("--min-trips", type=int, default=16)
     parser.add_argument("--min-train-lines", type=int, default=0)
@@ -2084,7 +2145,7 @@ def main() -> None:
             f"(test weeks are not rescored for Q1)..."
         )
         events = pd.read_parquet(events_path)
-        test = events[events.split == "test"].copy()
+        test = events[events.split == args.q4_split].copy()
         report = json.loads(src_report_path.read_text())
         emp_slopes = {
             split_name: float(
@@ -2108,6 +2169,7 @@ def main() -> None:
             max_trips_per_store_week=args.max_trips_per_store_week,
             seed=args.seed,
         )
+        model_check["event_split"] = args.q4_split
         model_check_path = out_dir / "model_check.json"
         model_check_path.write_text(strict_json_dumps(plain(model_check)))
         log(f"wrote {model_check_path}")

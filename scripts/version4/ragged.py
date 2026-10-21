@@ -1023,9 +1023,20 @@ class RaggedModel(torch.nn.Module):
         _gb = self.price_coefficients(it, trip)
         if "dlp_bar" in c:
             _m = c["dlp_bar"][trip]
-            b = b - _gb * (_m + softplus(self.price_kappa) * (c["dlp"] - _m))
+            _k = softplus(self.price_kappa)
+            b = b - _gb * (_m + _k * (c["dlp"] - _m))
         else:
+            _k = 1.0
             b = b - _gb * c["dlp"]
+        # Optional discount split: dlp = (dlp - dsc) + dsc, where dsc is the temporary discount
+        # depth centred on the product's training days.  The discount part gets its own relative multiplier
+        # softplus(disc_kappa) in place of _k; disc_kappa = price_kappa is the one-slope model.
+        if "dsc" in c and getattr(self, "disc_kappa", None) is not None:
+            b = b - _gb * (softplus(self.disc_kappa) - _k) * c["dsc"]
+        # Optional common discount slope, the same for every household and product, so the
+        # typical discount response is pooled rather than carried only by the factorised g.
+        if "dsc" in c and getattr(self, "disc_common", None) is not None:
+            b = b - self.disc_common * c["dsc"]
         b = b + self.w_dsp[it] * c["disp"] + self.w_mlr[it] * c["mail"]
         b = b + (self.mu[it] * self.delta_c()[c["week"]]).sum(-1)
         b = b + (self.zeta[it] * self.xi_c()[c["store"]]).sum(-1)

@@ -12,8 +12,13 @@ import math
 import torch
 
 
-def changed_price_context(context, item_trip: torch.Tensor, log_change) -> dict:
-    """Apply slot-level log-price changes and update the actual assortment mean."""
+def changed_price_context(context, item_trip: torch.Tensor, log_change,
+                          discount_change=None) -> dict:
+    """Apply slot-level log-price changes and update the actual assortment mean.
+
+    discount_change, when given and the context carries a discount panel ("dsc"), is the
+    slot-level change in discount depth; None treats every change as a regular-price change.
+    """
     change = torch.as_tensor(log_change, dtype=context["dlp"].dtype,
                              device=context["dlp"].device)
     change = torch.broadcast_to(change, context["dlp"].shape)
@@ -29,6 +34,10 @@ def changed_price_context(context, item_trip: torch.Tensor, log_change) -> dict:
             raise ValueError("every price context must have an offered product")
         total = torch.zeros_like(context["dlp_bar"]).index_add(0, item_trip, change)
         result["dlp_bar"] = context["dlp_bar"] + total / counts
+    if discount_change is not None and "dsc" in context:
+        d = torch.broadcast_to(torch.as_tensor(discount_change, dtype=context["dsc"].dtype,
+                                               device=context["dsc"].device), context["dsc"].shape)
+        result["dsc"] = context["dsc"] + d
     return result
 
 

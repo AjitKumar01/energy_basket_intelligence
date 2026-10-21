@@ -125,6 +125,7 @@ def setup(initialization, additive, threads, recency=False, iv_slope=False):
     data = build()
     model, meta, _ = load_model(Path(initialization), data)
     raw = torch.load(additive, map_location="cpu", weights_only=False)
+    attach_discount_kappa(model, raw["model"])
     model.load_state_dict(raw["model"])
     with torch.no_grad():
         model.phi.zero_()
@@ -148,10 +149,21 @@ def setup(initialization, additive, threads, recency=False, iv_slope=False):
     features = Features(int(data["n_item"]), int(data["n_store"]), include_recency=recency,
                         include_store_price=True)
     batcher = Batcher(data, features, int(meta["nmax"]), include_recency=recency)
+    if (getattr(model, "disc_kappa", None) is not None
+            or getattr(model, "disc_common", None) is not None) and features.dsc is None:
+        raise RuntimeError("the additive parent has a discount multiplier but no discount panel "
+                           "is loaded; set ENERGY_DISCOUNT_PANEL")
     model.recency = bool(recency)
     if recency:
         attach_purchase_history(batcher, PurchaseHistory(data), model.cat_of.long())
     return data, model, meta, batcher
+
+
+def attach_discount_kappa(model, state):
+    """Create the optional discount parameters when a state dict carries them."""
+    for name in ("disc_kappa", "disc_common"):
+        if name in state and getattr(model, name, None) is None:
+            setattr(model, name, torch.nn.Parameter(torch.zeros_like(state[name])))
 
 
 def checkpoint_uses_recency(path):
@@ -186,6 +198,7 @@ def configure_model_from_blob(model, blob):
         model.has_iv_slope = False
     model.iv_price_only = bool(blob.get("iv_price_only", False))
     model.cat_rho0 = bool(blob.get("cat_rho0", False))
+    attach_discount_kappa(model, st)
     model.load_state_dict(st)
 
 
@@ -297,7 +310,7 @@ def iv_slope_lambda(model):
     return None
 
 
-PRICE_KEYS = ("dlp", "dlp_bar", "disp", "mail")
+PRICE_KEYS = ("dlp", "dlp_bar", "disp", "mail", "dsc")
 
 
 def row_logsumexp(ix, b_slot):
@@ -789,7 +802,10 @@ def train(args):
         with torch.no_grad():
             model.phi[:, :r] = args.phi_init * torch.randn(J, r)
     # with --recency, psi is trained in its own group (from stage A) instead of with the T1 price block
-    price_names = ("gamma", "beta", "price_kappa") + (() if args.recency else ("psi",))
+    price_names = (("gamma", "beta", "price_kappa")
+                   + tuple(n for n in ("disc_kappa", "disc_common")
+                           if getattr(model, n, None) is not None)
+                   + (() if args.recency else ("psi",)))
     price_init = {n: getattr(model, n).detach().clone() for n in price_names}
     for n in price_names:
         getattr(model, n).requires_grad_(False)

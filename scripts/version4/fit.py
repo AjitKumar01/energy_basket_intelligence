@@ -215,6 +215,8 @@ class Batcher:
                    week=(wk_i - 1) % 52, store=st_i)
         if getattr(self.F, "availability_enabled", False):
             ctx["log_avail"] = self.F.log_availability(ix.item, st_i, wk_i)
+        if getattr(self.F, "dsc", None) is not None:
+            ctx["dsc"] = self.F.discount(ix.item, dy_i).double()
         if self.include_recency:
             ctx["rec"] = self.F.recency(ix.item, user[ix.item_trip], dy_i)
         li, lt, lc, lu = [], [], [], []
@@ -233,6 +235,8 @@ class Batcher:
                     week=(week[LT] - 1) % 52, store=store[LT])
         if getattr(self.F, "availability_enabled", False):
             lctx["log_avail"] = self.F.log_availability(LI, store[LT], week[LT])
+        if getattr(self.F, "dsc", None) is not None:
+            lctx["dsc"] = self.F.discount(LI, day[LT]).double()
         if self.include_recency:
             lctx["rec"] = self.F.recency(LI, user[LT], day[LT])
         house = torch.as_tensor(D["trip_user"][trips], dtype=torch.long)

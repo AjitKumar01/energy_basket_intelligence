@@ -11,6 +11,10 @@ unset), so Dunnhumby and canonical external bundles share one implementation.
                  sparse (product, store, week) deviation
     promotion    display and mailer indicators, sparse over (product, store, week)
     seasonality  mu_j' delta_w
+    discount     optional dense (product x day) temporary-discount depth
+                 min(log(price / regular price), 0), centred on each product's training days
+                 like the price panel: the part of Delta log p that is a discount; read from $ENERGY_DISCOUNT_PANEL or basket_input/log_discount.npy
+                 when present (scripts/v4_training/build_discount_panel.py)
     store        zeta_j' xi_s
     recency      optional strictly-before purchase-history features from state.npz
     availability optional log-availability offset from availability.npz: 0 once a product
@@ -45,7 +49,8 @@ class Features:
     WEEK_KEY_STRIDE = 128
     DAY_KEY_STRIDE = 1024
 
-    def __init__(self, n_item, n_store, include_recency=True, include_store_price=None):
+    def __init__(self, n_item, n_store, include_recency=True, include_store_price=None,
+                 discount_panel=None):
         self.S = n_store
         self.include_recency = bool(include_recency)
         if include_store_price is None:
@@ -64,6 +69,20 @@ class Features:
             raise RuntimeError("price panel has more days than the recency key stride")
         log(f"price deviation panel {tuple(self.dev.shape)}, "
             f"|mean| {float(self.dev.abs().mean()):.4f}")
+        # discount_panel: a path, False to disable, or None for the environment / bundle default.
+        if discount_panel is None:
+            discount_panel = os.environ.get("ENERGY_DISCOUNT_PANEL") or None
+            if discount_panel is None and os.path.isfile(os.path.join(BI, "log_discount.npy")):
+                discount_panel = os.path.join(BI, "log_discount.npy")
+        self.discount_panel = str(discount_panel) if discount_panel else None
+        if self.discount_panel:
+            self.dsc = torch.from_numpy(np.load(self.discount_panel).astype(np.float32))
+            if tuple(self.dsc.shape) != tuple(self.dev.shape):
+                raise RuntimeError(f"discount panel {tuple(self.dsc.shape)} does not match the "
+                                   f"price panel {tuple(self.dev.shape)}")
+            log(f"discount panel {self.discount_panel}: sd {float(self.dsc.std()):.4f}")
+        else:
+            self.dsc = None
 
         # Key conventions are NOT guessed.  The promotion panel is built by
         # pipeline/23_promo_data.py as (item * n_stores + store) * 128 + WEEK_NO with the
@@ -206,4 +225,8 @@ class Features:
         disp = self._lookup(self.pk, self.pd_, q)
         mail = self._lookup(self.pk, self.pm, q)
         return dlp, disp, mail
+
+    def discount(self, item, day):
+        """Centred temporary-discount depth at each slot, or None without a discount panel."""
+        return None if self.dsc is None else self.dsc[item, day]
 

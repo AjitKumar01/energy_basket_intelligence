@@ -91,12 +91,19 @@ class Priors:
     rec_prec: float
 
 
-def penalties(model, priors, n_train, psi, delta, price_init, recency):
-    loss = 0.0
+def add_pooling(loss, model, weight):
+    """loss + weight * sum over the three product x context factorisations (mu, delta),
+    (zeta, xi), (alpha, theta) of trace(P'P C'C) / (rows of P * rows of C): shrinks the
+    products of factors, so a constant cannot hide in a bilinear term."""
     for product, context in ((model.mu, model.delta_c()), (model.zeta, model.xi_c()),
                              (model.alpha, model.theta_c())):
-        loss = loss + priors.pool_prod * torch.trace((product.T @ product) @ (context.T @ context)) / (
+        loss = loss + weight * torch.trace((product.T @ product) @ (context.T @ context)) / (
             product.shape[0] * context.shape[0])
+    return loss
+
+
+def penalties(model, priors, n_train, psi, delta, price_init, recency):
+    loss = add_pooling(0.0, model, priors.pool_prod)
     phi_prior = priors.phi_prec * psi.square().sum() + priors.delta_prec * delta.square().sum()
     extra_prior = priors.f_extra_prec * model.f_extra.square().sum()
     price_prior = 0.0

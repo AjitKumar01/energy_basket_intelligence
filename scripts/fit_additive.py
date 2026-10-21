@@ -52,6 +52,7 @@ from v4.exact import additive_log_size  # noqa: E402
 from v4.features import PRICE_CONTRACTS, Features  # noqa: E402
 from v4.price import uniform_price_elasticity  # noqa: E402
 from v4.reporting import strict_json_dumps  # noqa: E402
+from v4.training import add_pooling  # noqa: E402
 
 ESTIMATOR = "exact_version4_no_gram_dynamic_program"
 FITTED = ("lam", "alpha", "theta", "rho_c", "rho_0_free", "price_kappa", "gamma", "beta",
@@ -281,10 +282,7 @@ def main():
             elasticity = uniform_price_elasticity(model, batch.ix, size_law, step=args.elast_step)
             loss = loss + args.elast_w * (elasticity - args.elast_target).square()
         if args.pool_prod > 0:
-            for product, context in ((model.mu, model.delta_c()), (model.zeta, model.xi_c()),
-                                     (model.alpha, model.theta_c())):
-                loss = loss + args.pool_prod * torch.trace((product.T @ product) @ (context.T @ context)) / (
-                    product.shape[0] * context.shape[0])
+            loss = add_pooling(loss, model, args.pool_prod)
         if not bool(torch.isfinite(loss)):
             raise FloatingPointError(f"non-finite loss at update {iteration}")
         loss.backward()

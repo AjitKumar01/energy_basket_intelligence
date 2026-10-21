@@ -46,7 +46,8 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument("--tsv", type=Path)
     p.add_argument("--bundle", action="store_true")
-    p.add_argument("--price-contract", choices=("chain_and_store", "chain_product_week_only"))
+    p.add_argument("--price-contract", choices=("chain_and_store", "chain_product_week_only"), default="chain_and_store",
+                   help="chain_product_week_only for Dunnhumby (as the energy model)")
     p.add_argument("--discount-panel", type=Path)
     p.add_argument("--norm-price", type=int, default=1)
     p.add_argument("--K", type=int, default=50)

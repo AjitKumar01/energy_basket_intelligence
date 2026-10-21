@@ -21,7 +21,7 @@ from __future__ import annotations
 
 import torch
 
-from .kernels import CategoryProduct, RowESP, category_product_2d
+from .kernels import CategoryProduct, CategoryProduct2D, RowESP
 
 ESP_BUCKETS = (8, 32, 96, 256)
 
@@ -114,7 +114,7 @@ def log_mass_by_size_and_categories(model, ix, log_g, scale):
     """log total weight of baskets with n products in m categories, n, m = 1..nmax,
     [B, nmax, nmax], with the size potential on m (M3)."""
     tilted, degree, slope = _trip_grid(model, ix, log_g)
-    log_a = category_product_2d(tilted[0].contiguous(), degree.contiguous(), model.nmax)
+    log_a = CategoryProduct2D.apply(tilted[0].contiguous(), degree.contiguous(), model.nmax)
     n = torch.arange(model.nmax + 1, dtype=log_g.dtype)
     log_a = log_a + slope[0, :, None, None] * n[None, :, None]
     return (log_a[:, 1:, 1:] + n[None, 1:, None] * scale[:, None, None]

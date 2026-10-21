@@ -167,15 +167,3 @@ class CategoryProduct2D(torch.autograd.Function):
                                                        ptr(deg_c), ptr(states), ptr(grad_c)), "2-D DP backward")
             grad_in[s:e] = grad_c
         return grad_in, None, None
-
-
-def category_product_2d(log_polys, degree, nmax):
-    """CategoryProduct2D, skipping the saved states when no gradient is needed."""
-    if torch.is_grad_enabled() and log_polys.requires_grad:
-        return CategoryProduct2D.apply(log_polys, degree, int(nmax))
-    lp, deg = log_polys.contiguous(), degree.contiguous()
-    B, Cpad, stride = lp.shape
-    out = torch.empty((B, nmax + 1, nmax + 1))
-    check(sampler().log_degree_2d_forward_cpp(B, Cpad, stride, int(nmax), ptr(lp), ptr(deg),
-                                              ptr(out), 0, 0), "2-D DP")
-    return out

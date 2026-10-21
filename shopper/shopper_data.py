@@ -94,6 +94,7 @@ class BundleSource:
         from v4.bundle import data_root, item_categories, load_bundle
         from v4.features import Features
         root = data_root(root)
+        price_contract = price_contract or "chain_and_store"       # older checkpoints record None
         data = load_bundle(root)
         self.data = data
         J = int(data["n_item"])

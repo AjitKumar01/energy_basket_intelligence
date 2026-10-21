@@ -40,6 +40,7 @@ from v4.bundle import data_root, item_categories, load_bundle, supported_trips  
 from v4.checkpoints import freeze, load_version4  # noqa: E402
 from v4.exact import incidence as exact_incidence, log_partition  # noqa: E402
 from v4.price import changed_price_context  # noqa: E402
+from v4 import scenarios  # noqa: E402
 from v4.reporting import classifier_auc, clustered_ci  # noqa: E402
 from v4.sampling import draw_from_model, gibbs, importance_log_z  # noqa: E402
 
@@ -127,18 +128,7 @@ def realism(model, data, batcher, args):
 
 
 def price_scenarios(model, data, batcher, args, gen):
-    world = args.world
-    o = np.load(world / "observed.npz")
-    meta = json.loads((world / "truth.json").read_text())
-    period = o["trip_period"]
-    split = np.where(period <= meta["train_weeks"], 0,
-                     np.where(period <= meta["train_weeks"] + meta["validation_weeks"], 1, 2))
-    rows = np.sort(np.random.default_rng(77).choice(np.flatnonzero(split == 2), size=args.scenario_trips,
-                                                    replace=False))
-    to_model = {int(orig): i for i, orig in enumerate(o["original_item"])}
-    truth = json.loads((world / "counterfactual_truth.json").read_text())
-    cat, sub, J = o["category"], o["subcategory"], int(data["n_item"])
-
+    rows = scenarios.test_rows(args.world, args.scenario_trips)
     # z draws at factual prices, shared by every scenario.
     sets = []
     for s in range(0, len(rows), args.eval_batch):
@@ -152,9 +142,9 @@ def price_scenarios(model, data, batcher, args, gen):
                 zs.append(model.basket_field(batch.ix, X) + torch.randn(batch.ix.B, model.rank, generator=gen))
         sets.append((batch, zs))
 
-    def incidence(product=None, multiplier=1.0):
+    def incidence(product, multiplier):
         """Expected purchases of every product (summed over trips) and mean basket size."""
-        inc, size = np.zeros(J), 0.0
+        inc, size = np.zeros(int(data["n_item"])), 0.0
         for batch, zs in sets:
             ix, ctx = batch.ix, batch.ctx
             if product is not None:
@@ -186,35 +176,7 @@ def price_scenarios(model, data, batcher, args, gen):
         batch.bind(model)
         return inc, size / len(rows)
 
-    base_inc, base_size = incidence()
-    rel = lambda a, b: float(b / a - 1.0) if a > 0 else None  # noqa: E731
-    results = []
-    for sc in truth["scenarios"]:
-        k = to_model.get(int(sc["product"]))
-        if k is None:
-            continue
-        alt, alt_size = incidence(k, sc["price_multiplier"])
-        same = np.flatnonzero((cat == cat[k]) & (sub == sub[k]) & (np.arange(J) != k))
-        rest = np.flatnonzero((cat == cat[k]) & (sub != sub[k]))
-        results.append({"product": int(sc["product"]), "price_multiplier": sc["price_multiplier"],
-                        "own": {"truth": rel(*sc["own_incidence"]), "model": rel(base_inc[k], alt[k])},
-                        "same_subcategory": {"truth": rel(*sc["same_subcategory_incidence"]),
-                                             "model": rel(base_inc[same].sum(), alt[same].sum())},
-                        "rest_of_category": {"truth": rel(*sc["rest_of_category_incidence"]),
-                                             "model": rel(base_inc[rest].sum(), alt[rest].sum())},
-                        "basket_size_change": {"truth": sc["mean_basket_size"][1] - sc["mean_basket_size"][0],
-                                               "model": alt_size - base_size}})
-
-    def agreement(key):
-        pairs = np.array([(x[key]["truth"], x[key]["model"]) for x in results
-                          if x[key]["truth"] is not None and x[key]["model"] is not None])
-        t, m = pairs.T
-        return {"scenarios": len(pairs), "correlation": float(np.corrcoef(t, m)[0, 1]),
-                "mean_abs_error": float(np.abs(t - m).mean()),
-                "sign_agreement": float(np.mean(np.sign(t) == np.sign(m))),
-                "mean_truth": float(t.mean()), "mean_model": float(m.mean())}
-
-    return {k: agreement(k) for k in ("own", "same_subcategory", "rest_of_category", "basket_size_change")}, results
+    return scenarios.run(args.world, int(data["n_item"]), incidence)
 
 
 def main():

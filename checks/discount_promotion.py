@@ -57,11 +57,9 @@ torch.set_default_dtype(torch.float64)
 from scipy.optimize import minimize  # noqa: E402
 from scipy.special import expit  # noqa: E402
 
-from v4.batches import Batcher, PurchaseHistory  # noqa: E402
 from v4.bundle import data_root, file_sha256, load_bundle  # noqa: E402
-from v4.checkpoints import discount_panel, freeze, load_additive, version4_flags  # noqa: E402
+from v4.checkpoints import batcher_for, freeze, load_model  # noqa: E402
 from v4.exact import incidence as exact_incidence  # noqa: E402
-from v4.features import Features  # noqa: E402
 from v4.price import changed_price_context, own_price_tilt  # noqa: E402
 from v4.reporting import strict_json_dumps  # noqa: E402
 from v4.sampling import draw_from_model, gibbs  # noqa: E402
@@ -224,25 +222,11 @@ def empirical_effects(frame):
 
 # ---- step 2: the model's responses -----------------------------------------------------------
 def load_any(path, data, root, initialization, panel=None):
-    """An additive or Version-4 checkpoint, with a chain-price batcher; rank 0 = additive.
-    ``panel`` overrides the discount panel the checkpoint records."""
-    blob = torch.load(path, map_location="cpu", weights_only=False)
-    if "rank" not in blob:                                          # additive base model
-        init = initialization or blob.get("initialization")
-        model, meta, parent = load_additive(init, path, data, root)
-        flags = {"rank": 0, "size_on_categories": False, "recency": False}
-    else:
-        init = initialization or blob["initialization"]
-        model, meta, parent = load_additive(init, blob["additive"], data, root)
-        flags = version4_flags(blob)
-        model.load_fitted_state(blob["model"])
-        model.rank, model.size_on_categories = flags["rank"], flags["size_on_categories"]
-        if flags["max_per_category"] is not None:
-            model.R = int(flags["max_per_category"])
-    features = Features(root, int(data["n_item"]), int(data["n_store"]), recency=flags["recency"],
-                        price_contract="chain_product_week_only", discount_panel=panel or discount_panel(parent))
-    batcher = Batcher(data, features, recency=flags["recency"],
-                      purchase_history=PurchaseHistory(data) if flags["recency"] else None)
+    """An additive or Version-4 checkpoint with chain-only prices (store prices exist only
+    where the product sold); ``panel`` overrides the recorded discount panel."""
+    model, meta, parent, flags, _ = load_model(path, data, root, initialization=initialization)
+    batcher = batcher_for(data, root, parent, recency=flags["recency"], purchase_history=flags["recency"],
+                          contract="chain_product_week_only", panel=panel)
     return freeze(model), meta, batcher
 
 

@@ -17,7 +17,7 @@ import torch
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
-from eval_shopper_stress import load  # noqa: E402
+from evaluate_shopper import load  # noqa: E402
 from shopper_data import BundleSource  # noqa: E402
 
 p = argparse.ArgumentParser()
@@ -33,7 +33,8 @@ torch.set_num_threads(a.threads)
 torch.set_default_dtype(torch.float64)
 model, _ = load(a.checkpoint)
 model.double()
-src = BundleSource()
+cfg = torch.load(a.checkpoint, map_location="cpu", weights_only=False)["config"]
+src = BundleSource(price_contract=cfg.get("price_contract"), discount_panel=cfg.get("discount_panel"))
 ref = np.load(a.per_trip)
 pick = np.sort(np.random.default_rng(11).choice(len(ref["trips"]), a.trips, replace=False))
 trips, ll_ref = ref["trips"][pick], ref["ll"][pick]

@@ -1,13 +1,17 @@
 #!/usr/bin/env python3
-"""Score a SHOPPER fit on the stress world exactly as scripts/evaluate.py scores the energy model.
+"""Score a SHOPPER fit exactly as scripts/evaluate.py scores the energy model (stress world or Dunnhumby).
 
 1. Held-out basket log-likelihood on the certified reference trips (the 4,096 test trips the
    energy models use), log P(S) by importance sampling over orderings with a half-split check,
    paired per trip with an energy-model run's per-trip log-likelihoods (e.g. hs_rec).
 2. Classifier two-sample AUCs (full basket, category presence) on all supported test trips,
    one generated basket per trip per seed (generation capped at the energy model's nmax).
-3. The 32 single-product price scenarios against the world's causal truth, on the same 400
-   test trips: incidences P(j in S) by Monte Carlo with common random numbers.
+3. Stress world only (--world): the 32 single-product price scenarios against the world's
+   causal truth, on the same 400 test trips: incidences P(j in S) by Monte Carlo with common
+   random numbers.
+
+The bundle is $ENERGY_MODEL_DATA_ROOT; the price contract is the one the fit used.  The
+protocol (docs/SHOPPER_BASELINE_PROTOCOL.md) needs at least 8,192 orderings for log P(S).
 """
 import argparse
 import json
@@ -46,8 +50,8 @@ def main():
     p.add_argument("--checkpoint", type=Path, required=True)
     p.add_argument("--reference", type=Path, required=True, help="reference trips (.npz with trips, household)")
     p.add_argument("--paired", type=Path, help="an energy model's per-trip log-likelihoods on the same trips")
-    p.add_argument("--world", type=Path, required=True, help="synthetic world with counterfactual truth")
-    p.add_argument("--perms", type=int, default=256)
+    p.add_argument("--world", type=Path, help="synthetic world with counterfactual truth (price scenarios)")
+    p.add_argument("--perms", type=int, default=8192, help="orderings per basket for log P(S)")
     p.add_argument("--auc-seeds", type=int, nargs="+", default=[41006, 41007, 41008])
     p.add_argument("--scenario-trips", type=int, default=400)
     p.add_argument("--scenario-draws", type=int, default=256)
@@ -63,7 +67,10 @@ def main():
     torch.set_default_dtype(torch.float64)
     model, blob = load(a.checkpoint)
     model.double()
-    src = BundleSource()
+    if a.world is None and "price" not in a.skip:
+        a.skip.append("price")                       # no causal truth on real data
+    cfg = blob["config"]
+    src = BundleSource(price_contract=cfg.get("price_contract"), discount_panel=cfg.get("discount_panel"))
     data = src.data
     J = src.n_item
     report = {"checkpoint": str(a.checkpoint), "config": {k: str(v) for k, v in blob["config"].items()},
@@ -126,18 +133,12 @@ def main():
             "category_presence_auc_sd": float(np.std([x["category_presence_auc"] for x in seeds], ddof=1))}
 
     if "price" not in a.skip:
-        o = np.load(a.world / "observed.npz")
-        tm = json.loads((a.world / "truth.json").read_text())
-        period = o["trip_period"]
-        split = np.where(period <= tm["train_weeks"], 0, np.where(period <= tm["train_weeks"] + tm["validation_weeks"], 1, 2))
-        rows = np.sort(np.random.default_rng(77).choice(np.flatnonzero(split == 2), size=a.scenario_trips, replace=False))
-        to_model = {int(orig): i for i, orig in enumerate(o["original_item"])}
-        truth = json.loads((a.world / "counterfactual_truth.json").read_text())
-        cat, sub = o["category"], o["subcategory"]
+        from v4 import scenarios
+        rows = scenarios.test_rows(a.world, a.scenario_trips)
         R = a.scenario_draws
         base_trips = [src.make(rows[s:s + 16]) for s in range(0, len(rows), 16)]
 
-        def incidence(product=None, multiplier=1.0):
+        def incidence(product, multiplier):
             inc, size = np.zeros(J), 0.0
             offset = 777
             if a.placebo and product is not None:    # same prices, different random numbers
@@ -155,40 +156,10 @@ def main():
                 size += float(w.sum())
             return inc, size / len(rows)
 
-        ts = time.time()
-        base_inc, base_size = incidence()
-        print(f"[scenario] base ({time.time() - ts:.0f}s)", flush=True)
-        rel = lambda x, y: float(y / x - 1.0) if x > 0 else None  # noqa: E731
-        results = []
-        for sc in truth["scenarios"]:
-            k = to_model.get(int(sc["product"]))
-            if k is None:
-                continue
-            ts = time.time()
-            alt, alt_size = incidence(k, sc["price_multiplier"])
-            print(f"[scenario] {len(results) + 1}: product {k} x{sc['price_multiplier']} "
-                  f"({time.time() - ts:.0f}s, total {time.time() - t0:.0f}s)", flush=True)
-            same = np.flatnonzero((cat == cat[k]) & (sub == sub[k]) & (np.arange(J) != k))
-            rest = np.flatnonzero((cat == cat[k]) & (sub != sub[k]))
-            results.append({"product": int(sc["product"]), "price_multiplier": sc["price_multiplier"],
-                            "own": {"truth": rel(*sc["own_incidence"]), "model": rel(base_inc[k], alt[k])},
-                            "same_subcategory": {"truth": rel(*sc["same_subcategory_incidence"]),
-                                                 "model": rel(base_inc[same].sum(), alt[same].sum())},
-                            "rest_of_category": {"truth": rel(*sc["rest_of_category_incidence"]),
-                                                 "model": rel(base_inc[rest].sum(), alt[rest].sum())},
-                            "basket_size_change": {"truth": sc["mean_basket_size"][1] - sc["mean_basket_size"][0],
-                                                   "model": alt_size - base_size}})
+        def progress(i, k, mult):
+            print(f"[scenario] {i}: product {k} x{mult} (total {time.time() - t0:.0f}s)", flush=True)
 
-        def agreement(key):
-            pairs = np.array([(x[key]["truth"], x[key]["model"]) for x in results
-                              if x[key]["truth"] is not None and x[key]["model"] is not None])
-            t_, m_ = pairs.T
-            return {"scenarios": len(pairs), "correlation": float(np.corrcoef(t_, m_)[0, 1]),
-                    "mean_abs_error": float(np.abs(t_ - m_).mean()),
-                    "sign_agreement": float(np.mean(np.sign(t_) == np.sign(m_))),
-                    "mean_truth": float(t_.mean()), "mean_model": float(m_.mean())}
-        report["price"] = {k: agreement(k) for k in ("own", "same_subcategory", "rest_of_category", "basket_size_change")}
-        report["price_scenarios"] = results
+        report["price"], report["price_scenarios"] = scenarios.run(a.world, J, incidence, progress)
         print(json.dumps(report["price"]), flush=True)
     report["eval_seconds"] = time.time() - t0
     a.output.write_text(json.dumps(report, indent=1) + "\n")

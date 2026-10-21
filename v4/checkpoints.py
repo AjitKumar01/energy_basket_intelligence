@@ -90,12 +90,13 @@ def load_additive(initialization, additive, data, root=None):
     return model, meta, blob
 
 
-def batcher_for(data, root, additive_blob, *, recency=False, purchase_history=False):
-    """A Batcher with the features the base model was fitted on, plus optional history."""
-    panel = discount_panel(additive_blob)
+def batcher_for(data, root, additive_blob, *, recency=False, purchase_history=False,
+                contract=None, panel=None):
+    """A Batcher with the features the base model was fitted on, plus optional history.
+    ``contract`` and ``panel`` override the recorded price contract and discount panel."""
     features = Features(data_root(root), int(data["n_item"]), int(data["n_store"]),
-                        recency=recency, price_contract=price_contract(additive_blob),
-                        discount_panel=panel)
+                        recency=recency, price_contract=contract or price_contract(additive_blob),
+                        discount_panel=panel or discount_panel(additive_blob))
     return Batcher(data, features, recency=recency,
                    purchase_history=PurchaseHistory(data) if purchase_history else None)
 
@@ -110,23 +111,33 @@ def version4_flags(blob) -> dict:
             "recency": bool(blob.get("recency", False)), "max_per_category": blob.get("max_per_category")}
 
 
-def load_version4(path, data, root=None, *, initialization=None, additive=None):
-    """A trained Version-4 model, its Batcher and its blob.
+def load_model(path, data, root=None, *, initialization=None, additive=None):
+    """An additive or a Version-4 checkpoint: (model, meta, parent blob, flags, its blob).
 
-    The parent files are read from the checkpoint; old checkpoints that do not record
-    them need ``initialization`` and ``additive``."""
+    For a Version-4 checkpoint the parent files are read from it; old checkpoints that do
+    not record them need ``initialization`` and ``additive``.  An additive model has rank 0."""
     blob = _load(path)
-    initialization = initialization or blob["initialization"]
-    additive = additive or blob["additive"]
-    model, meta, parent = load_additive(initialization, additive, data, root)
+    if "rank" not in blob:                                        # additive base model
+        model, meta, parent = load_additive(initialization or blob.get("initialization"), path, data, root)
+        flags = {"rank": 0, "size_on_categories": False, "recency": False, "max_per_category": None}
+        return model, meta, parent, flags, blob
+    model, meta, parent = load_additive(initialization or blob["initialization"],
+                                        additive or blob["additive"], data, root)
     flags = version4_flags(blob)
     model.load_fitted_state(blob["model"])
     model.rank = flags["rank"]
     model.size_on_categories = flags["size_on_categories"]
     if flags["max_per_category"] is not None:
         model.R = int(flags["max_per_category"])
-    batcher = batcher_for(data, root, parent, recency=flags["recency"],
-                          purchase_history=flags["recency"])
+    return model, meta, parent, flags, blob
+
+
+def load_version4(path, data, root=None, *, initialization=None, additive=None):
+    """A trained Version-4 model, its Batcher (the base model's features plus history),
+    its blob and metadata."""
+    model, meta, parent, flags, blob = load_model(path, data, root, initialization=initialization,
+                                                  additive=additive)
+    batcher = batcher_for(data, root, parent, recency=flags["recency"], purchase_history=flags["recency"])
     return model, batcher, blob, meta
 
 

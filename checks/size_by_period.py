@@ -99,8 +99,8 @@ def main():
         batch.bind(model)
         en = expected_size(model, batch, gen, long=a.long, draws=a.draws)
         ever = None
-        if "rec" in batch.ctx:                                   # purchase history: [slots, 3], first = ever bought
-            ever = float(np.bincount(batch.ix.item_trip.numpy(), batch.ctx["rec"][:, 0].numpy(), batch.ix.B).mean())
+        if "rec_item" in batch.ctx:                              # product purchase history; column 0 = ever bought
+            ever = float(np.bincount(batch.ix.item_trip.numpy(), batch.ctx["rec_item"][:, 0].numpy(), batch.ix.B).mean())
         row = {"period": name, "weeks": [int(weeks[trips].min()), int(weeks[trips].max())], "trips": len(trips),
                "model_expected_size": round(float(en.mean()), 2), "model_median": round(float(np.median(en)), 2),
                "real_size": round(float(sizes[trips].mean()), 2),

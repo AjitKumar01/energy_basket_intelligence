@@ -8,6 +8,9 @@ Blocks added to the base model (all start at zero or small values):
     size on categories           M3: rho_0 applies to the number of categories present
     u_cat                        M4a: household taste per category, theta_h . u_c
     psi, psi_item                --recency: sub-commodity recency and product purchase history
+    hist_size                    --centre-history: centre the history shift within each trip and
+                                 learn its size effect, n * hist_size * log(1 + products ever
+                                 bought) (see v4/model.py); needs --recency
     iv_slope_raw                 --m4c: discount only the price part of category inclusive value
 
 Stages:
@@ -22,6 +25,10 @@ Stages:
 Moment matching: besides Adam, rho_0, rho_c and lam take preconditioned steps
 (--mm-rho0, --mm-rho, --mm-lam) that move the model's category-presence, category-pair and
 product rates toward the data's; these terms otherwise converge slowly.
+
+--warm-start CK starts every parameter from a Version-4 checkpoint of the same shape (blocks
+the checkpoint lacks, such as hist_size, start at zero); the price prior stays centred at the
+base model.  Use it with --pl-epochs 0 to refit after a model change.
 
 Writes OUT.pt (final), OUT_pl.pt (after stage A) and OUT.log (one JSON row per epoch).
 """
@@ -57,6 +64,9 @@ def parse_args():
     p.add_argument("--out", type=Path, required=True, help="output path without suffix")
     p.add_argument("--recency", action="store_true", help="add recency and purchase-history features")
     p.add_argument("--m4c", action="store_true", help="add M4c (price-only inclusive value per category)")
+    p.add_argument("--centre-history", action="store_true",
+                   help="centre the history shift within each trip and learn its size effect (needs --recency)")
+    p.add_argument("--warm-start", type=Path, help="start from this Version-4 checkpoint's parameters")
     p.add_argument("--iv-init", type=float, default=0.0, help="M4c: starting logit of lambda_c")
     p.add_argument("--rank", type=int, default=16)
     p.add_argument("--max-per-category", type=int,
@@ -114,6 +124,9 @@ def add_version4_blocks(model, args, J, C):
         model.psi_item = P(torch.zeros(C, 3))
         with torch.no_grad():
             model.psi.zero_()
+    if args.centre_history:
+        model.hist_size = P(torch.zeros(()))
+        model.centre_history = True
     # M3: move the linear part of rho_0 (its slope over sizes 1..10) into lam, then let
     # rho_0 act on the number of categories present.
     model.size_on_categories = True
@@ -136,6 +149,8 @@ def main():
     args = parse_args()
     if args.val_trips <= 0:
         raise SystemExit("--val-trips must be positive (early stopping needs held-out trips)")
+    if args.centre_history and not args.recency:
+        raise SystemExit("--centre-history needs --recency")
     torch.set_num_threads(args.threads)
     root = data_root(args.data_root)
     data = load_bundle(root)
@@ -183,7 +198,16 @@ def main():
     price_init = {n: getattr(model, n).detach().clone() for n in price_names}
     for n in price_names:
         getattr(model, n).requires_grad_(False)
+    if args.warm_start is not None:
+        state = torch.load(args.warm_start, map_location="cpu", weights_only=False)["model"]
+        missing, unexpected = model.load_state_dict(state, strict=False)
+        if unexpected or set(missing) - {"hist_size"}:
+            raise SystemExit(f"--warm-start does not match this model: missing {missing}, unexpected {unexpected}")
+        with torch.no_grad():
+            delta.copy_(model.phi[:, :args.rank] - psi[category])
     rec_params = [model.psi, model.psi_item] if args.recency else []
+    if args.centre_history:
+        rec_params.append(model.hist_size)
     for q in rec_params:
         q.requires_grad_(True)
     base = [getattr(model, n) for n in BASE_NAMES]
@@ -331,6 +355,8 @@ def main():
                            iv_slope_max=round(float(lam_c.max()), 4))
             if sizes:
                 gap = (model_present / N - rate_present).abs()
+                if args.centre_history:
+                    row.update(hist_size=round(float(model.hist_size), 4))
                 row.update(chain_mean_size=float(np.mean([s[0] for s in sizes])),
                            data_mean_size=float(np.mean([s[1] for s in sizes])),
                            cat_pres_gap_mean=round(float(gap.mean()), 4), cat_pres_gap_max=round(float(gap.max()), 4))
@@ -367,7 +393,7 @@ def main():
                     "additive": str(args.additive.resolve()),
                     "rank": args.rank, "max_per_category": model.R, "use_f_extra": True, "presence_phi": True, "cat_rho0": True,
                     "u_cat": True, "unfreeze_price": True, "recency": bool(args.recency),
-                    "iv_slope": bool(args.m4c), "iv_price_only": bool(args.m4c), "stage": stage,
+                    "centre_history": bool(args.centre_history), "iv_slope": bool(args.m4c), "iv_price_only": bool(args.m4c), "stage": stage,
                     "seconds": time.time() - started, "args": {k: str(v) for k, v in vars(args).items()}},
                    path)
 

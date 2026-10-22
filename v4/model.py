@@ -34,8 +34,22 @@ Energy of a basket S (n products, n_c of them in category c, k categories presen
            + sum_{c present} (lambda_c - 1) * IV_price_c          M4c, see iv_shift()
 
 Version-4 blocks are optional parameters (None when absent): f_extra (M1), psi_cat (M2),
-u_cat (M4a), psi_item (purchase history), iv_slope_raw (M4c); M3 is the flag
-``size_on_categories``.  The exact additive base model has none of them and phi = 0.
+u_cat (M4a), psi_item (purchase history), iv_slope_raw (M4c), hist_size (history size
+term); M3 is the flag ``size_on_categories``.  The exact additive base model has none of
+them and phi = 0.
+
+History centring (flag ``centre_history``).  The history part of the utility,
+h_tj = psi_j . rec + psi_item_c(j) . rec_item, grows with the household's history (more
+products "ever bought"), and raising many utilities also raises basket size, so without
+centring the predicted size drifts upward with calendar time.  With centring every utility
+of trip t is shifted by the same number
+
+    o_t = mean_{j offered on t} h_tj + hist_size * log(1 + M_t),   M_t = products ever bought,
+
+so the history decides *which* products are bought, while its effect on *how many* is the
+learned term n * hist_size * log(1 + M_t).  A shift shared by all products of a trip is a
+term -n o_t in E(S): the law given the basket size and all within-trip comparisons are
+unchanged, and the normaliser stays exact.
 """
 from __future__ import annotations
 
@@ -46,7 +60,8 @@ from torch.nn.functional import softplus
 
 PRICE_KEYS = ("dlp", "dlp_bar", "disp", "mail", "dsc")
 OPTIONAL_PARAMETERS = ("disc_kappa", "disc_common", "f_extra", "psi_cat", "u_cat",
-                       "psi_item", "iv_slope_raw")
+                       "psi_item", "iv_slope_raw", "hist_size")
+HISTORY_KEYS = ("rec", "rec_item")
 # Parameters of an old quantity model and size factorisation that older checkpoints carry;
 # the basket law does not use them.
 LEGACY_KEYS = ("a_q", "gamma_q", "beta_q", "log_r", "factored_size_enabled",
@@ -94,6 +109,7 @@ class BasketModel(torch.nn.Module):
         for name in OPTIONAL_PARAMETERS:
             setattr(self, name, None)
         self.size_on_categories = False      # M3
+        self.centre_history = False          # see the module docstring
         self.rank = 0                        # active columns of phi
         self.house = None                    # [B] households of the current batch
         self.ctx = None                      # features of the current batch (Batch.bind)
@@ -164,19 +180,42 @@ class BasketModel(torch.nn.Module):
             b = b + self.w_dsp[it] * c["disp"] + self.w_mlr[it] * c["mail"]
             b = b + (self.mu[it] * self.delta_c()[c["week"]]).sum(-1)
             b = b + (self.zeta[it] * self.xi_c()[c["store"]]).sum(-1)
-            if "rec" in c:
-                b = b + (self.psi[it] * c["rec"]).sum(-1)
             if "log_avail" in c:
                 b = b + c["log_avail"]
         if self.u_cat is not None:
             b = b + (theta[hh] * self.u_cat[self.cat_of[it]]).sum(-1)
+        h = self.history_utilities(it, c)
+        return b if h is None else b + h
+
+    def history_utilities(self, it, c):
+        """h = psi_j . rec + psi_item_c(j) . rec_item at products ``it`` (None without history)."""
+        h = None
+        if c is not None and "rec" in c:
+            h = (self.psi[it] * c["rec"]).sum(-1)
         if c is not None and "rec_item" in c and self.psi_item is not None:
-            b = b + (self.psi_item[self.cat_of[it]] * c["rec_item"]).sum(-1)
-        return b
+            part = (self.psi_item[self.cat_of[it]] * c["rec_item"]).sum(-1)
+            h = part if h is None else h + part
+        return h
+
+    def history_offset(self, ix):
+        """o_t per trip of the bound batch (module docstring), or None without centring."""
+        if not self.centre_history:
+            return None
+        h = self.history_utilities(ix.item, self.ctx)
+        if h is None:
+            return None
+        count = torch.bincount(ix.item_trip, minlength=ix.B).double()
+        o = torch.zeros(ix.B).index_add_(0, ix.item_trip, h) / count
+        if self.hist_size is not None and "rec_item" in self.ctx:
+            ever = torch.zeros(ix.B).index_add_(0, ix.item_trip, self.ctx["rec_item"][:, 0])
+            o = o + self.hist_size * torch.log1p(ever)
+        return o
 
     def slot_utilities(self, ix):
-        """b at every offered slot of the bound batch."""
-        return self.utilities(ix.item, ix.item_trip, self.ctx)
+        """b at every offered slot of the bound batch (minus the trip's history offset)."""
+        b = self.utilities(ix.item, ix.item_trip, self.ctx)
+        o = self.history_offset(ix)
+        return b if o is None else b - o[ix.item_trip]
 
     def slot_utilities_given_z(self, ix, z, beta=1.0, b=None):
         """Utilities of the law of S given the latent z (B x rank):
@@ -222,7 +261,11 @@ class BasketModel(torch.nn.Module):
         if b_slot is None:
             b_slot = self.slot_utilities(ix)
         regular = {k: (torch.zeros_like(v) if k in PRICE_KEYS else v) for k, v in self.ctx.items()}
-        iv = _row_logsumexp(ix, b_slot) - _row_logsumexp(ix, self.utilities(ix.item, ix.item_trip, regular))
+        b_regular = self.utilities(ix.item, ix.item_trip, regular)
+        o = self.history_offset(ix)                        # the same for both, so it cancels
+        if o is not None:
+            b_regular = b_regular - o[ix.item_trip]
+        iv = _row_logsumexp(ix, b_slot) - _row_logsumexp(ix, b_regular)
         return (lam[ix.row_cat] - 1.0) * iv
 
     def basket_field(self, ix, X):
@@ -256,6 +299,9 @@ class BasketModel(torch.nn.Module):
         ``iv``: the M4c shift of the batch, if already computed."""
         e = self.additive_energy(batch.line_item, batch.line_trip, batch.line_cat,
                                  batch.ix.B, batch.line_ctx)
+        o = self.history_offset(batch.ix)
+        if o is not None:                                  # -n o_t: every bought product shifted by o_t
+            e = e - torch.bincount(batch.line_trip, minlength=batch.ix.B).double() * o
         iv = self.iv_shift(batch.ix) if iv is None else iv
         if (self.f_extra is None and self.psi_cat is None and not self.size_on_categories
                 and iv is None):

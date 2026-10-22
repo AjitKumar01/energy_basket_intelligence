@@ -3,7 +3,8 @@
 Two trips at one store; trip 0 is offered categories {0: 3 products, 1: 2 products},
 trip 1 categories {0: 3 products, 2: 1 product}; baskets have 1..nmax = 4 products.
 Every Version-4 block can be switched on: f_extra (M1), psi_cat (M2), size on categories
-(M3), u_cat (M4a), iv_slope_raw (M4c), and the discount split.
+(M3), u_cat (M4a), iv_slope_raw (M4c), the discount split, and purchase history with
+centring and its size term (``history``).
 """
 from __future__ import annotations
 
@@ -23,7 +24,7 @@ TRIPS = [[0, 1, 2, 3, 4], [0, 1, 2, 5]]            # offered products per trip
 
 
 def make_model(seed=0, *, f_extra=False, presence=False, categories=False, u_cat=False,
-               iv=False, discount=False):
+               iv=False, discount=False, history=False):
     torch.manual_seed(seed)
     g = torch.Generator().manual_seed(seed)
     m = BasketModel(J, 2, C, K=3, Kz=4, Kp=2, nmax=NMAX, R=NMAX, S=1, seed=seed)
@@ -50,6 +51,12 @@ def make_model(seed=0, *, f_extra=False, presence=False, categories=False, u_cat
     if discount:
         m.disc_kappa = P(torch.tensor(0.9))
         m.disc_common = P(torch.tensor(0.4))
+    if history:
+        with torch.no_grad():
+            m.psi.copy_(r(J, 4, s=0.4))
+        m.psi_item = P(r(C, 3, s=0.5))
+        m.hist_size = P(torch.tensor(0.3))
+        m.centre_history = True
     return m
 
 
@@ -75,6 +82,10 @@ def make_batch(basket=((0, 3), (1, 5)), seed=1):
 
     ctx = context(ix.item, ix.item_trip)
     ctx["dlp_bar"] = torch.zeros(2).index_add_(0, ix.item_trip, ctx["dlp"]) / torch.bincount(ix.item_trip).double()
+    n = len(ix.item)                                     # purchase history (zero effect unless history=True)
+    ctx["rec"] = torch.rand(n, 4, generator=g)
+    ctx["rec_item"] = torch.stack([(torch.rand(n, generator=g) < 0.5).double(),
+                                   (torch.rand(n, generator=g) < 0.3).double(), torch.rand(n, generator=g)], -1)
     line_item = torch.tensor([j for b in basket for j in b])
     line_trip = torch.tensor([t for t, b in enumerate(basket) for _ in b])
     slot = {(int(t), int(j)): s for s, (t, j) in enumerate(zip(ix.item_trip, ix.item))}

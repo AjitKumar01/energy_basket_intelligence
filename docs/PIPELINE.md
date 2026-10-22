@@ -343,6 +343,13 @@ makes it worse: a commodity is split over 7 groups on average (soft drinks over 
 
 0. *Make the purchase-history features neutral to basket size* (the drift above), so the
    model's E[N] follows the real size in every period; worked on in branch `v4-history-size`.
+   Implemented there as `--centre-history` (v4/model.py: every utility of a trip shifted by
+   the trip mean of the history shift plus a learned hist_size * log(1 + products ever
+   bought); exact, tested against enumeration). Applied to the fitted v4_rec.pt *without*
+   refitting it already moves validation E[N] from 16.8 to 10.3 (real 8.7) and test from
+   15.6 to 9.1 (real 8.1), and raises the log-likelihood on 512 validation trips by
+   +0.25 ± 0.10 (+0.5 on baskets of 1–8 products, −2.3 on the 34 of 21+). Refit:
+   `DATA=... FROM=runs/dunnhumby/v4_rec.pt run/dunnhumby_history.sh`.
 1. *Within-group competition in the model:* a learned term that changes the energy of buying a
    second product from the same group, so a price change moves purchases within the group
    instead of adding items. It goes in the exact per-group DP. Test it on the stress world

@@ -121,6 +121,8 @@ def penalties(model, priors, n_train, psi, delta, price_init, recency):
             price_prior = price_prior + priors.price_prec * (p - start).square().sum()
     u_cat_prior = priors.u_cat_prec * model.u_cat.square().sum()
     rec_prior = priors.rec_prec * (model.psi.square().sum() + model.psi_item.square().sum()) if recency else 0.0
+    if model.hist_size is not None:
+        rec_prior = rec_prior + priors.rec_prec * model.hist_size.square()
     return loss + 0.5 * (phi_prior + priors.rho_c_prec * model.rho_c.square().sum() + extra_prior
                          + price_prior + u_cat_prior + rec_prior) / n_train
 

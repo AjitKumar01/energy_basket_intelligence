@@ -16,8 +16,9 @@ BLOCKS = {
     "M2": {"presence": True},
     "M3": {"categories": True},
     "M4c": {"iv": True},
+    "history": {"history": True},
     "all": {"f_extra": True, "presence": True, "categories": True, "u_cat": True, "iv": True,
-            "discount": True},
+            "discount": True, "history": True},
 }
 
 
@@ -87,7 +88,7 @@ def test_sampler_matches_exact_marginals(cap):
     ix = RaggedIndex(item, row_of, row_trip, row_cat, 2 * reps)
     batch.ix = ix
     batch.house = torch.tensor([0, 1]).repeat(reps)
-    batch.ctx = {k: (v.repeat(reps) if k != "dlp_bar" else v.repeat(reps)) for k, v in base.ctx.items()}
+    batch.ctx = {k: v.repeat(reps, *[1] * (v.dim() - 1)) for k, v in base.ctx.items()}
     batch.bind(model)
     z = torch.randn(2, RANK, generator=torch.Generator().manual_seed(4)).repeat(reps, 1)
     u = model.slot_utilities_given_z(ix, z).detach()
@@ -128,7 +129,7 @@ def test_gibbs_and_importance_sampling_match_full_law():
                      (ix0.row_trip[None, :] + 2 * torch.arange(reps)[:, None]).reshape(-1),
                      ix0.row_cat.repeat(reps), 2 * reps)
     base.ix, base.house = ix, torch.tensor([0, 1]).repeat(reps)
-    base.ctx = {k: v.repeat(reps) for k, v in base.ctx.items()}
+    base.ctx = {k: v.repeat(reps, *[1] * (v.dim() - 1)) for k, v in base.ctx.items()}
     base.bind(model)
     X = sampling.draw_from_model(model, ix, torch.Generator().manual_seed(7), burn=60)
     freq = X.double().view(reps, T).mean(0)
@@ -203,3 +204,22 @@ def test_cap_on_products_per_category(name):
         assert abs(float(lz[t]) - lz_t) < 1e-10
         for s in (s for s in range(len(ix.item)) if int(ix.item_trip[s]) == t):
             assert abs(float(p[s]) - sum(math.exp(e - lz_t) for S, e in energies.items() if s in S)) < 1e-10
+
+
+def test_history_offset_is_the_trip_mean_plus_size_term():
+    """Centring shifts every product of a trip by o_t = mean h + hist_size log(1 + ever);
+    without centring the utilities are the raw ones."""
+    model = make_model(history=True)
+    batch = make_batch()
+    batch.bind(model)
+    ix = batch.ix
+    raw = model.utilities(ix.item, ix.item_trip, batch.ctx)
+    h = model.history_utilities(ix.item, batch.ctx)
+    b = model.slot_utilities(ix)
+    for t in range(2):
+        on = ix.item_trip == t
+        ever = float(batch.ctx["rec_item"][on, 0].sum())
+        o = float(h[on].mean()) + float(model.hist_size) * math.log1p(ever)
+        assert float((raw[on] - o - b[on]).abs().max()) < 1e-12
+    model.centre_history = False
+    assert float((model.slot_utilities(ix) - raw).abs().max()) == 0.0

@@ -108,7 +108,8 @@ def version4_flags(blob) -> dict:
     if "iv_slope_raw" in state and not blob.get("iv_price_only", False):
         raise ValueError("M4b (full inclusive value) checkpoints are not supported; only M4c")
     return {"rank": int(blob["rank"]), "size_on_categories": bool(blob.get("cat_rho0", False)),
-            "recency": bool(blob.get("recency", False)), "max_per_category": blob.get("max_per_category")}
+            "recency": bool(blob.get("recency", False)), "max_per_category": blob.get("max_per_category"),
+            "centre_history": bool(blob.get("centre_history", False))}
 
 
 def load_model(path, data, root=None, *, initialization=None, additive=None):
@@ -119,7 +120,8 @@ def load_model(path, data, root=None, *, initialization=None, additive=None):
     blob = _load(path)
     if "rank" not in blob:                                        # additive base model
         model, meta, parent = load_additive(initialization or blob.get("initialization"), path, data, root)
-        flags = {"rank": 0, "size_on_categories": False, "recency": False, "max_per_category": None}
+        flags = {"rank": 0, "size_on_categories": False, "recency": False, "max_per_category": None,
+                 "centre_history": False}
         return model, meta, parent, flags, blob
     model, meta, parent = load_additive(initialization or blob["initialization"],
                                         additive or blob["additive"], data, root)
@@ -127,6 +129,7 @@ def load_model(path, data, root=None, *, initialization=None, additive=None):
     model.load_fitted_state(blob["model"])
     model.rank = flags["rank"]
     model.size_on_categories = flags["size_on_categories"]
+    model.centre_history = flags["centre_history"]
     if flags["max_per_category"] is not None:
         model.R = int(flags["max_per_category"])
     return model, meta, parent, flags, blob

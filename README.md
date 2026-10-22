@@ -17,7 +17,7 @@ as a baseline and scored the same way.
 | `v4/` | the model: data bundle, features, batches, utilities and energy, exact normaliser, sampler |
 | `v4/native/` | C++ kernels, built on first use into `build/native/` |
 | `scripts/` | one script per stage: partition, discount panel, initialize, base-model fit, Version-4 fit, evaluate |
-| `checks/` | checks of a fitted model: discounts and promotions, support cap, recommendation, learned embeddings, customer segments, the price halo |
+| `checks/` | checks of a fitted model: discounts and promotions, support cap, recommendation, learned embeddings, customer segments, the price halo, basket size by period |
 | `sim/` | a Gymnasium environment for promotion policies on a fitted model (see `docs/PIPELINE.md` §7 before using it) |
 | `shopper/` | SHOPPER (PyTorch reimplementation), its exactness checks and evaluator |
 | `data_prep/` | building bundles: Dunnhumby from its raw CSVs; any dataset from a canonical directory |
@@ -156,6 +156,7 @@ DEMO="/path/to/raw/hh_demographic.csv"
 python3 checks/recommendation.py --checkpoint $CK --split validation --out runs/dunnhumby/v4_rec_recommendation.json
 python3 checks/embeddings.py --checkpoint $CK --demographics "$DEMO" --out runs/dunnhumby/v4_rec_embeddings.json
 python3 checks/segments.py   --checkpoint $CK --demographics "$DEMO" --out runs/dunnhumby/v4_rec_segments.json
+python3 checks/size_by_period.py --checkpoint $CK --out runs/dunnhumby/v4_rec_size_by_period.json
 python3 sim/run_policies.py  --checkpoint runs/dunnhumby/additive/v3_pipeline_additive_best.pt \
   --initialization runs/dunnhumby/initialization.pt --simulator base --out runs/dunnhumby/sim/base_policies.json
 ```

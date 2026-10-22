@@ -220,8 +220,43 @@ pipeline's validation trips; `scripts/reference_trips.py`), as log-likelihood pe
 | Version 4, recency + M4c | −40.462 | −0.055 ± 0.021 |
 
 The gain grows with basket size: −0.14 for 1–3 products, +2.6 for 4–8, +6.6 for 9–20 and
-+15.9 for 21–120. M4c is slightly worse, so **recency is the chosen model**; its test weeks are
-still to be opened, once (`CHOSEN=rec FROM=5 run/dunnhumby.sh`).
++15.9 for 21–120. M4c is slightly worse, so **recency is the chosen model**.
+
+**Test weeks** (opened once, 2026-10-22, for the recency model; the old pipeline's 4,096 test
+trips, same order; `runs/dunnhumby/reference_test_trips.npz`, `v4_rec_test.per_trip.npz`):
+
+| Model | Test log-likelihood | Version 4 (recency) gains over it, household-clustered 95% |
+|---|---|---|
+| old base model | −46.073 | +3.62 [3.39, 3.85] |
+| old Version 4 | −46.051 | +3.60 [3.37, 3.83] |
+| new base model (Step 3 refit) | −46.097 | +3.64 [3.42, 3.87] |
+| **Version 4, recency** | **−42.456** | — |
+
+By basket size against the old Version 4: −0.09 (1–3 products), +2.5 (4–8), +7.3 (9–20), +16.4
+(21–120). IS check: ESS fraction 0.76, mean half-split difference 0.16. Realism on the test
+weeks was stopped after two of three seeds (full-basket AUC 0.80, category AUC 0.69), because
+the generated baskets are far too big (24.9 products against 7.8); see the next paragraph.
+
+**Basket size drifts with calendar time** (`checks/size_by_period.py`). The model's expected
+basket size under its own law, against the real size:
+
+| Weeks | Products the household had ever bought before the trip | Model E[N] | Real |
+|---|---|---|---|
+| training, early (9–28) | 68 | 4.3 | 5.5 |
+| training, late (66–82) | 358 | 11.8 | 6.4 |
+| validation (83–90) | 422 | 17.8 | 7.1 |
+| test (91–101) | 442 | 18.9 | 7.2 |
+
+The sampler is not at fault: the C++ Gibbs chain matches one built from the tested pieces, and
+an importance-sampling estimate whose proposal covers both small and big baskets agrees with
+the standard log Z (6.279 against 6.296 on 32 test trips) and gives the same E[N]. The cause
+is the purchase-history feature "ever bought this product": it only grows over time, the model
+gives it a positive weight (+0.77 per category on average; right for *which* products are
+bought), and in this law raising many utilities also raises basket size, the same mechanism
+as the price halo. Early training trips are predicted too small and late ones too big, which
+cancel in the training moment check (7.76 against 7.65). The likelihoods above stay valid (the
+law is correctly normalised); generation, size predictions and counterfactuals in later weeks
+are biased upward.
 
 | Discount and promotion check (validation) | Base (Step 3) | V4 recency | V4 + M4c | Data: train / validation / test |
 |---|---|---|---|---|
@@ -294,6 +329,7 @@ makes it worse: a commodity is split over 7 groups on average (soft drinks over 
 
 **Known weaknesses**
 
+- **Basket size drifts with time** through the purchase-history features (above).
 - **The halo and too little switching** (above). This affects every price and promotion
   counterfactual on real data.
 - **Display is too weak**, and Version 4 made it weaker (0.06 purchase-weighted, against 0.38–0.43
@@ -305,6 +341,8 @@ makes it worse: a commodity is split over 7 groups on average (soft drinks over 
 
 **Phase 2** (agreed 2026-10-22, in this order):
 
+0. *Make the purchase-history features neutral to basket size* (the drift above), so the
+   model's E[N] follows the real size in every period; worked on in branch `v4-history-size`.
 1. *Within-group competition in the model:* a learned term that changes the energy of buying a
    second product from the same group, so a price change moves purchases within the group
    instead of adding items. It goes in the exact per-group DP. Test it on the stress world

@@ -24,6 +24,10 @@ discount depth by the same amount, so the model's discount slope applies.
 Limits: the model is conditional on a trip, so a promotion cannot bring in extra shoppers;
 units per product are the training average (the model predicts incidence, not quantity);
 simulated purchases do not feed back into later weeks' purchase history.
+
+Caution: the current models add an invented gain to the rest of the basket when one
+commodity is discounted (the halo; docs/PIPELINE.md section 7), so the revenue numbers are
+too high.  Use the environment for plumbing and policy-code tests until that is fixed.
 """
 from __future__ import annotations
 

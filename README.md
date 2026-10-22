@@ -17,7 +17,8 @@ as a baseline and scored the same way.
 | `v4/` | the model: data bundle, features, batches, utilities and energy, exact normaliser, sampler |
 | `v4/native/` | C++ kernels, built on first use into `build/native/` |
 | `scripts/` | one script per stage: partition, discount panel, initialize, base-model fit, Version-4 fit, evaluate |
-| `checks/` | the real-data discount and promotion check; the support-cap check |
+| `checks/` | checks of a fitted model: discounts and promotions, support cap, recommendation, learned embeddings, customer segments, the price halo |
+| `sim/` | a Gymnasium environment for promotion policies on a fitted model (see `docs/PIPELINE.md` §7 before using it) |
 | `shopper/` | SHOPPER (PyTorch reimplementation), its exactness checks and evaluator |
 | `data_prep/` | building bundles: Dunnhumby from its raw CSVs; any dataset from a canonical directory |
 | `synthetic/` | the stress-world generator |
@@ -120,7 +121,7 @@ nohup run/dunnhumby.sh > runs/dunnhumby/pipeline.out 2>&1 &
 | 3 | `scripts/fit_additive.py` with chain-only prices and the discount split | `additive/` |
 | 3c | `checks/discount_promotion.py events`, then `model` on the base model | `discount_events/`, `additive/discount_check.json` |
 | 4 | `scripts/fit_interactions.py` (recency; recency + M4c), then the discount check and the support-cap check on each | `v4_rec.pt`, `v4_m4c.pt`, `v4_*_discount_check.json`, `v4_*_support_cap.json` |
-| 5 | test weeks, once, for the chosen variant: `CHOSEN=m4c FROM=5 run/dunnhumby.sh` | `reference_test_trips.npz`, `v4_m4c.eval.json` |
+| 5 | test weeks, once, for the chosen variant: `CHOSEN=rec FROM=5 run/dunnhumby.sh` | `reference_test_trips.npz`, `v4_rec.eval.json` |
 
 **Version 4 only, from an existing base model** (the update-matched schedule, at most 40
 products per category):
@@ -145,6 +146,26 @@ discount-depth slope (the protocol's third measure) is not implemented yet.
 **What to read:** the Version-4 `.log` rows (`val_ll`, `val_ess`, `chain_mean_size` against
 `data_mean_size`); in `discount_check.json`, `depth_slope` against `empirical_effects`
 (train / validation / test) and `promotion_on_vs_off`.
+
+**Further checks on a fitted model** (each writes one JSON file; add `--initialization` for old
+checkpoints that do not record their parents):
+
+```bash
+CK=runs/dunnhumby/v4_rec.pt
+DEMO="/path/to/raw/hh_demographic.csv"
+python3 checks/recommendation.py --checkpoint $CK --split validation --out runs/dunnhumby/v4_rec_recommendation.json
+python3 checks/embeddings.py --checkpoint $CK --demographics "$DEMO" --out runs/dunnhumby/v4_rec_embeddings.json
+python3 checks/segments.py   --checkpoint $CK --demographics "$DEMO" --out runs/dunnhumby/v4_rec_segments.json
+python3 sim/run_policies.py  --checkpoint runs/dunnhumby/additive/v3_pipeline_additive_best.pt \
+  --initialization runs/dunnhumby/initialization.pt --simulator base --out runs/dunnhumby/sim/base_policies.json
+```
+
+On a synthetic world, the price halo (does a one-product price change move the rest of the basket?):
+
+```bash
+ENERGY_MODEL_DATA_ROOT=$WORLD/model_input_category python3 checks/halo.py \
+  --checkpoint runs/stress/v4_rec.pt --world $WORLD --out runs/stress/halo_v4_rec.json
+```
 
 ## 5. Watching runs
 

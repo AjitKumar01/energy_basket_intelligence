@@ -176,7 +176,7 @@ Two related fixed rules:
 5. **SHOPPER baseline**: a sequential model (Ruiz, Athey and Blei), refitted in PyTorch on the
    same trips, scored the same way.
 
-## 7. Where things stand (2026-10-21)
+## 7. Where things stand (2026-10-22)
 
 **Stress world**, model with recency (`hs_rec`; M4c in brackets):
 
@@ -206,22 +206,118 @@ the old parent, but the discount response is no longer too weak: it now overshoo
 In the refit the discount part has its own strong slope (about 0.97 on average) next to a
 regular-price slope of about 0.19.
 
-**Dunnhumby Version 4** (Step 4, from the refit; schedule matched to the stress world by
-updates, at most 40 products per category) is running. The recency variant's first SML epoch:
-validation log-likelihood −38.90 on held-out training trips, ESS 0.86, chain basket size 7.47
-against 7.65 in the data.
+**Dunnhumby Version 4** (Step 4, finished 2026-10-22). Both variants were fitted from the
+Step-3 refit with the update-matched schedule and at most 40 products per category, and
+both converged. All likelihoods below are on the same 4,096 validation trips (the old
+pipeline's validation trips; `scripts/reference_trips.py`), as log-likelihood per basket:
+
+| Model | Log-likelihood | Version 4 (recency) gains over it |
+|---|---|---|
+| old base model | −43.676 | +3.27 |
+| old Version 4 | −43.662 | +3.25 [3.04, 3.48] |
+| new base model (Step 3 refit) | −43.689 | +3.28 |
+| **Version 4, recency (chosen)** | **−40.407** | — |
+| Version 4, recency + M4c | −40.462 | −0.055 ± 0.021 |
+
+The gain grows with basket size: −0.14 for 1–3 products, +2.6 for 4–8, +6.6 for 9–20 and
++15.9 for 21–120. M4c is slightly worse, so **recency is the chosen model**; its test weeks are
+still to be opened, once (`CHOSEN=rec FROM=5 run/dunnhumby.sh`).
+
+| Discount and promotion check (validation) | Base (Step 3) | V4 recency | V4 + M4c | Data: train / validation / test |
+|---|---|---|---|---|
+| Discount depth slope, single item | 1.30 | 1.42 | 1.45 | 1.07 / 0.64 / 1.00 |
+| Display effect, purchase-weighted | 0.11 | 0.06 | 0.08 | 0.43 / 0.38 / 0.41 |
+| Mailer effect | 0.27 | 0.22 | 0.24 | 0.31 / 0.35 / 0.23 |
+
+Support cap: removing the 40-per-category cap would put at most 4.5e-10 (recency) and
+2.6e-5 (M4c) of a trip's probability above it, so it is harmless.
+
+**Recommendation** (`checks/recommendation.py`; hide one product of a validation basket, rank
+every offered product by the exact log odds of adding it; 1,620 cases):
+
+| Model | MRR | Recall@10 |
+|---|---|---|
+| popularity | 0.045 | — |
+| old base / old Version 4 | 0.093 | 18.0% |
+| new base | 0.094 | 17.7% |
+| **Version 4, recency** | **0.118** | **21.8%** (recall@100 49.9%) |
+
+Paired MRR gain over the old model +0.025 (s.e. 0.004).
+
+**Speed** (Version 4; one trip / per trip in a batch of 64): likelihood with 256 latent draws
+9.7 s / 3.2 s, recommendation 9 ms / 2.4 ms, a price counterfactual with 64 draws 3.4 s / 1.3 s.
+The base model takes a few milliseconds for each.
+
+**What the model learned** (`checks/embeddings.py`, `checks/segments.py`):
+
+- *Interactions:* the first direction carries 59% of the interaction variance, and the
+  category part carries 87%. Learned pair strength correlates 0.40 with real log
+  co-purchase lift. The strongest pairs are picnic/BBQ, convenience and baking groups;
+  fresh milk repels candy, soft drinks, water and baby food.
+- *Taste:* 36% of each product's 5 nearest neighbours share its commodity (1.6% by chance).
+  The household size shift is higher for large households and households with children.
+- *Price:* a household's price slope correlates 0.60 with the share it really buys on
+  discount. Produce, isotonic drinks and bath tissue are the most price-sensitive; magazines,
+  cards, cigarettes and baby food the least. National brands are more sensitive than private
+  label (0.017 against 0.014).
+- *Segments:* k-means on taste, size shift and price slope gives five segments (deal-seeking
+  families, convenience stock-up, fresh produce, frequent small households, cooking basics).
+  Each segment's over-bought commodities in training weeks correlate 0.67–0.94 with those in
+  validation weeks. There are no sharp clusters (silhouette about 0.02) and stability across
+  seeds is moderate (adjusted Rand 0.58–0.77), so they are a useful cut of a continuum.
+
+**Promotion environment** (`sim/`). A Gymnasium environment: one step is one week, the action
+is a discount level (0/10/20/30%) for each of the 12 highest-revenue commodities, and the
+reward is expected revenue at paid prices relative to the same week with no promotion. The
+simulator is either the base model (exact) or Version 4. It works, but its answers are not yet
+believable: 30% off everything triples revenue in the base model, because of the halo below.
+Do not use it for policy decisions until Phase 2 is done.
+
+**The halo** (`checks/halo.py`, stress world, 20% price cut on one product; change in items
+per 1,000 baskets, mean of 16 scenarios):
+
+| | Own product | Own category total | Other categories |
+|---|---|---|---|
+| truth | +7.0 | 0.0 | 0.0 |
+| base model | +6.9 | +6.4 | +7.9 |
+| Version 4, latent draws reweighted (the law's own counterfactual) | +8.1 | +7.0 | +5.1 |
+| Version 4, each trip's latent state held fixed | +6.5 | +3.9 | +0.8 ± 0.4 |
+
+In the truth a price cut is pure switching: the product gains, its rivals lose the same amount,
+nothing else moves. Every model gets the own effect roughly right, but (a) adds an invented
+gain to the rest of the basket, because in the joint law a more attractive product makes big
+baskets more likely, and big baskets contain everything; and (b) takes too little from rivals.
+Holding the latent state fixed removes most of (a), not (b). That fit used the true categories
+as its partition, so (b) is not only a partition problem. On Dunnhumby the affinity partition
+makes it worse: a commodity is split over 7 groups on average (soft drinks over 41), and
+1,724 products share one mixed leftover group.
 
 **Known weaknesses**
 
-- **Display is too weak.** The model's display effect is 0.10–0.11 purchase-weighted and about 0
-  on average over events, against 0.38–0.43 in the data. 21% of events show a negative effect,
-  and the mean display weight over the catalogue is −0.33. The likely cause is that display
-  is learned separately for each product with no pooling, while in Dunnhumby display nearly
-  always comes with a discount. The likely fix, like the discount one, is a common display slope
-  plus per-product variation shrunk toward it. Accepted for now.
-- The refitted base model's discount response (1.30) is above every empirical slope (1.07 / 0.64 /
-  1.00); the pilot's (0.87) was between them. The empirical slopes themselves move by split.
-- On the stress world the substitution response is too small on average (above).
+- **The halo and too little switching** (above). This affects every price and promotion
+  counterfactual on real data.
+- **Display is too weak**, and Version 4 made it weaker (0.06 purchase-weighted, against 0.38–0.43
+  in the data). Likely cause: display is learned separately per product with no pooling, while
+  in Dunnhumby display nearly always comes with a discount.
+- **The discount response overshoots** (1.42 in Version 4, 1.30 in the base model, against
+  0.64–1.07 in the data).
+- On the stress world the own-price response is about 1.7× too strong on average.
+
+**Phase 2** (agreed 2026-10-22, in this order):
+
+1. *Within-group competition in the model:* a learned term that changes the energy of buying a
+   second product from the same group, so a price change moves purchases within the group
+   instead of adding items. It goes in the exact per-group DP. Test it on the stress world
+   with `checks/halo.py` (switching and halo) before anything else.
+2. *Hold the latent state fixed* in price and promotion counterfactuals (the environment and
+   the scenario scorer), if step 1 does not make it unnecessary.
+3. *A partition that keeps rivals together on Dunnhumby:* commodities, or affinity groups split
+   by commodity; then refit Steps 3 and 4.
+4. *Measure the real halo:* when one commodity is discounted in a store-week, do other
+   commodities' purchases per trip move?
+5. *Promotions:* a common display slope with per-product variation shrunk toward it, and a
+   firmer prior on the promotion weights during Version-4 training.
+6. Then the promotion environment, the test weeks for the chosen model, and SHOPPER on Dunnhumby.
 
 ## 8. Commands
 
@@ -233,7 +329,7 @@ DATA=data/dunnhumby nohup run/dunnhumby.sh > runs/dunnhumby/pipeline.out 2>&1 &
 DATA=... INIT=... ADDITIVE=... nohup run/dunnhumby_step4.sh > runs/dunnhumby/step4.out 2>&1 &
 WORLD=data/stress_world nohup run/stress_world.sh > runs/stress/pipeline.out 2>&1 &
 DATA=... CONTRACT=... nohup run/shopper.sh > runs/shopper/pipeline.out 2>&1 &
-DATA=data/dunnhumby CHOSEN=m4c FROM=5 run/dunnhumby.sh       # test weeks, once, for the chosen model
+DATA=data/dunnhumby CHOSEN=rec FROM=5 run/dunnhumby.sh       # test weeks, once, for the chosen model
 ```
 
 The native kernels (`v4/native/`) compile on first use into `build/native/` (`$CXX`, else clang++,

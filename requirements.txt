@@ -11,3 +11,4 @@ scikit-learn==1.7.2    # taste initialization (SVD) and the realism classifier
 torch==2.9.1           # model, exact normalizer and optimisation; CPU execution
 setuptools==80.9.0     # builds the local PyTorch C++ extension
 pytest==9.0.1          # unit tests
+gymnasium==1.2.3      # the promotion environment (sim/)

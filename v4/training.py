@@ -31,12 +31,13 @@ def require_full_model(model):
         raise ValueError("training expects the full Version-4 model (M1, M2 and M3)")
 
 
-def pseudo_loglik(model, ix, X):
-    """Mean over trips of sum_j log P(x_j | rest), exact, for slots of trips whose basket
-    without j has size in 1..nmax-1.
+def conditional_log_odds(model, ix, X):
+    """For every slot j, d_j = E(S with j) - E(S without j), S = the basket X, so that
+    P(j in S | the rest) = sigmoid(d_j).  Exact: the normaliser cancels.  Also returns the
+    size of the basket without j at every slot.
 
-    For slot j the log odds of being in the basket given the rest are
         d_j = b_j + pair_j - category_j - size_j (+ M4c term if j opens its category)
+
     where pair_j is the change in the M2 pair term, category_j the change in
     rho_c C(n_c, 2) + f_c(n_c), and size_j the change in rho_0 of the number of categories."""
     require_full_model(model)
@@ -74,6 +75,13 @@ def pseudo_loglik(model, ix, X):
     iv = model.iv_shift(ix, b_slot=b)
     if iv is not None:
         d = d + opens.double() * iv[ix.row_of]
+    return d, n_without
+
+
+def pseudo_loglik(model, ix, X):
+    """Mean over trips of sum_j log P(x_j | rest), exact, for slots of trips whose basket
+    without j has size in 1..nmax-1 (see conditional_log_odds)."""
+    d, n_without = conditional_log_odds(model, ix, X)
     valid = (n_without > 0) & (n_without < model.nmax)
     return (F.logsigmoid(torch.where(X, d, -d)) * valid).sum() / ix.B
 

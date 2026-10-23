@@ -363,7 +363,10 @@ makes it worse: a commodity is split over 7 groups on average (soft drinks over 
    | test | 8.06 | 15.62 | 9.07 | 11.95 |
 
    Recommendation (1,620 validation cases): MRR 0.121 against 0.118, recall@100 50.4% against
-   49.9%. Validation log-likelihood on the 4,096 trips: running.
+   49.9%. Validation log-likelihood on the 4,096 trips: **−39.821 against −40.407 for v4_rec,
+   +0.587 ± 0.039 per basket** (+3.84 [3.62, 4.07] over the old Version 4), gaining at every
+   size: +0.82 (1–3 products), +0.59 (4–8), +0.31 (9–20), 0.00 (21–120). IS check: ESS 0.80,
+   mean half-split difference 0.11.
 
    The drift is much smaller but not gone (0.91× the real size early in training, 1.48× on
    test), and the refit is worse on size than centring without refitting. Most of the excess is

@@ -22,6 +22,9 @@ BLOCKS = {
             "discount": True, "history": "inclusive"},
     "all-mean": {"f_extra": True, "presence": True, "categories": True, "u_cat": True, "iv": True,
                  "discount": True, "history": "mean"},
+    "competition": {"competition": True},
+    "all-competition": {"f_extra": True, "presence": True, "categories": True, "u_cat": True,
+                        "discount": True, "history": "inclusive", "competition": True},
 }
 
 
@@ -59,7 +62,7 @@ def test_additive_size_law():
             assert abs(float(law[t, n - 1]) - exact_p) < 1e-10
 
 
-@pytest.mark.parametrize("name", ["additive", "all", "all-mean"])
+@pytest.mark.parametrize("name", ["additive", "all", "all-mean", "all-competition"])
 def test_energy_matches_gaussian_identity(name):
     model = make_model(**BLOCKS[name])
     batch = make_batch()
@@ -106,12 +109,14 @@ def test_sampler_matches_exact_marginals(cap):
     assert int(torch.zeros(ix.n_rows).index_add_(0, ix.row_of, X.double()).max()) <= cap
 
 
-def test_gibbs_and_importance_sampling_match_full_law():
-    model = make_model(**BLOCKS["all"])
+@pytest.mark.parametrize("name", ["all", "all-competition"])
+def test_gibbs_and_importance_sampling_match_full_law(name):
+    model = make_model(**BLOCKS[name])
     base = make_batch()
     base.bind(model)
     ix0 = base.ix
-    b0, iv0 = model.slot_utilities(ix0).detach(), model.iv_shift(ix0).detach()
+    b0, iv0 = model.slot_utilities(ix0).detach(), model.iv_shift(ix0)
+    iv0 = None if iv0 is None else iv0.detach()
     exact_lz, exact_inc = [], torch.zeros(len(ix0.item))
     for t in range(2):
         energies = {S: full_energy(model, ix0, b0, iv0, S) for S in baskets_of(ix0, t)}
@@ -139,8 +144,9 @@ def test_gibbs_and_importance_sampling_match_full_law():
     assert float((freq - exact_inc).abs().max()) < 0.03
 
 
-def test_pseudo_likelihood_is_exact_conditionals():
-    model = make_model(**{k: v for k, v in BLOCKS["all"].items()})
+@pytest.mark.parametrize("name", ["all", "all-competition"])
+def test_pseudo_likelihood_is_exact_conditionals(name):
+    model = make_model(**BLOCKS[name])
     batch = make_batch(basket=((0, 1, 3), (0, 5)))
     batch.bind(model)
     ix = batch.ix
@@ -232,3 +238,41 @@ def test_history_offset_is_the_intended_trip_shift(mode):
         assert float((raw[on] - o - b[on]).abs().max()) < 1e-12
     model.centre_history = None
     assert float((model.slot_utilities(ix) - raw).abs().max()) == 0.0
+
+
+def test_competition_moves_purchases_within_the_category():
+    """With lambda_c -> 0, at most one product per category and no interaction term, a price
+    cut on one product leaves every category's expected count unchanged (pure switching to it
+    from its rivals); with lambda_c -> 1 the block has no effect.  (Given z the products also
+    carry z . phi_j, which the shift does not see, so switching is then close but not exact.)"""
+    model = make_model(competition=True)
+    model.R = 1
+    model.rank = 0
+    with torch.no_grad():                                         # price slopes near 3, so a cut matters
+        model.gamma.fill_(1.0)
+        model.beta.fill_(1.0)
+    batch = make_batch()
+    ix = batch.ix
+    z = None
+    cut = torch.where(ix.item == 0, math.log(0.7), 0.0)
+    after = changed_price_context(batch.ctx, ix.item_trip, cut)
+
+    def per_category(ctx):
+        batch.bind(model, ctx)
+        _, p = exact.incidence(model, ix, model.slot_utilities_given_z(ix, z).detach(), z=z)
+        return torch.zeros(ix.n_rows).index_add_(0, ix.row_of, p), p
+
+    with torch.no_grad():
+        model.comp_raw.fill_(-40.0)
+    rows0, p0 = per_category(batch.ctx)
+    rows1, p1 = per_category(after)
+    own = (ix.item == 0) & (ix.item_trip == 0)
+    assert float(p1[own].sum() - p0[own].sum()) > 0.01          # the cut product gains
+    assert float((rows1 - rows0).abs().max()) < 1e-10            # no category grows or shrinks
+
+    with torch.no_grad():
+        model.comp_raw.fill_(40.0)
+    with_block = per_category(after)[1]
+    model.comp_raw = None
+    without = per_category(after)[1]
+    assert float((with_block - without).abs().max()) < 1e-12

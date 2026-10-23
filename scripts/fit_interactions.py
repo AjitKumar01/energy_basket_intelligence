@@ -12,6 +12,8 @@ Blocks added to the base model (all start at zero or small values):
                                  within each trip and learn its size effect, n * hist_size *
                                  log(1 + products ever bought) (see v4/model.py); needs --recency
     iv_slope_raw                 --m4c: discount only the price part of category inclusive value
+    comp_raw                     --within-competition: products of a category compete for price
+                                 and promotion changes (see v4/model.py); not with --m4c
 
 Stages:
     A  pseudo-likelihood (--pl-epochs): warms up phi with exact conditionals
@@ -69,6 +71,9 @@ def parse_args():
                         "trip's inclusive value) and learn its size effect (needs --recency)")
     p.add_argument("--warm-start", type=Path, help="start from this Version-4 checkpoint's parameters")
     p.add_argument("--iv-init", type=float, default=0.0, help="M4c: starting logit of lambda_c")
+    p.add_argument("--within-competition", action="store_true",
+                   help="within-category competition for price and promotion changes (learned lambda_c)")
+    p.add_argument("--comp-init", type=float, default=0.0, help="competition: starting logit of lambda_c")
     p.add_argument("--rank", type=int, default=16)
     p.add_argument("--max-per-category", type=int,
                    help="largest number of products from one category in a basket (default: nmax); "
@@ -121,6 +126,8 @@ def add_version4_blocks(model, args, J, C):
     model.u_cat = P(torch.zeros(C, model.theta.shape[1]))
     if args.m4c:
         model.iv_slope_raw = P(torch.full((C,), float(args.iv_init)))
+    if args.within_competition:
+        model.comp_raw = P(torch.full((C,), float(args.comp_init)))
     if args.recency:
         model.psi_item = P(torch.zeros(C, 3))
         with torch.no_grad():
@@ -152,6 +159,8 @@ def main():
         raise SystemExit("--val-trips must be positive (early stopping needs held-out trips)")
     if args.centre_history and not args.recency:
         raise SystemExit("--centre-history needs --recency")
+    if args.within_competition and args.m4c:
+        raise SystemExit("--within-competition and --m4c cannot be combined")
     torch.set_num_threads(args.threads)
     root = data_root(args.data_root)
     data = load_bundle(root)
@@ -202,7 +211,7 @@ def main():
     if args.warm_start is not None:
         state = torch.load(args.warm_start, map_location="cpu", weights_only=False)["model"]
         missing, unexpected = model.load_state_dict(state, strict=False)
-        if set(unexpected) - {"hist_size"} or set(missing) - {"hist_size"}:
+        if set(unexpected) - {"hist_size"} or set(missing) - {"hist_size", "comp_raw"}:
             raise SystemExit(f"--warm-start does not match this model: missing {missing}, unexpected {unexpected}")
         with torch.no_grad():
             delta.copy_(model.phi[:, :args.rank] - psi[category])
@@ -270,6 +279,7 @@ def main():
         extra = [model.f_extra]
         for params, lr in (([model.u_cat], lr_u_cat),
                            ([model.iv_slope_raw] if args.m4c else [], lr_iv),
+                           ([model.comp_raw] if args.within_competition else [], lr_iv),
                            (rec_params, lr_rec),
                            ([getattr(model, n) for n in price_names if getattr(model, n).requires_grad], lr_price)):
             if params and lr > 0.0:
@@ -358,6 +368,10 @@ def main():
                 gap = (model_present / N - rate_present).abs()
                 if args.centre_history:
                     row.update(hist_size=round(float(model.hist_size), 4))
+                if args.within_competition:
+                    lam_c = torch.sigmoid(model.comp_raw.detach())
+                    row.update(comp_lambda_mean=round(float(lam_c.mean()), 4), comp_lambda_min=round(float(lam_c.min()), 4),
+                               comp_lambda_max=round(float(lam_c.max()), 4))
                 row.update(chain_mean_size=float(np.mean([s[0] for s in sizes])),
                            data_mean_size=float(np.mean([s[1] for s in sizes])),
                            cat_pres_gap_mean=round(float(gap.mean()), 4), cat_pres_gap_max=round(float(gap.max()), 4))
@@ -394,7 +408,7 @@ def main():
                     "additive": str(args.additive.resolve()),
                     "rank": args.rank, "max_per_category": model.R, "use_f_extra": True, "presence_phi": True, "cat_rho0": True,
                     "u_cat": True, "unfreeze_price": True, "recency": bool(args.recency),
-                    "centre_history": args.centre_history, "iv_slope": bool(args.m4c), "iv_price_only": bool(args.m4c), "stage": stage,
+                    "centre_history": args.centre_history, "within_competition": bool(args.within_competition), "iv_slope": bool(args.m4c), "iv_price_only": bool(args.m4c), "stage": stage,
                     "seconds": time.time() - started, "args": {k: str(v) for k, v in vars(args).items()}},
                    path)
 

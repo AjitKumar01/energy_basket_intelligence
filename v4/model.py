@@ -35,7 +35,20 @@ Energy of a basket S (n products, n_c of them in category c, k categories presen
 
 Version-4 blocks are optional parameters (None when absent): f_extra (M1), psi_cat (M2),
 u_cat (M4a), psi_item (purchase history), iv_slope_raw (M4c), hist_size (history size
-term); M3 is the flag ``size_on_categories``.  The exact additive base model has none of
+term), comp_raw (within-category competition); M3 is the flag ``size_on_categories``.
+
+Within-category competition (comp_raw).  Every product of category c on trip t is shifted by
+
+    iota_tc = (lambda_c - 1) * [IV_tc(actual) - IV_tc(regular)],   lambda_c = sigmoid(comp_raw_c),
+
+IV_tc = log sum_{j in c} exp b_tj and "regular" the same trip without price deviation,
+display, mailer or discount.  A price or promotion change then raises the category's total
+attraction by only lambda_c times its inclusive-value gain: with lambda_c near 0 it moves
+purchases between the category's products, with lambda_c = 1 the term vanishes.  The shift
+is the same for every product of a (trip, category) row and depends on the context only, so
+the normaliser stays exact; in E(S) it is sum_c n_c iota_tc.  lambda_c is learned by
+likelihood like every other parameter.  The inclusive values use b, not the utilities given
+the latent z, so with interactions the switching is close to, not exactly, what lambda_c says.  The exact additive base model has none of
 them and phi = 0.
 
 History centring (``centre_history`` = None, "mean" or "inclusive").  The history part of
@@ -67,7 +80,7 @@ from torch.nn.functional import softplus
 
 PRICE_KEYS = ("dlp", "dlp_bar", "disp", "mail", "dsc")
 OPTIONAL_PARAMETERS = ("disc_kappa", "disc_common", "f_extra", "psi_cat", "u_cat",
-                       "psi_item", "iv_slope_raw", "hist_size")
+                       "psi_item", "iv_slope_raw", "hist_size", "comp_raw")
 HISTORY_KEYS = ("rec", "rec_item")
 # Parameters of an old quantity model and size factorisation that older checkpoints carry;
 # the basket law does not use them.
@@ -226,10 +239,27 @@ class BasketModel(torch.nn.Module):
         return o
 
     def slot_utilities(self, ix):
-        """b at every offered slot of the bound batch (minus the trip's history offset)."""
-        b = self.utilities(ix.item, ix.item_trip, self.ctx)
-        o = self.history_offset(ix, b)
-        return b if o is None else b - o[ix.item_trip]
+        """b at every offered slot of the bound batch (minus the trip's history offset, plus
+        the within-category competition shift)."""
+        raw = self.utilities(ix.item, ix.item_trip, self.ctx)
+        o = self.history_offset(ix, raw)
+        b = raw if o is None else raw - o[ix.item_trip]
+        iota = self.competition_shift(ix, raw)
+        return b if iota is None else b + iota[ix.row_of]
+
+    def competition_shift(self, ix, raw=None):
+        """iota per (trip, category) row (module docstring), or None without the block.
+        ``raw``: the slot utilities before any shift, if already computed.  The history
+        offset is the same within a trip, so it cancels in the inclusive-value change."""
+        if self.comp_raw is None:
+            return None
+        if self.iv_slope_raw is not None:
+            raise ValueError("within-category competition and M4c cannot be combined")
+        raw = self.utilities(ix.item, ix.item_trip, self.ctx) if raw is None else raw
+        regular = {k: (torch.zeros_like(v) if k in PRICE_KEYS else v) for k, v in self.ctx.items()}
+        b_regular = self.utilities(ix.item, ix.item_trip, regular)
+        change = _row_logsumexp(ix, raw) - _row_logsumexp(ix, b_regular)
+        return (torch.sigmoid(self.comp_raw)[ix.row_cat] - 1.0) * change
 
     def slot_utilities_given_z(self, ix, z, beta=1.0, b=None):
         """Utilities of the law of S given the latent z (B x rank):
@@ -316,6 +346,10 @@ class BasketModel(torch.nn.Module):
         o = self.history_offset(batch.ix)
         if o is not None:                                  # -n o_t: every bought product shifted by o_t
             e = e - torch.bincount(batch.line_trip, minlength=batch.ix.B).double() * o
+        iota = self.competition_shift(batch.ix)
+        if iota is not None:                               # sum_c n_c iota_tc
+            n_row = torch.zeros(batch.ix.n_rows).index_add_(0, batch.ix.row_of, batch.observed.double())
+            e = e + torch.zeros(batch.ix.B).index_add_(0, batch.ix.row_trip, n_row * iota)
         iv = self.iv_shift(batch.ix) if iv is None else iv
         if (self.f_extra is None and self.psi_cat is None and not self.size_on_categories
                 and iv is None):

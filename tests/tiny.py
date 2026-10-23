@@ -4,7 +4,7 @@ Two trips at one store; trip 0 is offered categories {0: 3 products, 1: 2 produc
 trip 1 categories {0: 3 products, 2: 1 product}; baskets have 1..nmax = 4 products.
 Every Version-4 block can be switched on: f_extra (M1), psi_cat (M2), size on categories
 (M3), u_cat (M4a), iv_slope_raw (M4c), the discount split, and purchase history with
-centring and its size term (``history``).
+centring and its size term (``history``), within-category competition (``competition``).
 """
 from __future__ import annotations
 
@@ -24,7 +24,7 @@ TRIPS = [[0, 1, 2, 3, 4], [0, 1, 2, 5]]            # offered products per trip
 
 
 def make_model(seed=0, *, f_extra=False, presence=False, categories=False, u_cat=False,
-               iv=False, discount=False, history=None):
+               iv=False, discount=False, history=None, competition=False):
     torch.manual_seed(seed)
     g = torch.Generator().manual_seed(seed)
     m = BasketModel(J, 2, C, K=3, Kz=4, Kp=2, nmax=NMAX, R=NMAX, S=1, seed=seed)
@@ -57,6 +57,8 @@ def make_model(seed=0, *, f_extra=False, presence=False, categories=False, u_cat
         m.psi_item = P(r(C, 3, s=0.5))
         m.hist_size = P(torch.tensor(0.3))
         m.centre_history = history                      # "mean" or "inclusive"
+    if competition:
+        m.comp_raw = P(r(C, s=1.0))
     return m
 
 

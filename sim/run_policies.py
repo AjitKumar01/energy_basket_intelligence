@@ -49,11 +49,14 @@ def main():
     p.add_argument("--trips-per-week", type=int, default=500)
     p.add_argument("--weeks", type=int, nargs="*", help="weeks to simulate (default: the validation weeks)")
     p.add_argument("--draws", type=int, default=32)
+    p.add_argument("--latent", choices=("reweight", "fixed"), default="reweight",
+                   help="Version 4: reweight latent draws (the law) or hold each trip's latent state fixed")
     p.add_argument("--threads", type=int, default=4)
     p.add_argument("--out", type=Path, required=True)
     a = p.parse_args()
     env = PromotionEnv(a.checkpoint, simulator=a.simulator, initialization=a.initialization,
-                       trips_per_week=a.trips_per_week, weeks=a.weeks or None, draws=a.draws, threads=a.threads)
+                       trips_per_week=a.trips_per_week, weeks=a.weeks or None, draws=a.draws, threads=a.threads,
+                       latent=a.latent)
     K, L = len(env.categories), len(env.levels)
     check_env(env, skip_render_check=True)
     rng = np.random.default_rng(1)
@@ -78,7 +81,7 @@ def main():
                 "flat-30": lambda obs: np.full(K, L - 1),
                 "random": lambda obs: rng.integers(0, L, K),
                 "greedy": lambda obs: best}
-    report = {"simulator": a.simulator, "checkpoint": str(a.checkpoint), "weeks": [int(w) for w in env.weeks],
+    report = {"simulator": a.simulator, "latent": a.latent, "checkpoint": str(a.checkpoint), "weeks": [int(w) for w in env.weeks],
               "trips_per_week": a.trips_per_week, "categories": env.categories,
               "levels": env.levels.tolist(),
               "single_category_uplift_first_week": single,

@@ -66,6 +66,9 @@ def parse_args():
     p.add_argument("--output-dir", type=Path, required=True)
     p.add_argument("--label", default="pipeline_additive")
     p.add_argument("--resume", type=Path, help="continue from v3_LABEL.pt; --iters is the final update")
+    p.add_argument("--warm-start", type=Path,
+                   help="start the fitted blocks from another additive fit (same products, possibly another "
+                        "partition); rho_c, which belongs to the partition, starts from the initialization")
     p.add_argument("--iters", type=int, default=30000, help="safety ceiling on updates")
     p.add_argument("--batch", type=int, default=128)
     p.add_argument("--lr", type=float, default=0.002)
@@ -187,6 +190,21 @@ def main():
         "discount_panel": str(panel), "discount_panel_sha256": file_sha256(panel),
         "disc_kappa": bool(args.disc_kappa), "disc_common": bool(args.disc_common)}
     batcher = Batcher(data, features)
+    if args.warm_start is not None:
+        if args.resume is not None:
+            raise SystemExit("--warm-start and --resume exclude each other")
+        state = torch.load(args.warm_start, map_location="cpu", weights_only=False)["model"]
+        taken = []
+        with torch.no_grad():
+            for name in FITTED:
+                if name == "rho_c" or name not in state or getattr(model, name) is None:
+                    continue
+                if state[name].shape != getattr(model, name).shape:
+                    raise SystemExit(f"--warm-start: {name} has shape {tuple(state[name].shape)}, "
+                                     f"the model {tuple(getattr(model, name).shape)}")
+                getattr(model, name).copy_(state[name])
+                taken.append(name)
+        print(f"[additive] warm start from {args.warm_start}: {', '.join(taken)}", flush=True)
 
     train = supported_trips(data, 0, nmax)
     counts = np.bincount(np.clip(data["trip_nlines"][train], 1, nmax), minlength=nmax + 1)[1:].astype(np.float64)

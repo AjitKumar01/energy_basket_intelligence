@@ -382,12 +382,31 @@ makes it worse: a commodity is split over 7 groups on average (soft drinks over 
    second product from the same group, so a price change moves purchases within the group
    instead of adding items. It goes in the exact per-group DP. Test it on the stress world
    with `checks/halo.py` (switching and halo) before anything else.
+   *Status (2026-10-24).* Design (research agent, branch `v4-competition`): every product of a
+   category is shifted by iota_tc = (lambda_c - 1) x the price/promotion-driven change of the
+   category's inclusive value, so only a fraction lambda_c of a price cut's attraction gain
+   grows the category. It is a per-(trip, category) constant, so the normaliser stays exact.
+   The agent's version redefines M4c and learns lambda_c from an instrument rather than by
+   likelihood. A clean version is on branch `v4-competition-lik` (`--within-competition`,
+   its own parameter, lambda_c by likelihood, M4c unchanged, 29 exact tests); with the
+   latent term the switching is close to, not exactly, what lambda_c says. Both are being
+   fitted on the stress world and will be compared on `checks/halo.py`, held-out likelihood
+   and realism.
 2. *Hold the latent state fixed* in price and promotion counterfactuals (the environment and
-   the scenario scorer), if step 1 does not make it unnecessary.
+   the scenario scorer), if step 1 does not make it unnecessary. *Done as options:*
+   `checks/halo.py` reports both ("reweighted" and "z_fixed"); the promotion environment takes
+   `latent="fixed"` (`sim/run_policies.py --latent fixed`).
 3. *A partition that keeps rivals together on Dunnhumby:* commodities, or affinity groups split
    by commodity; then refit Steps 3 and 4.
 4. *Measure the real halo:* when one commodity is discounted in a store-week, do other
-   commodities' purchases per trip move?
+   commodities' purchases per trip move? *Done* (`checks/halo_real.py`). Discount depth is
+   chain-wide here, so the comparison uses display, which varies by store within a week:
+   1,560 store-weeks (70 stores, at least 30 trips each), store and week fixed effects, the 60
+   most-bought commodities. 100 more products on display elsewhere in the store change the
+   other commodities' items per trip by **−0.15 in the data** (± 0.03 if the commodities were
+   independent) and by **+0.46 in the base model** on the same trips. Own display effects
+   agree (+46% vs +36% per 10 products). So the model's halo has the wrong sign on real data.
+   The Version-4 run is pending.
 5. *Promotions:* a common display slope with per-product variation shrunk toward it, and a
    firmer prior on the promotion weights during Version-4 training.
 6. Then the promotion environment, the test weeks for the chosen model, and SHOPPER on Dunnhumby.

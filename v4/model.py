@@ -31,7 +31,7 @@ Energy of a basket S (n products, n_c of them in category c, k categories presen
            - sum_c [rho_c C(n_c, 2) + f_c(n_c)]                 f_c: M1, free counts 2, 3, >=4
            + M2 presence correction                               see energy()
            - rho_0(n)       or  - rho_0(k) with M3 (size potential on categories present)
-           + sum_{c present} (lambda_c - 1) * IV_price_c          M4c, see iv_shift()
+           + sum_c n_c * (lambda_c - 1) * IV_price_c              M4c, see iv_shift()
 
 Version-4 blocks are optional parameters (None when absent): f_extra (M1), psi_cat (M2),
 u_cat (M4a), psi_item (purchase history), iv_slope_raw (M4c), hist_size (history size
@@ -261,14 +261,36 @@ class BasketModel(torch.nn.Module):
         """M4c lambda_c = sigmoid(iv_slope_raw) in (0, 1), or None."""
         return None if self.iv_slope_raw is None else torch.sigmoid(self.iv_slope_raw)
 
+    @torch.no_grad()
+    def iv_instrument(self, ix):
+        """Household-invariant category price/promotion inclusive-value shift per row,
+        centred within each category of the batch so learning lambda_c is orthogonal to
+        category intercepts and free of in-sample household taste/history selection bias."""
+        g_bar = (softplus(self.gamma).mean(0, keepdim=True) * softplus(self.beta[ix.item])).sum(-1)
+        mean = self.ctx["dlp_bar"][ix.item_trip]
+        kappa = softplus(self.price_kappa)
+        delta = -g_bar * (mean + kappa * (self.ctx["dlp"] - mean))
+        if "dsc" in self.ctx and self.disc_kappa is not None:
+            delta = delta - g_bar * (softplus(self.disc_kappa) - kappa) * self.ctx["dsc"]
+        if "dsc" in self.ctx and self.disc_common is not None:
+            delta = delta - self.disc_common * self.ctx["dsc"]
+        delta = delta + self.w_dsp[ix.item] * self.ctx["disp"] + self.w_mlr[ix.item] * self.ctx["mail"]
+        b0 = self.lam[ix.item]
+        div = _row_logsumexp(ix, b0 + delta) - _row_logsumexp(ix, b0)
+        count = torch.bincount(ix.row_cat, minlength=self.C).clamp_min(1).double()
+        mean_c = torch.zeros(self.C).index_add_(0, ix.row_cat, div) / count
+        return div - mean_c[ix.row_cat]
+
     def iv_shift(self, ix, b_slot=None):
         """M4c, per row: (lambda_c - 1) * [IV_c(actual) - IV_c(regular)].
 
         IV_c = log sum_{j in c} exp b_j, the category's inclusive value; "regular" is the
         same trip with no price deviation, display, mailer or discount.  The term is charged
-        once per category present, so a discount mostly moves choice *within* its category
-        and only a fraction lambda_c of its inclusive-value gain raises category incidence.
-        It depends on the context only, so the normaliser stays exact."""
+        per bought product of the category (equivalent to shifting every slot utility in
+        category c by iv_c), so each degree k >= 1 of the category polynomial scales with
+        k * lambda_c: a price cut moves choice *within* its category while only a fraction
+        lambda_c of its inclusive-value gain expands the category.  It depends on the
+        context only, so the normaliser stays exact."""
         lam = self.iv_lambda()
         if lam is None:
             return None
@@ -280,7 +302,11 @@ class BasketModel(torch.nn.Module):
         if o is not None:
             b_regular = b_regular - o[ix.item_trip]
         iv = _row_logsumexp(ix, b_slot) - _row_logsumexp(ix, b_regular)
-        return (lam[ix.row_cat] - 1.0) * iv
+        lam_c = lam[ix.row_cat]
+        if not self.iv_slope_raw.requires_grad:
+            return (lam_c - 1.0) * iv
+        inst = self.iv_instrument(ix)
+        return (lam_c - 1.0).detach() * iv + (lam_c - lam_c.detach()) * inst
 
     def basket_field(self, ix, X):
         """s(S) = sum_{j in S} phi_j, minus psi_c per extra product of a category with M2.
@@ -344,8 +370,8 @@ class BasketModel(torch.nn.Module):
             k = torch.zeros(ix.B, dtype=torch.long).index_add_(0, ix.row_trip, (n_row > 0).long())
             rho0 = self.rho_0()
             e = e + rho0[n] - rho0[k]
-        if iv is not None:                                 # M4c
-            e = e + torch.zeros(ix.B).index_add_(0, ix.row_trip, (n_row > 0).double() * iv)
+        if iv is not None:                                 # M4c: per product of the category
+            e = e + torch.zeros(ix.B).index_add_(0, ix.row_trip, n_row * iv)
         return e
 
     # ---- loading ------------------------------------------------------------------------------

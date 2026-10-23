@@ -36,7 +36,7 @@ def conditional_log_odds(model, ix, X):
     P(j in S | the rest) = sigmoid(d_j).  Exact: the normaliser cancels.  Also returns the
     size of the basket without j at every slot.
 
-        d_j = b_j + pair_j - category_j - size_j (+ M4c term if j opens its category)
+        d_j = b_j + pair_j - category_j - size_j (+ M4c term iv_c(j))
 
     where pair_j is the change in the M2 pair term, category_j the change in
     rho_c C(n_c, 2) + f_c(n_c), and size_j the change in rho_0 of the number of categories."""
@@ -74,7 +74,7 @@ def conditional_log_odds(model, ix, X):
     d = b + pair - category - size
     iv = model.iv_shift(ix, b_slot=b)
     if iv is not None:
-        d = d + opens.double() * iv[ix.row_of]
+        d = d + iv[ix.row_of]
     return d, n_without
 
 
@@ -118,13 +118,18 @@ def penalties(model, priors, n_train, psi, delta, price_init, recency):
     for name, start in price_init.items():
         p = getattr(model, name)
         if p.requires_grad:
-            price_prior = price_prior + priors.price_prec * (p - start).square().sum()
+            w = 0.05 * priors.price_prec if name == "price_kappa" else priors.price_prec
+            price_prior = price_prior + w * (p - start).square().sum()
     u_cat_prior = priors.u_cat_prec * model.u_cat.square().sum()
     rec_prior = priors.rec_prec * (model.psi.square().sum() + model.psi_item.square().sum()) if recency else 0.0
     if model.hist_size is not None:
         rec_prior = rec_prior + priors.rec_prec * model.hist_size.square()
+    iv_prior = 0.0
+    if model.iv_slope_raw is not None and model.iv_slope_raw.requires_grad:
+        iv_dev = model.iv_slope_raw - model.iv_slope_raw.mean()
+        iv_prior = 2.0 * iv_dev.square().sum()
     return loss + 0.5 * (phi_prior + priors.rho_c_prec * model.rho_c.square().sum() + extra_prior
-                         + price_prior + u_cat_prior + rec_prior) / n_train
+                         + price_prior + u_cat_prior + rec_prior + iv_prior) / n_train
 
 
 def project(model, capacities, optimizer):

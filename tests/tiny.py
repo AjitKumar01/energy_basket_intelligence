@@ -123,7 +123,7 @@ def energy_given_z(model, ix, u, z, iv, S):
             psi = model.psi_cat[c]
             e -= (n - 1) * (float(z[int(ix.row_trip[row])] @ psi) - 0.5 * float(psi @ psi))
         if iv is not None:
-            e += float(iv[row])
+            e += n * float(iv[row])
     size = len(counts) if model.size_on_categories else len(S)
     return e - float(model.rho_0()[size])
 
@@ -145,7 +145,7 @@ def full_energy(model, ix, b, iv, S):
             s = s - (n - 1) * model.psi_cat[c]
             e += 0.5 * (n - 1) * float(model.psi_cat[c] @ model.psi_cat[c])
         if iv is not None:
-            e += float(iv[row])
+            e += n * float(iv[row])
     size = len(counts) if model.size_on_categories else len(S)
     return e + 0.5 * float(s @ s) - float(model.rho_0()[size])
 

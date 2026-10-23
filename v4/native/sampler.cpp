@@ -524,7 +524,7 @@ extern "C" int sample_slots_cpp(
         double* g_ptr = &G[fslot * K1];
         g_ptr[0] = 0.0;
         for (int64_t k = 1; k <= Kr; ++k) {
-            double pen = rc * (0.5 * k * (k - 1)) + extra_count_pen(f_extra, cat, k) - iv_sh;
+            double pen = rc * (0.5 * k * (k - 1)) + extra_count_pen(f_extra, cat, k) - k * iv_sh;
             if (k >= 2) pen += (k - 1) * cshift;
             g_ptr[k] = (e_cur[k] > 0.0)
                            ? (std::log(e_cur[k]) + k * rmax - pen)
@@ -867,7 +867,7 @@ extern "C" int gibbs_sweeps_cpp(
             double* g_ptr = &G[fslot * K1];
             g_ptr[0] = 0.0;
             for (int64_t k = 1; k <= Kr; ++k) {
-                double pen = rc * (0.5 * k * (k - 1)) + extra_count_pen(f_extra, cat, k) - iv_sh;
+                double pen = rc * (0.5 * k * (k - 1)) + extra_count_pen(f_extra, cat, k) - k * iv_sh;
                 if (k >= 2) pen += (k - 1) * cshift;
                 g_ptr[k] = (e_cur[k] > 0.0)
                                ? (std::log(e_cur[k]) + k * rmax - pen)

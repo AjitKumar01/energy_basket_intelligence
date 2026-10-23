@@ -63,7 +63,8 @@ def parse_args():
     p.add_argument("--data-root", type=Path, help="model-data bundle (default $ENERGY_MODEL_DATA_ROOT)")
     p.add_argument("--out", type=Path, required=True, help="output path without suffix")
     p.add_argument("--recency", action="store_true", help="add recency and purchase-history features")
-    p.add_argument("--m4c", action="store_true", help="add M4c (price-only inclusive value per category)")
+    p.add_argument("--m4c", action=argparse.BooleanOptionalAction, default=True,
+                   help="add M4c within-category price competition (default: enabled)")
     p.add_argument("--centre-history", nargs="?", const="mean", choices=("mean", "inclusive"),
                    help="centre the history shift within each trip (by its mean, or by its effect on the "
                         "trip's inclusive value) and learn its size effect (needs --recency)")
@@ -99,6 +100,7 @@ def parse_args():
     p.add_argument("--mm-rho", type=float, default=0.2)
     p.add_argument("--mm-rho0", type=float, default=0.5)
     p.add_argument("--mm-lam", type=float, default=0.5)
+    p.add_argument("--mm-iv", type=float, default=0.5)
     p.add_argument("--pool-prod", type=float, default=0.5)
     p.add_argument("--phi-prec", type=float, default=20.0)
     p.add_argument("--delta-prec", type=float, default=200.0)
@@ -191,14 +193,16 @@ def main():
     if args.max_per_category is not None:
         model.R = min(model.R, args.max_per_category)
 
-    # Price (and, without --recency, the unused recency loading psi) stays at the base
-    # model's values during stage A and is trained from stage B under a centred prior.
+    # Price slopes gamma and beta (and, without --recency, the unused recency loading psi)
+    # stay at the base model's values during stage A and are trained from stage B under a
+    # centred prior; price_kappa adapts from stage A so relative price sensitivity matches
+    # the within-category competition regime.
     price_names = ("gamma", "beta", "price_kappa") + tuple(
         n for n in ("disc_kappa", "disc_common") if getattr(model, n) is not None) + (
         () if args.recency else ("psi",))
     price_init = {n: getattr(model, n).detach().clone() for n in price_names}
     for n in price_names:
-        getattr(model, n).requires_grad_(False)
+        getattr(model, n).requires_grad_(n == "price_kappa" and bool(args.m4c))
     if args.warm_start is not None:
         state = torch.load(args.warm_start, map_location="cpu", weights_only=False)["model"]
         missing, unexpected = model.load_state_dict(state, strict=False)
@@ -220,11 +224,13 @@ def main():
 
     # Data rates used to precondition the moment-matching steps.
     with torch.no_grad():
-        k_counts, pair_sum, item_counts, cat_present = (
-            torch.zeros(nmax + 1), torch.zeros(C), torch.zeros(J), torch.zeros(C))
+        k_counts, pair_sum, item_counts, cat_present, iv_cov, iv_info = (
+            torch.zeros(nmax + 1), torch.zeros(C), torch.zeros(J), torch.zeros(C),
+            torch.zeros(C), torch.zeros(C))
         chains = []                                         # persistent SML chains, from the data
         for trips in batches:
             bt = batcher.make(trips)
+            bt.bind(model)
             chains.append(bt.observed.clone())
             n_row = torch.zeros(bt.ix.n_rows).index_add_(0, bt.ix.row_of, bt.observed.double())
             if int(n_row.max()) >= model.R:      # keeps every observed basket (and PL step) inside the cap
@@ -235,10 +241,29 @@ def main():
             pair_sum.index_add_(0, bt.ix.row_cat, model.pair_feature(n_row))
             cat_present.index_add_(0, bt.ix.row_cat, (n_row > 0).double())
             item_counts.index_add_(0, bt.ix.item, bt.observed.double())
+            if args.m4c:
+                inst = model.iv_instrument(bt.ix)
+                iv_cov.index_add_(0, bt.ix.row_cat, n_row * inst)
+                iv_info.index_add_(0, bt.ix.row_cat, n_row * inst.square())
         rate_k = (k_counts[1:] / N).clamp_min(2e-3)
         rate_pairs = (pair_sum / N).clamp_min(5e-3)
         rate_item = (item_counts / N).clamp_min(2e-3)
         rate_present = cat_present / N
+
+    def _update_iv_eb(cov, info):
+        """Empirical-Bayes moment update for lambda_c from the training data's category
+        counts and centred price/promotion inclusive-value shift."""
+        rate_cov = cov / N
+        rate_iv = (info / N).clamp_min(1e-4)
+        total_info = rate_iv.sum()
+        pooled_lam = (rate_cov.sum() / total_info).clamp(0.01, 0.99)
+        prior_info = 10.0 * (total_info / C)
+        lam_eb = ((rate_cov + prior_info * pooled_lam) / (rate_iv + prior_info)).clamp(0.01, 0.99)
+        model.iv_slope_raw.copy_(torch.logit(lam_eb))
+
+    with torch.no_grad():
+        if args.m4c and args.warm_start is None:
+            _update_iv_eb(iv_cov, iv_info)
 
     def sync_phi():
         with torch.no_grad():
@@ -261,6 +286,8 @@ def main():
 
     def run_stage(name, epochs, step_fn, *, lr_base, lr_lam, lr_phi, lr_price=0.0, lr_u_cat=0.0,
                   lr_rec=0.0, lr_iv=0.0, average=False, monitor=False, moments=False):
+        if args.m4c:
+            model.iv_slope_raw.requires_grad_(False)
         groups = [{"params": [getattr(model, n) for n in CONTEXT_NAMES], "lr": lr_base},
                   {"params": [model.lam], "lr": lr_lam},
                   {"params": [model.rho_c], "lr": args.lr_rho},
@@ -268,10 +295,14 @@ def main():
                   {"params": [psi, delta], "lr": lr_phi},
                   {"params": [model.f_extra], "lr": 0.2 * args.lr_rho}]
         extra = [model.f_extra]
+        other_price = [getattr(model, n) for n in price_names
+                       if n != "price_kappa" and getattr(model, n).requires_grad]
+        kappa_param = [model.price_kappa] if model.price_kappa.requires_grad else []
+        lr_kappa = max(8.0 * lr_price, 8.0 * lr_base)
         for params, lr in (([model.u_cat], lr_u_cat),
-                           ([model.iv_slope_raw] if args.m4c else [], lr_iv),
                            (rec_params, lr_rec),
-                           ([getattr(model, n) for n in price_names if getattr(model, n).requires_grad], lr_price)):
+                           (other_price, lr_price),
+                           (kappa_param, lr_kappa)):
             if params and lr > 0.0:
                 groups.append({"params": params, "lr": lr})
                 extra.extend(params)
@@ -279,6 +310,7 @@ def main():
         total = epochs * len(batches)
         decay = args.lr_final_ratio ** (1.0 / max(total - 1, 1))
         mm = (args.mm_rho, args.mm_rho0, args.mm_lam) if moments else (0.0, 0.0, 0.0)
+        mm_iv = args.mm_iv if (args.m4c and lr_iv > 0.0) else 0.0
         avg, n_avg, step = None, 0, 0
         best_ll, best_state, bad = -float("inf"), None, 0
         for epoch in range(1, epochs + 1):
@@ -286,6 +318,7 @@ def main():
             values, sizes, model_present = [], [], torch.zeros(C)
             g_sums = [torch.zeros_like(model.rho_0_free), torch.zeros_like(model.rho_c),
                       torch.zeros_like(model.lam)]
+            iv_cov_ep, iv_info_ep = torch.zeros(C), torch.zeros(C)
             for i in rng.permutation(len(batches)):
                 step += 1
                 bt = batcher.make(batches[i])
@@ -304,6 +337,12 @@ def main():
                                      model.rho_c.grad.detach().clone(), model.lam.grad.detach().clone())
                 for s, gr in zip(g_sums, (g_r0, g_rc, g_lam)):
                     s.add_(gr)
+                if mm_iv > 0.0:
+                    with torch.no_grad():
+                        n_obs = torch.zeros(bt.ix.n_rows).index_add_(0, bt.ix.row_of, bt.observed.double())
+                        inst = model.iv_instrument(bt.ix)
+                        iv_cov_ep.index_add_(0, bt.ix.row_cat, n_obs * inst)
+                        iv_info_ep.index_add_(0, bt.ix.row_cat, n_obs * inst.square())
                 torch.nn.utils.clip_grad_norm_(base + extra + [psi, delta], 10.0)
                 opt.step()
                 sync_phi()
@@ -335,7 +374,7 @@ def main():
                         k: (avg[k] + (state[k] - avg[k]) / (n_avg + 1)) if state[k].is_floating_point()
                         else state[k] for k in state}
                     n_avg += 1
-            if any(mm):                                     # one damped full-data step per epoch
+            if any(mm) or mm_iv > 0.0:                      # one damped full-data step per epoch
                 with torch.no_grad():
                     r0, rc, la = (s / len(batches) for s in g_sums)
                     if mm[1] > 0.0:
@@ -344,6 +383,8 @@ def main():
                         model.rho_c.sub_(0.5 * (rc / rate_pairs).clamp(-0.5, 0.5))
                     if mm[2] > 0.0:
                         model.lam.sub_(0.35 * (la / rate_item).clamp(-0.35, 0.35))
+                    if mm_iv > 0.0:
+                        _update_iv_eb(iv_cov_ep, iv_info_ep)
                 project(model, capacities, opt)
             sv = torch.linalg.svdvals(model.phi_r().detach())
             row = {"stage": name, "epoch": epoch, "objective": float(np.mean(values)),

@@ -232,3 +232,58 @@ def test_history_offset_is_the_intended_trip_shift(mode):
         assert float((raw[on] - o - b[on]).abs().max()) < 1e-12
     model.centre_history = None
     assert float((model.slot_utilities(ix) - raw).abs().max()) == 0.0
+
+
+def test_group_competition_switches_within_category():
+    """As lambda_c -> 0, a price cut on one product raises its own incidence by taking share
+    from same-category rivals, while leaving category incidence, log Z_z and other categories
+    invariant (exact at R = 1, and bounded by the multi-item share-concentration term at R = NMAX)."""
+    model = make_model(**BLOCKS["all-mean"])
+    with torch.no_grad():
+        model.iv_slope_raw.fill_(-40.0)                      # lambda_c -> 0
+        model.price_kappa.fill_(math.log(math.expm1(1.0)))   # kappa = 1: dlp_bar cancels
+        model.phi[:, :RANK] = model.psi_cat[model.cat_of]    # tied within category
+    batch = make_batch()
+    ix = batch.ix
+    z = torch.randn(2, RANK, generator=torch.Generator().manual_seed(9))
+    alt_ctx = changed_price_context(batch.ctx, ix.item_trip, torch.where(ix.item == 0, -0.3, 0.0))
+
+    model.R = 1
+    batch.bind(model)
+    lz0, p0 = exact.incidence(model, ix, model.slot_utilities_given_z(ix, z).detach(),
+                              z=z, iv=model.iv_shift(ix))
+    batch.bind(model, alt_ctx)
+    lz1, p1 = exact.incidence(model, ix, model.slot_utilities_given_z(ix, z).detach(),
+                              z=z, iv=model.iv_shift(ix))
+    assert torch.allclose(lz1, lz0, atol=1e-12, rtol=0)
+    cat0 = ix.row_cat[ix.row_of] == 0
+    own = ix.item == 0
+    rivals = cat0 & ~own
+    others = ~cat0
+    assert bool((p1[own] > p0[own] + 1e-4).all())
+    assert bool((p1[rivals] < p0[rivals]).all())
+    for t in range(2):
+        on = ix.item_trip == t
+        assert abs(float((p1[on & cat0] - p0[on & cat0]).sum())) < 1e-12
+    assert torch.allclose(p1[others], p0[others], atol=1e-12, rtol=0)
+
+
+def test_group_competition_matches_unconstrained_at_lambda_one():
+    """As lambda_c -> 1, the competition term vanishes and the law matches iv_slope_raw = None."""
+    model = make_model(**BLOCKS["all"])
+    with torch.no_grad():
+        model.iv_slope_raw.fill_(40.0)                       # lambda_c -> 1
+    batch = make_batch()
+    batch.bind(model)
+    ix = batch.ix
+    z = torch.randn(2, RANK, generator=torch.Generator().manual_seed(10))
+    u = model.slot_utilities_given_z(ix, z).detach()
+    lz1, p1 = exact.incidence(model, ix, u, z=z, iv=model.iv_shift(ix))
+    e1 = model.energy(batch)
+    model.iv_slope_raw = None
+    lz0, p0 = exact.incidence(model, ix, u, z=z, iv=model.iv_shift(ix))
+    e0 = model.energy(batch)
+    assert torch.allclose(lz1, lz0, atol=1e-12, rtol=0)
+    assert torch.allclose(p1, p0, atol=1e-12, rtol=0)
+    assert torch.allclose(e1, e0, atol=1e-12, rtol=0)
+

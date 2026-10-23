@@ -38,13 +38,20 @@ u_cat (M4a), psi_item (purchase history), iv_slope_raw (M4c), hist_size (history
 term); M3 is the flag ``size_on_categories``.  The exact additive base model has none of
 them and phi = 0.
 
-History centring (flag ``centre_history``).  The history part of the utility,
-h_tj = psi_j . rec + psi_item_c(j) . rec_item, grows with the household's history (more
-products "ever bought"), and raising many utilities also raises basket size, so without
-centring the predicted size drifts upward with calendar time.  With centring every utility
-of trip t is shifted by the same number
+History centring (``centre_history`` = None, "mean" or "inclusive").  The history part of
+the utility, h_tj = psi_j . rec + psi_item_c(j) . rec_item, grows with the household's
+history (more products "ever bought"), and raising many utilities also raises basket size,
+so without centring the predicted size drifts upward with calendar time.  With centring every
+utility of trip t is shifted by the same number
 
-    o_t = mean_{j offered on t} h_tj + hist_size * log(1 + M_t),   M_t = products ever bought,
+    o_t = c_t + hist_size * log(1 + M_t),   M_t = products ever bought before the trip,
+
+    "mean"       c_t = mean_{j offered on t} h_tj
+    "inclusive"  c_t = log sum_j exp(b0_tj + h_tj) - log sum_j exp(b0_tj),  b0 = b without h
+
+"inclusive" removes the history's effect on the trip's total attraction (its inclusive
+value), so a wider spread of h across products does not raise size either; "mean" removes
+only its average.
 
 so the history decides *which* products are bought, while its effect on *how many* is the
 learned term n * hist_size * log(1 + M_t).  A shift shared by all products of a trip is a
@@ -109,7 +116,7 @@ class BasketModel(torch.nn.Module):
         for name in OPTIONAL_PARAMETERS:
             setattr(self, name, None)
         self.size_on_categories = False      # M3
-        self.centre_history = False          # see the module docstring
+        self.centre_history = None           # None, "mean" or "inclusive" (module docstring)
         self.rank = 0                        # active columns of phi
         self.house = None                    # [B] households of the current batch
         self.ctx = None                      # features of the current batch (Batch.bind)
@@ -197,15 +204,22 @@ class BasketModel(torch.nn.Module):
             h = part if h is None else h + part
         return h
 
-    def history_offset(self, ix):
-        """o_t per trip of the bound batch (module docstring), or None without centring."""
+    def history_offset(self, ix, b=None):
+        """o_t per trip of the bound batch (module docstring), or None without centring.
+        ``b``: the slot utilities before centring, if already computed ("inclusive" needs them)."""
         if not self.centre_history:
             return None
         h = self.history_utilities(ix.item, self.ctx)
         if h is None:
             return None
-        count = torch.bincount(ix.item_trip, minlength=ix.B).double()
-        o = torch.zeros(ix.B).index_add_(0, ix.item_trip, h) / count
+        if self.centre_history == "mean":
+            count = torch.bincount(ix.item_trip, minlength=ix.B).double()
+            o = torch.zeros(ix.B).index_add_(0, ix.item_trip, h) / count
+        elif self.centre_history == "inclusive":
+            b = self.utilities(ix.item, ix.item_trip, self.ctx) if b is None else b
+            o = _trip_logsumexp(ix, b) - _trip_logsumexp(ix, b - h)
+        else:
+            raise ValueError(f"unknown centre_history {self.centre_history!r}")
         if self.hist_size is not None and "rec_item" in self.ctx:
             ever = torch.zeros(ix.B).index_add_(0, ix.item_trip, self.ctx["rec_item"][:, 0])
             o = o + self.hist_size * torch.log1p(ever)
@@ -214,7 +228,7 @@ class BasketModel(torch.nn.Module):
     def slot_utilities(self, ix):
         """b at every offered slot of the bound batch (minus the trip's history offset)."""
         b = self.utilities(ix.item, ix.item_trip, self.ctx)
-        o = self.history_offset(ix)
+        o = self.history_offset(ix, b)
         return b if o is None else b - o[ix.item_trip]
 
     def slot_utilities_given_z(self, ix, z, beta=1.0, b=None):
@@ -347,6 +361,14 @@ class BasketModel(torch.nn.Module):
             if name in state and state[name] is not None and getattr(self, name) is None:
                 setattr(self, name, torch.nn.Parameter(torch.zeros_like(state[name])))
         self.load_state_dict(state)
+
+
+def _trip_logsumexp(ix, b_slot):
+    """log sum exp of slot values within each trip."""
+    m = torch.full((ix.B,), -float("inf")).index_reduce_(
+        0, ix.item_trip, b_slot, "amax", include_self=True).detach()
+    w = torch.zeros(ix.B).index_add_(0, ix.item_trip, torch.exp(b_slot - m[ix.item_trip]))
+    return m + torch.log(w)
 
 
 def _row_logsumexp(ix, b_slot):

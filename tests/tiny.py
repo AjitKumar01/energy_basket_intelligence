@@ -24,7 +24,7 @@ TRIPS = [[0, 1, 2, 3, 4], [0, 1, 2, 5]]            # offered products per trip
 
 
 def make_model(seed=0, *, f_extra=False, presence=False, categories=False, u_cat=False,
-               iv=False, discount=False, history=False):
+               iv=False, discount=False, history=None):
     torch.manual_seed(seed)
     g = torch.Generator().manual_seed(seed)
     m = BasketModel(J, 2, C, K=3, Kz=4, Kp=2, nmax=NMAX, R=NMAX, S=1, seed=seed)
@@ -56,7 +56,7 @@ def make_model(seed=0, *, f_extra=False, presence=False, categories=False, u_cat
             m.psi.copy_(r(J, 4, s=0.4))
         m.psi_item = P(r(C, 3, s=0.5))
         m.hist_size = P(torch.tensor(0.3))
-        m.centre_history = True
+        m.centre_history = history                      # "mean" or "inclusive"
     return m
 
 

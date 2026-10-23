@@ -8,9 +8,9 @@ Blocks added to the base model (all start at zero or small values):
     size on categories           M3: rho_0 applies to the number of categories present
     u_cat                        M4a: household taste per category, theta_h . u_c
     psi, psi_item                --recency: sub-commodity recency and product purchase history
-    hist_size                    --centre-history: centre the history shift within each trip and
-                                 learn its size effect, n * hist_size * log(1 + products ever
-                                 bought) (see v4/model.py); needs --recency
+    hist_size                    --centre-history [mean|inclusive]: centre the history shift
+                                 within each trip and learn its size effect, n * hist_size *
+                                 log(1 + products ever bought) (see v4/model.py); needs --recency
     iv_slope_raw                 --m4c: discount only the price part of category inclusive value
 
 Stages:
@@ -64,8 +64,9 @@ def parse_args():
     p.add_argument("--out", type=Path, required=True, help="output path without suffix")
     p.add_argument("--recency", action="store_true", help="add recency and purchase-history features")
     p.add_argument("--m4c", action="store_true", help="add M4c (price-only inclusive value per category)")
-    p.add_argument("--centre-history", action="store_true",
-                   help="centre the history shift within each trip and learn its size effect (needs --recency)")
+    p.add_argument("--centre-history", nargs="?", const="mean", choices=("mean", "inclusive"),
+                   help="centre the history shift within each trip (by its mean, or by its effect on the "
+                        "trip's inclusive value) and learn its size effect (needs --recency)")
     p.add_argument("--warm-start", type=Path, help="start from this Version-4 checkpoint's parameters")
     p.add_argument("--iv-init", type=float, default=0.0, help="M4c: starting logit of lambda_c")
     p.add_argument("--rank", type=int, default=16)
@@ -126,7 +127,7 @@ def add_version4_blocks(model, args, J, C):
             model.psi.zero_()
     if args.centre_history:
         model.hist_size = P(torch.zeros(()))
-        model.centre_history = True
+        model.centre_history = args.centre_history
     # M3: move the linear part of rho_0 (its slope over sizes 1..10) into lam, then let
     # rho_0 act on the number of categories present.
     model.size_on_categories = True
@@ -201,7 +202,7 @@ def main():
     if args.warm_start is not None:
         state = torch.load(args.warm_start, map_location="cpu", weights_only=False)["model"]
         missing, unexpected = model.load_state_dict(state, strict=False)
-        if unexpected or set(missing) - {"hist_size"}:
+        if set(unexpected) - {"hist_size"} or set(missing) - {"hist_size"}:
             raise SystemExit(f"--warm-start does not match this model: missing {missing}, unexpected {unexpected}")
         with torch.no_grad():
             delta.copy_(model.phi[:, :args.rank] - psi[category])
@@ -393,7 +394,7 @@ def main():
                     "additive": str(args.additive.resolve()),
                     "rank": args.rank, "max_per_category": model.R, "use_f_extra": True, "presence_phi": True, "cat_rho0": True,
                     "u_cat": True, "unfreeze_price": True, "recency": bool(args.recency),
-                    "centre_history": bool(args.centre_history), "iv_slope": bool(args.m4c), "iv_price_only": bool(args.m4c), "stage": stage,
+                    "centre_history": args.centre_history, "iv_slope": bool(args.m4c), "iv_price_only": bool(args.m4c), "stage": stage,
                     "seconds": time.time() - started, "args": {k: str(v) for k, v in vars(args).items()}},
                    path)
 

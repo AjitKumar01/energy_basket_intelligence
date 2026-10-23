@@ -16,9 +16,12 @@ BLOCKS = {
     "M2": {"presence": True},
     "M3": {"categories": True},
     "M4c": {"iv": True},
-    "history": {"history": True},
+    "history-mean": {"history": "mean"},
+    "history-inclusive": {"history": "inclusive"},
     "all": {"f_extra": True, "presence": True, "categories": True, "u_cat": True, "iv": True,
-            "discount": True, "history": True},
+            "discount": True, "history": "inclusive"},
+    "all-mean": {"f_extra": True, "presence": True, "categories": True, "u_cat": True, "iv": True,
+                 "discount": True, "history": "mean"},
 }
 
 
@@ -56,7 +59,7 @@ def test_additive_size_law():
             assert abs(float(law[t, n - 1]) - exact_p) < 1e-10
 
 
-@pytest.mark.parametrize("name", ["additive", "all"])
+@pytest.mark.parametrize("name", ["additive", "all", "all-mean"])
 def test_energy_matches_gaussian_identity(name):
     model = make_model(**BLOCKS[name])
     batch = make_batch()
@@ -206,10 +209,12 @@ def test_cap_on_products_per_category(name):
             assert abs(float(p[s]) - sum(math.exp(e - lz_t) for S, e in energies.items() if s in S)) < 1e-10
 
 
-def test_history_offset_is_the_trip_mean_plus_size_term():
-    """Centring shifts every product of a trip by o_t = mean h + hist_size log(1 + ever);
-    without centring the utilities are the raw ones."""
-    model = make_model(history=True)
+@pytest.mark.parametrize("mode", ["mean", "inclusive"])
+def test_history_offset_is_the_intended_trip_shift(mode):
+    """Centring shifts every product of a trip by o_t = c_t + hist_size log(1 + ever), with
+    c_t the mean of h ("mean") or the change of log sum exp b ("inclusive"); without centring
+    the utilities are the raw ones."""
+    model = make_model(history=mode)
     batch = make_batch()
     batch.bind(model)
     ix = batch.ix
@@ -219,7 +224,11 @@ def test_history_offset_is_the_trip_mean_plus_size_term():
     for t in range(2):
         on = ix.item_trip == t
         ever = float(batch.ctx["rec_item"][on, 0].sum())
-        o = float(h[on].mean()) + float(model.hist_size) * math.log1p(ever)
+        if mode == "mean":
+            c = float(h[on].mean())
+        else:
+            c = float(torch.logsumexp(raw[on], 0) - torch.logsumexp(raw[on] - h[on], 0))
+        o = c + float(model.hist_size) * math.log1p(ever)
         assert float((raw[on] - o - b[on]).abs().max()) < 1e-12
-    model.centre_history = False
+    model.centre_history = None
     assert float((model.slot_utilities(ix) - raw).abs().max()) == 0.0

@@ -102,6 +102,13 @@ def batcher_for(data, root, additive_blob, *, recency=False, purchase_history=Fa
 
 
 # ---- Version-4 model -------------------------------------------------------------------------------
+def _centring(value):
+    """The history-centring mode a checkpoint records (old ones stored True for "mean")."""
+    if value is True:
+        return "mean"
+    return value or None
+
+
 def version4_flags(blob) -> dict:
     """Rank and the non-parameter switches of a Version-4 checkpoint."""
     state = blob["model"]
@@ -109,7 +116,7 @@ def version4_flags(blob) -> dict:
         raise ValueError("M4b (full inclusive value) checkpoints are not supported; only M4c")
     return {"rank": int(blob["rank"]), "size_on_categories": bool(blob.get("cat_rho0", False)),
             "recency": bool(blob.get("recency", False)), "max_per_category": blob.get("max_per_category"),
-            "centre_history": bool(blob.get("centre_history", False))}
+            "centre_history": _centring(blob.get("centre_history"))}
 
 
 def load_model(path, data, root=None, *, initialization=None, additive=None):
@@ -121,7 +128,7 @@ def load_model(path, data, root=None, *, initialization=None, additive=None):
     if "rank" not in blob:                                        # additive base model
         model, meta, parent = load_additive(initialization or blob.get("initialization"), path, data, root)
         flags = {"rank": 0, "size_on_categories": False, "recency": False, "max_per_category": None,
-                 "centre_history": False}
+                 "centre_history": None}
         return model, meta, parent, flags, blob
     model, meta, parent = load_additive(initialization or blob["initialization"],
                                         additive or blob["additive"], data, root)

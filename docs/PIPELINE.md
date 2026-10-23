@@ -350,6 +350,31 @@ makes it worse: a commodity is split over 7 groups on average (soft drinks over 
    15.6 to 9.1 (real 8.1), and raises the log-likelihood on 512 validation trips by
    +0.25 ± 0.10 (+0.5 on baskets of 1–8 products, −2.3 on the 34 of 21+). Refit:
    `DATA=... FROM=runs/dunnhumby/v4_rec.pt run/dunnhumby_history.sh`.
+
+   *Refit result* (`v4_hist.pt`, 2026-10-23; warm start, 4 SML epochs + 1 calibration, 4.8 h).
+   Held-out training trips −38.325 against −38.506 for v4_rec (same 1,024 trips). The learned
+   hist_size stayed small (+0.015). Expected basket size, the same 96 trips per period:
+
+   | Weeks | Real | v4_rec | v4_rec centred, no refit | v4_hist |
+   |---|---|---|---|---|
+   | training, early | 7.33 | 5.01 | 5.90 | 6.70 |
+   | training, late | 8.04 | 10.21 | 7.59 | 9.60 |
+   | validation | 8.69 | 16.76 | 10.34 | 11.00 |
+   | test | 8.06 | 15.62 | 9.07 | 11.95 |
+
+   Recommendation (1,620 validation cases): MRR 0.121 against 0.118, recall@100 50.4% against
+   49.9%. Validation log-likelihood on the 4,096 trips: running.
+
+   The drift is much smaller but not gone (0.91× the real size early in training, 1.48× on
+   test), and the refit is worse on size than centring without refitting. Most of the excess is
+   a tail: the validation median is 7.2 while the mean is 11.0. Two likely reasons: (a) the
+   plain-mean centring is first order only; as history grows, more products carry the +0.77
+   "ever bought" shift, the spread of h widens, and through log-sum-exp a wider spread still
+   raises size; (b) hist_size is learned from training trips where early and late errors
+   partly cancel. Next: centre by the history shift's effect on the trip's inclusive value,
+   o_t = log sum_j exp(b0_tj + h_tj) - log sum_j exp(b0_tj), which removes the spread effect to
+   first order and is still a per-trip constant (exact); check it on v4_rec without a refit
+   first, as before.
 1. *Within-group competition in the model:* a learned term that changes the energy of buying a
    second product from the same group, so a price change moves purchases within the group
    instead of adding items. It goes in the exact per-group DP. Test it on the stress world

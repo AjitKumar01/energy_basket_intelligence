@@ -28,8 +28,7 @@ product rates toward the data's; these terms otherwise converge slowly.
 
 --warm-start CK starts every parameter from a Version-4 checkpoint of the same shape (blocks
 the checkpoint lacks, such as hist_size, start at zero); the price prior stays centred at the
-base model.  A checkpoint on another partition passes only its product-level blocks; the
-per-category ones (PARTITION_BLOCKS) start afresh, psi_cat at each category's mean phi.  Use it with --pl-epochs 0 to refit after a model change.
+base model.  Use it with --pl-epochs 0 to refit after a model change.
 
 Writes OUT.pt (final), OUT_pl.pt (after stage A) and OUT.log (one JSON row per epoch).
 """
@@ -113,11 +112,6 @@ def parse_args():
     p.add_argument("--seed", type=int, default=41001)
     p.add_argument("--threads", type=int, default=4)
     return p.parse_args()
-
-
-# Blocks with one entry per category; a warm start from another partition leaves them at
-# their starting values (rho_c from the base model, the others at zero, psi_cat from phi).
-PARTITION_BLOCKS = ("cat_of", "rho_c", "f_extra", "u_cat", "psi_item", "psi_cat", "iv_slope_raw", "comp_raw")
 
 
 def add_version4_blocks(model, args, J, C):
@@ -207,21 +201,11 @@ def main():
         getattr(model, n).requires_grad_(False)
     if args.warm_start is not None:
         state = torch.load(args.warm_start, map_location="cpu", weights_only=False)["model"]
-        other_partition = not torch.equal(state["cat_of"].long(), category)
-        if other_partition:                 # blocks with one entry per category start afresh
-            state = {k: v for k, v in state.items() if k not in PARTITION_BLOCKS}
         missing, unexpected = model.load_state_dict(state, strict=False)
-        allowed = {"hist_size"} | (set(PARTITION_BLOCKS) if other_partition else set())
-        if set(unexpected) - {"hist_size"} or set(missing) - allowed:
+        if set(unexpected) - {"hist_size"} or set(missing) - {"hist_size"}:
             raise SystemExit(f"--warm-start does not match this model: missing {missing}, unexpected {unexpected}")
         with torch.no_grad():
-            if other_partition:             # category vector = mean of its products' phi; phi unchanged
-                counts = torch.bincount(category, minlength=C).clamp_min(1).double()
-                psi.copy_(torch.zeros(C, args.rank).index_add_(0, category, model.phi[:, :args.rank])
-                          / counts[:, None])
             delta.copy_(model.phi[:, :args.rank] - psi[category])
-        emit({"event": "warm_start", "from": str(args.warm_start), "other_partition": other_partition,
-              "fresh": sorted(set(missing))})
     rec_params = [model.psi, model.psi_item] if args.recency else []
     if args.centre_history:
         rec_params.append(model.hist_size)

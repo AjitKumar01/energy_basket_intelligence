@@ -50,10 +50,13 @@ class Truth:
     def __init__(self, world_dir: Path):
         gen = load_generator()
         meta = json.loads((world_dir / "truth.json").read_text())
-        args = gen.argparse.Namespace(seed=meta["seed"], households=3000, stores=meta["stores"], departments=6,
-                                      categories_per_department=8, mission_variants=1, weeks=meta["weeks"],
-                                      train_weeks=meta["train_weeks"], validation_weeks=meta["validation_weeks"],
-                                      scenario_products=16, category_growth=meta.get("category_growth", 0.0))
+        if "args" in meta:                                   # worlds that record every setting
+            args = gen.argparse.Namespace(**meta["args"])
+        else:                                                # older worlds: the defaults they were made with
+            args = gen.argparse.Namespace(seed=meta["seed"], households=3000, stores=meta["stores"], departments=6,
+                                          categories_per_department=8, mission_variants=1, weeks=meta["weeks"],
+                                          train_weeks=meta["train_weeks"], validation_weeks=meta["validation_weeks"],
+                                          scenario_products=16, category_growth=meta.get("category_growth", 0.0))
         rng = np.random.default_rng(args.seed)
         world = gen.World(args, rng)
         H, S, T = args.households, args.stores, args.weeks

@@ -108,7 +108,7 @@ class World:
         self.intensity = rng.gamma(2.0, 0.6, H)
         self.visit_rate = rng.beta(1.1, 3.0, H)
         self.home = rng.integers(0, S, H)
-        self.price_sens = np.exp(rng.normal(0.4, 0.5, H))      # household price sensitivity
+        self.price_sens = np.exp(rng.normal(float(getattr(args, "price_sens_mean", 0.4)), 0.5, H))  # household price sensitivity
         self.taste0 = rng.normal(0, 0.6, (H, 3))
         self.idiosyncratic = rng.normal(0, 0.5, (H, J)) * (rng.random((H, J)) < 0.15)
         # prices and promotions (chain level), weekly
@@ -116,6 +116,11 @@ class World:
         promo = rng.random((J, T)) < 0.07
         self.price = np.round(self.base_price[:, None] * np.exp(log_mult) * np.where(promo, 0.75, 1.0), 2)
         self.promo = promo
+        if getattr(args, "display_separate", False):
+            # displays on their own schedule (separate stream, so the rest of the world is unchanged):
+            # the 25% price cuts stay where they are, and the display bonus and stockpiling follow
+            # the displays, so price and display effects can be told apart
+            self.promo = np.random.default_rng([args.seed, 5151]).random((J, T)) < 0.07
         # assortment: launches seen in the retail feed, and unrecorded stockouts
         first = np.where(rng.random((J, S)) < 0.85, 1, T + 1).astype(np.int16)
         launched = rng.choice(J, size=J // 10, replace=False)
@@ -237,6 +242,10 @@ def main():
     p.add_argument("--train-weeks", type=int, default=32)
     p.add_argument("--validation-weeks", type=int, default=10)
     p.add_argument("--scenario-products", type=int, default=16)
+    p.add_argument("--price-sens-mean", type=float, default=0.4,
+                   help="mean of the households' log price sensitivity (higher: price cuts move more)")
+    p.add_argument("--display-separate", action="store_true",
+                   help="displays on their own schedule instead of always with the 25%% price cut")
     p.add_argument("--category-growth", type=float, default=0.0,
                    help="inclusive-value slope lambda on category need and variety-seeking "
                         "probabilities (0: pure within-category switching)")
@@ -389,6 +398,7 @@ def main():
          "item_ids": "original product ids; observed.npz original_item maps modeled item ids to them",
          "scenarios": scenarios}) + "\n")
     summary = {"seed": args.seed, "category_growth": float(args.category_growth),
+               "args": {k: (str(v) if isinstance(v, Path) else v) for k, v in vars(args).items()},
                "households_with_trips": int(len(customers)), "stores": S, "products": J,
                "products_simulated": J_all,
                "categories": C, "weeks": T, "train_weeks": args.train_weeks,

@@ -15,8 +15,11 @@ parts, the revenue per commodity, and the uplift over the same week without prom
 Purchase probabilities come from the model (THEORY.md section 7):
     simulator="base"  the exact base model (fast: about a second per step)
     simulator="v4"    a Version-4 model: latent draws are taken once per week at the
-                      factual prices and reused for every action, each reweighted exactly
-                      by Z_new(z) / Z_old(z) (minutes per step; for evaluating policies)
+                      factual prices and reused for every action (minutes per step; for
+                      evaluating policies).  latent="reweight" weights each draw exactly by
+                      Z_new(z) / Z_old(z), the law's own counterfactual; latent="fixed" keeps
+                      the draws' equal weights, i.e. each trip's latent state is held fixed
+                      and only the basket given z responds (much smaller halo; checks/halo.py)
 
 A discount lowers the product's log price by log(1 - d) and, with a discount panel, its
 discount depth by the same amount, so the model's discount slope applies.
@@ -54,7 +57,7 @@ class PromotionEnv(gym.Env):
 
     def __init__(self, checkpoint, *, simulator="base", data_root_path=None, initialization=None,
                  weeks=None, n_categories=12, levels=(0.0, 0.1, 0.2, 0.3), trips_per_week=500,
-                 draws=32, burn=100, batch=128, seed=0, threads=4):
+                 draws=32, burn=100, batch=128, seed=0, threads=4, latent="reweight"):
         super().__init__()
         torch.set_default_dtype(torch.float64)
         torch.set_num_threads(threads)
@@ -72,6 +75,9 @@ class PromotionEnv(gym.Env):
         freeze(self.model)
         self.levels = np.asarray(levels, dtype=float)
         self.draws, self.burn, self.batch = draws, burn, batch
+        if latent not in ("reweight", "fixed"):
+            raise ValueError("latent must be 'reweight' or 'fixed'")
+        self.latent = latent
 
         meta_split = self.data["trip_split"]
         weeks_all = self.data["trip_week"]
@@ -145,6 +151,8 @@ class PromotionEnv(gym.Env):
             return incidence(m, ix, m.slot_utilities(ix))[1]
         iv = m.iv_shift(ix)
         out = [incidence(m, ix, m.slot_utilities_given_z(ix, z), z=z, iv=iv) for z in zs]
+        if self.latent == "fixed":
+            return torch.stack([o[1] for o in out], 1).mean(1)
         w = torch.softmax(torch.stack([o[0] for o in out], 1) - lz0, 1)
         return (torch.stack([o[1] for o in out], 1) * w[ix.item_trip]).sum(1)
 

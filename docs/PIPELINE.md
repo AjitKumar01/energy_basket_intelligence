@@ -332,9 +332,14 @@ makes it worse: a commodity is split over 7 groups on average (soft drinks over 
 - **Basket size drifts with time** through the purchase-history features (above).
 - **The halo and too little switching** (above). This affects every price and promotion
   counterfactual on real data.
-- **Display is too weak**, and Version 4 made it weaker (0.06 purchase-weighted, against 0.38–0.43
-  in the data). Likely cause: display is learned separately per product with no pooling, while
-  in Dunnhumby display nearly always comes with a discount.
+- **Display weights of rarely displayed products are wrong.** Display is learned separately per
+  product with no prior. About 860 products were displayed but never bought on display; their
+  weights run to about −3 to −4, and each Version-4 epoch pushes them further. That is 85% of
+  the negative display weights (34% of the catalogue in the base model, 38% in Version 4), so
+  displaying such a product in a counterfactual predicts a fall. Where display actually happens
+  the weights are sound (+0.34 base, +0.31 Version 4, weighted by display trips), and the real
+  display effect is matched (item 4). The discount check's near-zero display effect is the same
+  tail: it switches display on across all discount events, 90% of which are never displayed.
 - **The discount response overshoots** (1.42 in Version 4, 1.30 in the base model, against
   0.64–1.07 in the data).
 - On the stress world the own-price response is about 1.7× too strong on average.
@@ -427,13 +432,28 @@ makes it worse: a commodity is split over 7 groups on average (soft drinks over 
    1,560 store-weeks (70 stores, at least 30 trips each), store and week fixed effects, the 60
    most-bought commodities. 100 more products on display elsewhere in the store change the
    other commodities' items per trip by **−0.15 in the data** (± 0.03 if the commodities were
-   independent) and by **+0.46 in the base model** on the same trips. Own display effects
-   agree (+46% vs +36% per 10 products). So the model's halo has the wrong sign on real data.
-   Version 4 (`v4_hist`, 12 trips per store-week, 16 latent draws): halo **+0.35** (± 0.03),
-   own display only **+14%**: the latent term shrinks the halo a little but also most of
-   the display effect (item 5).
-5. *Promotions:* a common display slope with per-product variation shrunk toward it, and a
-   firmer prior on the promotion weights during Version-4 training.
+   independent) and by **+0.46 in the base model** on the same trips. So the model's halo has
+   the wrong sign on real data. Version 4 (`v4_hist`, 12 trips per store-week, 16 latent
+   draws): halo **+0.35** (± 0.03): the latent term shrinks the halo only a little.
+   Own display effect per 10 products, relative to the commodity's items per trip:
+
+   | | data | base | Version 4 |
+   |---|---|---|---|
+   | plain mean, 60 commodities | +46% | +36% | +14% |
+   | 48 well-measured commodities (data relative se < 0.5) | +13.6% | +17.0% | +16.1% |
+   | weighted by the data's precision | +2.7% | +6.2% | +6.0% |
+
+   The plain mean is dominated by a few produce commodities that are almost never displayed
+   (PEPPERS-ALL alone is +12.4 ± 3.5 in the data, adding +0.23 to the mean), so the earlier
+   reading "Version 4 loses most of the display effect" was wrong: on the measurable
+   commodities both models match the data, slightly above it. (Version 4 was also run at 12
+   trips per store-week against 24 for the base model; compare at the same `--model-trips`.)
+5. *Promotions:* the display problem is the rarely displayed products (Known weaknesses), not
+   the real display effect. Fix: a common display slope (and mailer slope) with per-product
+   deviations shrunk to zero, held fixed during pseudo-likelihood. Small enough to fold into
+   the next Version-4 fit, not a separate refit. Judge it by the share of negative weights
+   and the precision-weighted own effect, not the plain mean. Diagnosis:
+   `v4-promotions` branch, `checks/diagnose_display.py`.
 6. Then the promotion environment, the test weeks for the chosen model, and SHOPPER on Dunnhumby.
 
 ## 8. Commands

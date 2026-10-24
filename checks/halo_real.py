@@ -17,6 +17,14 @@ standard errors clustered by store.  b_halo is the halo: the change in k's items
 when 100 more products elsewhere in the store are on display.  Summed over the commodities,
 it is the change in all other items per trip.
 
+The own display effect is reported relative to each commodity's items per trip.  Its plain
+mean over commodities (own_mean_relative) is dominated by a few produce commodities that are
+almost never displayed (one product in a few store-weeks), whose estimates are huge and noisy
+in the data and the model alike.  So it is also averaged over the well-measured commodities
+(relative standard error in the data below 0.5) and weighted by the data's precision; both use
+the data's standard errors, so data and model are averaged over the same commodities with the
+same weights.  Compare models at the same --model-trips.
+
 With --checkpoint the same regression is run on the model's expected items per trip, from
 up to --model-trips trips per store-week with their real households and features (exact
 incidence for a base model; for Version 4 the latent state is drawn once per trip at the
@@ -97,6 +105,26 @@ def model_items(model, batcher, trips, commodity_of, K, draws, gen):
     return out
 
 
+def own_summaries(data_rows, rows, max_rse=0.5):
+    """Own display effect averaged over the well-measured commodities and weighted by precision,
+    both judged by the data's standard errors."""
+    rse = np.array([r["own_se"] / r["mean_items_per_trip"] for r in data_rows])
+    rel = np.array([r["own"] / r["mean_items_per_trip"] for r in rows])
+    ok = np.isfinite(rse) & np.isfinite(rel)
+    good, w = ok & (rse < max_rse), np.where(ok, 1.0 / np.where(ok, rse, 1.0) ** 2, 0.0)
+    return {"own_mean_relative_well_measured": float(rel[good].mean()),
+            "own_well_measured_commodities": int(good.sum()),
+            "own_precision_weighted_relative": float(np.sum(w[ok] * rel[ok]) / w[ok].sum())}
+
+
+def summarise(report):
+    """Add the own-effect summaries to a report (also for reports written before they existed)."""
+    for part in ("data", "model"):
+        if part in report:
+            report[part].update(own_summaries(report["data"]["commodities"], report[part]["commodities"]))
+    return report
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     p.add_argument("--checkpoint", type=Path)
@@ -110,7 +138,15 @@ def main():
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--threads", type=int, default=4)
     p.add_argument("--out", type=Path, required=True)
+    p.add_argument("--summarise", action="store_true", help="only add the own-effect summaries to an existing --out")
     a = p.parse_args()
+    if a.summarise:
+        report = summarise(json.loads(a.out.read_text()))
+        a.out.write_text(json.dumps(report, indent=1) + "\n")
+        for part in ("data", "model"):
+            if part in report:
+                print(part, json.dumps({k: v for k, v in report[part].items() if k != "commodities"}))
+        return
     torch.set_num_threads(a.threads)
     root = data_root(a.data_root)
     data = load_bundle(root)
@@ -194,6 +230,9 @@ def main():
         y_model /= np.bincount(ccell, minlength=len(cells)).clip(1)[:, None]
         report["model"] = {"checkpoint": str(a.checkpoint), "trips": int(len(chosen)), **fit(y_model)}
         print(json.dumps({k: v for k, v in report["model"].items() if k != "commodities"}), flush=True)
+    summarise(report)
+    if "model" in report:
+        print(json.dumps({k: v for k, v in report["model"].items() if k.startswith("own_")}), flush=True)
     a.out.write_text(json.dumps(report, indent=1) + "\n")
 
 

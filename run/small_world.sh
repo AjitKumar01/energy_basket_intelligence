@@ -6,15 +6,20 @@
 #   OUT      folder to write (required)
 #   GEN      extra generator flags, e.g. "--seed 3 --category-growth 0.45 --display-separate"
 #   THREADS  threads per job (default 2)
+#   ADD      extra fit_additive.py flags (optional; record them, worlds are only comparable under the same fit)
+#   WORLD    an existing world to use instead of OUT/world (then start at FROM=2 or later)
+#   INIT     initialization to use (default OUT/initialization.pt)
+#   BASE     base model to use (default OUT/additive/v3_pipeline_additive_best.pt)
 #   FROM     first stage: 1 generate, 2 base model, 3 Version 4, 4 promotion check (default 1)
 set -euo pipefail
 cd "$(dirname "$0")/.."
 OUT=${OUT:?set OUT to the folder to write}
 GEN=${GEN:-}
+ADD=${ADD:-}
 THREADS=${THREADS:-2}
 FROM=${FROM:-1}
 export OMP_NUM_THREADS=$THREADS
-W=$OUT/world; D=$W/model_input_category
+W=${WORLD:-$OUT/world}; D=$W/model_input_category
 mkdir -p "$OUT"
 stage() { [[ $1 -ge $FROM ]]; }
 timed() {  # name, command...
@@ -32,13 +37,13 @@ if stage 1; then
     --canonical "$W/canonical" --out "$D" > "$OUT/1_bundle.log" 2>&1
 fi
 export ENERGY_MODEL_DATA_ROOT=$D
-I=$OUT/initialization.pt; B=$OUT/additive/v3_pipeline_additive_best.pt
+I=${INIT:-$OUT/initialization.pt}; B=${BASE:-$OUT/additive/v3_pipeline_additive_best.pt}
 
 # 2. The exact base model.
 if stage 2; then
   timed initialize python3 scripts/initialize.py --output "$I" --threads "$THREADS" > "$OUT/2_initialize.log" 2>&1
   timed additive python3 -u scripts/fit_additive.py --artifact "$I" --output-dir "$OUT/additive" \
-    --require-convergence --threads "$THREADS" > "$OUT/2_additive.log" 2>&1
+    --require-convergence --threads "$THREADS" $ADD > "$OUT/2_additive.log" 2>&1
 fi
 
 # 3. Version 4: no competition, and competition with lambda from the price instrument.

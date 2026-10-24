@@ -378,6 +378,18 @@ makes it worse: a commodity is split over 7 groups on average (soft drinks over 
    o_t = log sum_j exp(b0_tj + h_tj) - log sum_j exp(b0_tj), which removes the spread effect to
    first order and is still a per-trip constant (exact); check it on v4_rec without a refit
    first, as before.
+
+   *Inclusive centring, refitted* (`--centre-history inclusive`, warm-started from v4_hist,
+   one pseudo-likelihood epoch, hist_size −0.065). Expected size by period, 96 trips each
+   (mean, with the median in brackets; real 7.33 / 8.04 / 8.69 / 8.06):
+   inclusive 6.71 (4.7) / 8.53 (7.1) / 12.16 (7.9) / 16.93 (9.0), against mean centring
+   6.70 (5.0) / 9.60 (7.4) / 11.00 (7.2) / 11.95 (7.0). Validation log-likelihood on the
+   4,096 trips **−39.749, +0.071 ± 0.021 per basket over mean centring**; MRR 0.123 against
+   0.121 (± 0.007); on the 1,024 held-out training trips it is slightly behind (−38.372 against
+   −38.325). So inclusive centring fits a little better but does not stop the drift; its
+   mean size on the test weeks is larger (the tail grows), its median slightly closer.
+   Mean centring is kept for the next refits (the commodity partition): simpler and less
+   drift where it matters for generation; the remaining drift is a tail to study separately.
 1. *Within-group competition in the model:* a learned term that changes the energy of buying a
    second product from the same group, so a price change moves purchases within the group
    instead of adding items. It goes in the exact per-group DP. Test it on the stress world
@@ -417,7 +429,9 @@ makes it worse: a commodity is split over 7 groups on average (soft drinks over 
    other commodities' items per trip by **−0.15 in the data** (± 0.03 if the commodities were
    independent) and by **+0.46 in the base model** on the same trips. Own display effects
    agree (+46% vs +36% per 10 products). So the model's halo has the wrong sign on real data.
-   The Version-4 run is pending.
+   Version 4 (`v4_hist`, 12 trips per store-week, 16 latent draws): halo **+0.35** (± 0.03),
+   own display only **+14%**: the latent term shrinks the halo a little but also most of
+   the display effect (item 5).
 5. *Promotions:* a common display slope with per-product variation shrunk toward it, and a
    firmer prior on the promotion weights during Version-4 training.
 6. Then the promotion environment, the test weeks for the chosen model, and SHOPPER on Dunnhumby.

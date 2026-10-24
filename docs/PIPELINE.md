@@ -398,6 +398,17 @@ makes it worse: a commodity is split over 7 groups on average (soft drinks over 
    `latent="fixed"` (`sim/run_policies.py --latent fixed`).
 3. *A partition that keeps rivals together on Dunnhumby:* commodities, or affinity groups split
    by commodity; then refit Steps 3 and 4.
+   *Status (2026-10-24).* One group per commodity (`scripts/build_commodity_partition.py`):
+   187 groups, largest 236 products (soft drinks), median 14, no residual group. The exact
+   dynamic program costs (products offered) x R per trip whatever the group sizes, so no cap
+   is needed. `run/commodity_bundle.sh` makes a linked copy of the bundle with this partition
+   and its own fingerprint; `run/commodity.sh` refits on it, warm-started from the co-purchase
+   fits (all product-level blocks; the per-category ones start afresh).
+   Base model: validation LL **−44.655** (co-purchase partition −44.706, same 1,024 trips).
+   Real halo +0.45 (co-purchase +0.46, data −0.15), own display +36%, discount depth slope 1.28
+   (1.30): **the partition alone does not change the halo**, as on the stress world, where the
+   true categories as partition still had it. It is what lets the competition term (item 1)
+   act on true rivals. Version 4 on this partition is next.
 4. *Measure the real halo:* when one commodity is discounted in a store-week, do other
    commodities' purchases per trip move? *Done* (`checks/halo_real.py`). Discount depth is
    chain-wide here, so the comparison uses display, which varies by store within a week:

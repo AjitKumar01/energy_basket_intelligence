@@ -12,6 +12,9 @@ Blocks added to the base model (all start at zero or small values):
                                  within each trip and learn its size effect, n * hist_size *
                                  log(1 + products ever bought) (see v4/model.py); needs --recency
     iv_slope_raw                 --m4c: discount only the price part of category inclusive value
+    comp_raw                     --within-competition: products of a category compete for price
+                                 and promotion changes (see v4/model.py and v4/competition_iv.py);
+                                 not with --m4c
 
 Stages:
     A  pseudo-likelihood (--pl-epochs): warms up phi with exact conditionals
@@ -50,6 +53,7 @@ torch.set_default_dtype(torch.float64)
 
 from v4.bundle import data_root, load_bundle, supported_trips  # noqa: E402
 from v4.checkpoints import batcher_for, load_additive  # noqa: E402
+from v4.competition_iv import estimate_competition_iv  # noqa: E402
 from v4.constraints import category_capacities  # noqa: E402
 from v4.exact import log_partition  # noqa: E402
 from v4.sampling import gibbs, importance_log_z  # noqa: E402
@@ -63,13 +67,18 @@ def parse_args():
     p.add_argument("--data-root", type=Path, help="model-data bundle (default $ENERGY_MODEL_DATA_ROOT)")
     p.add_argument("--out", type=Path, required=True, help="output path without suffix")
     p.add_argument("--recency", action="store_true", help="add recency and purchase-history features")
-    p.add_argument("--m4c", action=argparse.BooleanOptionalAction, default=True,
-                   help="add M4c within-category price competition (default: enabled)")
+    p.add_argument("--m4c", action="store_true", help="add M4c (price-only inclusive value per category)")
     p.add_argument("--centre-history", nargs="?", const="mean", choices=("mean", "inclusive"),
                    help="centre the history shift within each trip (by its mean, or by its effect on the "
                         "trip's inclusive value) and learn its size effect (needs --recency)")
     p.add_argument("--warm-start", type=Path, help="start from this Version-4 checkpoint's parameters")
     p.add_argument("--iv-init", type=float, default=0.0, help="M4c: starting logit of lambda_c")
+    p.add_argument("--within-competition", action="store_true",
+                   help="within-category competition for price and promotion changes (learned lambda_c)")
+    p.add_argument("--comp-estimator", choices=("instrument", "likelihood"), default="instrument",
+                   help="estimator for within-category competition lambda_c: 'instrument' (exogenous "
+                        "price-instrument Wald IV, default) or 'likelihood' (SML gradient steps)")
+    p.add_argument("--comp-init", type=float, default=0.0, help="competition: starting logit of lambda_c")
     p.add_argument("--rank", type=int, default=16)
     p.add_argument("--max-per-category", type=int,
                    help="largest number of products from one category in a basket (default: nmax); "
@@ -100,7 +109,6 @@ def parse_args():
     p.add_argument("--mm-rho", type=float, default=0.2)
     p.add_argument("--mm-rho0", type=float, default=0.5)
     p.add_argument("--mm-lam", type=float, default=0.5)
-    p.add_argument("--mm-iv", type=float, default=0.5)
     p.add_argument("--pool-prod", type=float, default=0.5)
     p.add_argument("--phi-prec", type=float, default=20.0)
     p.add_argument("--delta-prec", type=float, default=200.0)
@@ -123,6 +131,8 @@ def add_version4_blocks(model, args, J, C):
     model.u_cat = P(torch.zeros(C, model.theta.shape[1]))
     if args.m4c:
         model.iv_slope_raw = P(torch.full((C,), float(args.iv_init)))
+    if args.within_competition:
+        model.comp_raw = P(torch.full((C,), float(args.comp_init)))
     if args.recency:
         model.psi_item = P(torch.zeros(C, 3))
         with torch.no_grad():
@@ -154,6 +164,8 @@ def main():
         raise SystemExit("--val-trips must be positive (early stopping needs held-out trips)")
     if args.centre_history and not args.recency:
         raise SystemExit("--centre-history needs --recency")
+    if args.within_competition and args.m4c:
+        raise SystemExit("--within-competition and --m4c cannot be combined")
     torch.set_num_threads(args.threads)
     root = data_root(args.data_root)
     data = load_bundle(root)
@@ -193,23 +205,26 @@ def main():
     if args.max_per_category is not None:
         model.R = min(model.R, args.max_per_category)
 
-    # Price slopes gamma and beta (and, without --recency, the unused recency loading psi)
-    # stay at the base model's values during stage A and are trained from stage B under a
-    # centred prior; price_kappa adapts from stage A so relative price sensitivity matches
-    # the within-category competition regime.
+    # Price (and, without --recency, the unused recency loading psi) stays at the base
+    # model's values during stage A and is trained from stage B under a centred prior.
     price_names = ("gamma", "beta", "price_kappa") + tuple(
         n for n in ("disc_kappa", "disc_common") if getattr(model, n) is not None) + (
         () if args.recency else ("psi",))
     price_init = {n: getattr(model, n).detach().clone() for n in price_names}
     for n in price_names:
-        getattr(model, n).requires_grad_(n == "price_kappa" and bool(args.m4c))
+        getattr(model, n).requires_grad_(False)
     if args.warm_start is not None:
         state = torch.load(args.warm_start, map_location="cpu", weights_only=False)["model"]
         missing, unexpected = model.load_state_dict(state, strict=False)
-        if set(unexpected) - {"hist_size"} or set(missing) - {"hist_size"}:
+        if set(unexpected) - {"hist_size"} or set(missing) - {"hist_size", "comp_raw"}:
             raise SystemExit(f"--warm-start does not match this model: missing {missing}, unexpected {unexpected}")
         with torch.no_grad():
             delta.copy_(model.phi[:, :args.rank] - psi[category])
+    use_comp_iv = args.within_competition and args.comp_estimator == "instrument"
+    if use_comp_iv:
+        model.comp_raw.requires_grad_(False)
+        iv_stats = estimate_competition_iv(model, batches, batcher)
+        emit({"event": "comp_iv_init", **iv_stats})
     rec_params = [model.psi, model.psi_item] if args.recency else []
     if args.centre_history:
         rec_params.append(model.hist_size)
@@ -224,13 +239,11 @@ def main():
 
     # Data rates used to precondition the moment-matching steps.
     with torch.no_grad():
-        k_counts, pair_sum, item_counts, cat_present, iv_cov, iv_info = (
-            torch.zeros(nmax + 1), torch.zeros(C), torch.zeros(J), torch.zeros(C),
-            torch.zeros(C), torch.zeros(C))
+        k_counts, pair_sum, item_counts, cat_present = (
+            torch.zeros(nmax + 1), torch.zeros(C), torch.zeros(J), torch.zeros(C))
         chains = []                                         # persistent SML chains, from the data
         for trips in batches:
             bt = batcher.make(trips)
-            bt.bind(model)
             chains.append(bt.observed.clone())
             n_row = torch.zeros(bt.ix.n_rows).index_add_(0, bt.ix.row_of, bt.observed.double())
             if int(n_row.max()) >= model.R:      # keeps every observed basket (and PL step) inside the cap
@@ -241,29 +254,10 @@ def main():
             pair_sum.index_add_(0, bt.ix.row_cat, model.pair_feature(n_row))
             cat_present.index_add_(0, bt.ix.row_cat, (n_row > 0).double())
             item_counts.index_add_(0, bt.ix.item, bt.observed.double())
-            if args.m4c:
-                inst = model.iv_instrument(bt.ix)
-                iv_cov.index_add_(0, bt.ix.row_cat, n_row * inst)
-                iv_info.index_add_(0, bt.ix.row_cat, n_row * inst.square())
         rate_k = (k_counts[1:] / N).clamp_min(2e-3)
         rate_pairs = (pair_sum / N).clamp_min(5e-3)
         rate_item = (item_counts / N).clamp_min(2e-3)
         rate_present = cat_present / N
-
-    def _update_iv_eb(cov, info):
-        """Empirical-Bayes moment update for lambda_c from the training data's category
-        counts and centred price/promotion inclusive-value shift."""
-        rate_cov = cov / N
-        rate_iv = (info / N).clamp_min(1e-4)
-        total_info = rate_iv.sum()
-        pooled_lam = (rate_cov.sum() / total_info).clamp(0.01, 0.99)
-        prior_info = 10.0 * (total_info / C)
-        lam_eb = ((rate_cov + prior_info * pooled_lam) / (rate_iv + prior_info)).clamp(0.01, 0.99)
-        model.iv_slope_raw.copy_(torch.logit(lam_eb))
-
-    with torch.no_grad():
-        if args.m4c and args.warm_start is None:
-            _update_iv_eb(iv_cov, iv_info)
 
     def sync_phi():
         with torch.no_grad():
@@ -286,8 +280,6 @@ def main():
 
     def run_stage(name, epochs, step_fn, *, lr_base, lr_lam, lr_phi, lr_price=0.0, lr_u_cat=0.0,
                   lr_rec=0.0, lr_iv=0.0, average=False, monitor=False, moments=False):
-        if args.m4c:
-            model.iv_slope_raw.requires_grad_(False)
         groups = [{"params": [getattr(model, n) for n in CONTEXT_NAMES], "lr": lr_base},
                   {"params": [model.lam], "lr": lr_lam},
                   {"params": [model.rho_c], "lr": args.lr_rho},
@@ -295,14 +287,11 @@ def main():
                   {"params": [psi, delta], "lr": lr_phi},
                   {"params": [model.f_extra], "lr": 0.2 * args.lr_rho}]
         extra = [model.f_extra]
-        other_price = [getattr(model, n) for n in price_names
-                       if n != "price_kappa" and getattr(model, n).requires_grad]
-        kappa_param = [model.price_kappa] if model.price_kappa.requires_grad else []
-        lr_kappa = max(8.0 * lr_price, 8.0 * lr_base)
         for params, lr in (([model.u_cat], lr_u_cat),
+                           ([model.iv_slope_raw] if args.m4c else [], lr_iv),
+                           ([model.comp_raw] if (args.within_competition and not use_comp_iv) else [], lr_iv),
                            (rec_params, lr_rec),
-                           (other_price, lr_price),
-                           (kappa_param, lr_kappa)):
+                           ([getattr(model, n) for n in price_names if getattr(model, n).requires_grad], lr_price)):
             if params and lr > 0.0:
                 groups.append({"params": params, "lr": lr})
                 extra.extend(params)
@@ -310,7 +299,6 @@ def main():
         total = epochs * len(batches)
         decay = args.lr_final_ratio ** (1.0 / max(total - 1, 1))
         mm = (args.mm_rho, args.mm_rho0, args.mm_lam) if moments else (0.0, 0.0, 0.0)
-        mm_iv = args.mm_iv if (args.m4c and lr_iv > 0.0) else 0.0
         avg, n_avg, step = None, 0, 0
         best_ll, best_state, bad = -float("inf"), None, 0
         for epoch in range(1, epochs + 1):
@@ -318,7 +306,6 @@ def main():
             values, sizes, model_present = [], [], torch.zeros(C)
             g_sums = [torch.zeros_like(model.rho_0_free), torch.zeros_like(model.rho_c),
                       torch.zeros_like(model.lam)]
-            iv_cov_ep, iv_info_ep = torch.zeros(C), torch.zeros(C)
             for i in rng.permutation(len(batches)):
                 step += 1
                 bt = batcher.make(batches[i])
@@ -337,12 +324,6 @@ def main():
                                      model.rho_c.grad.detach().clone(), model.lam.grad.detach().clone())
                 for s, gr in zip(g_sums, (g_r0, g_rc, g_lam)):
                     s.add_(gr)
-                if mm_iv > 0.0:
-                    with torch.no_grad():
-                        n_obs = torch.zeros(bt.ix.n_rows).index_add_(0, bt.ix.row_of, bt.observed.double())
-                        inst = model.iv_instrument(bt.ix)
-                        iv_cov_ep.index_add_(0, bt.ix.row_cat, n_obs * inst)
-                        iv_info_ep.index_add_(0, bt.ix.row_cat, n_obs * inst.square())
                 torch.nn.utils.clip_grad_norm_(base + extra + [psi, delta], 10.0)
                 opt.step()
                 sync_phi()
@@ -374,7 +355,7 @@ def main():
                         k: (avg[k] + (state[k] - avg[k]) / (n_avg + 1)) if state[k].is_floating_point()
                         else state[k] for k in state}
                     n_avg += 1
-            if any(mm) or mm_iv > 0.0:                      # one damped full-data step per epoch
+            if any(mm):                                     # one damped full-data step per epoch
                 with torch.no_grad():
                     r0, rc, la = (s / len(batches) for s in g_sums)
                     if mm[1] > 0.0:
@@ -383,9 +364,11 @@ def main():
                         model.rho_c.sub_(0.5 * (rc / rate_pairs).clamp(-0.5, 0.5))
                     if mm[2] > 0.0:
                         model.lam.sub_(0.35 * (la / rate_item).clamp(-0.35, 0.35))
-                    if mm_iv > 0.0:
-                        _update_iv_eb(iv_cov_ep, iv_info_ep)
                 project(model, capacities, opt)
+            if use_comp_iv:
+                estimate_competition_iv(model, batches, batcher)
+                if avg is not None:
+                    avg["comp_raw"] = model.comp_raw.detach().clone()
             sv = torch.linalg.svdvals(model.phi_r().detach())
             row = {"stage": name, "epoch": epoch, "objective": float(np.mean(values)),
                    "phi_eig_top3": [round(float(v), 3) for v in sv[:3] ** 2],
@@ -395,6 +378,10 @@ def main():
                 lam_c = model.iv_lambda().detach()
                 row.update(iv_slope_mean=round(float(lam_c.mean()), 4), iv_slope_min=round(float(lam_c.min()), 4),
                            iv_slope_max=round(float(lam_c.max()), 4))
+            if args.within_competition:
+                lam_c = model.comp_lambda().detach()
+                row.update(comp_lambda_mean=round(float(lam_c.mean()), 4), comp_lambda_min=round(float(lam_c.min()), 4),
+                           comp_lambda_max=round(float(lam_c.max()), 4))
             if sizes:
                 gap = (model_present / N - rate_present).abs()
                 if args.centre_history:
@@ -406,6 +393,9 @@ def main():
                 current = {k: v.detach().clone() for k, v in model.state_dict().items()}
                 scored = avg if avg is not None else current
                 model.load_state_dict(scored)
+                if use_comp_iv:
+                    estimate_competition_iv(model, batches, batcher)
+                    scored["comp_raw"] = model.comp_raw.detach().clone()
                 ll, ess = validation_ll()
                 row.update(val_ll=round(ll, 4), val_ess=round(ess, 4))
                 if ll > best_ll + args.val_tol:
@@ -426,6 +416,8 @@ def main():
             model.load_state_dict(best_state)
         elif avg is not None:
             model.load_state_dict(avg)
+        if use_comp_iv:
+            estimate_competition_iv(model, batches, batcher)
         with torch.no_grad():                               # re-derive delta from the kept phi
             delta.copy_(model.phi[:, :args.rank] - psi[category])
 
@@ -435,7 +427,9 @@ def main():
                     "additive": str(args.additive.resolve()),
                     "rank": args.rank, "max_per_category": model.R, "use_f_extra": True, "presence_phi": True, "cat_rho0": True,
                     "u_cat": True, "unfreeze_price": True, "recency": bool(args.recency),
-                    "centre_history": args.centre_history, "iv_slope": bool(args.m4c), "iv_price_only": bool(args.m4c), "stage": stage,
+                    "centre_history": args.centre_history, "within_competition": bool(args.within_competition),
+                    "comp_estimator": args.comp_estimator if args.within_competition else None,
+                    "iv_slope": bool(args.m4c), "iv_price_only": bool(args.m4c), "stage": stage,
                     "seconds": time.time() - started, "args": {k: str(v) for k, v in vars(args).items()}},
                    path)
 

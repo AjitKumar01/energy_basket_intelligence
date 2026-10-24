@@ -4,8 +4,8 @@ Given z (or with phi = 0) the energy has no pairwise product term, so baskets fa
 categories.  For each (trip, category) row:
 
     e_k        = sum over k-subsets of the row's products of prod exp(u_j)   (ESP, R >= k)
-    g_c(k)     = e_k * exp(-rho_c C(k, 2) - f_c(k) - k_extra * presence_shift
-                           + k * iv_shift)                                     (category polynomial)
+    g_c(k)     = e_k * exp(-rho_c C(k, 2) - f_c(k) - k_extra * presence_shift)
+                 * exp(iv_shift) if k >= 1                                     (category polynomial)
 
 and the trip's total weight of baskets with n products is the coefficient of t^n in
 prod_c g_c(t), weighted by exp(-rho_0(n)).  With M3 the product also tracks the number of
@@ -80,8 +80,8 @@ def category_polynomials(model, ix, u, *, z=None, beta=1.0, iv=None):
     shift = model.presence_shift(ix, z, beta=beta)    # M2: per extra product of the category
     if shift is not None:
         log_g = log_g - shift[:, None] * (k - 1.0).clamp_min(0.0)[None, :]
-    if iv is not None:                                # M4c: per product of the category
-        log_g = log_g + iv[:, None] * k[None, :]
+    if iv is not None:                                # M4c: once per category present
+        log_g = torch.cat([log_g[:, :1], log_g[:, 1:] + iv[:, None]], dim=1)
     return log_g, scale
 
 

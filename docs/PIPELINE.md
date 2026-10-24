@@ -409,6 +409,25 @@ makes it worse: a commodity is split over 7 groups on average (soft drinks over 
    latent term the switching is close to, not exactly, what lambda_c says. Both are being
    fitted on the stress world and will be compared on `checks/halo.py`, held-out likelihood
    and realism.
+   *Result on the partial-growth stress world* (category_growth 0.45: a cut partly grows the
+   category, partly switches within it; branch `v4-competition`, `--within-competition`).
+   Change in items per 1,000 baskets, 16 products at price x 0.8:
+
+   | | own product | own category | other categories |
+   |---|---|---|---|
+   | truth | +9.7 | +4.8 | +0.5 |
+   | no competition (`hs_rec`), reweighted / z fixed | +10.5 / +8.8 | +9.1 / +5.7 | +3.3 / −0.2 |
+   | lambda by instrument (`v4_comp`) | +9.9 / +8.7 | **+6.5 / +4.1** | **+2.0 / −0.3** |
+   | lambda by likelihood (`v4_complik`) | +10.5 / +8.8 | +8.6 / +5.4 | +3.3 / −0.1 |
+
+   The instrument gives lambda 0.61–0.73 across categories (mean 0.67; somewhat above the
+   generator's 0.45 growth slope) and on the pure-switching world 0.02–0.09 (truth 0), and
+   it removes about 40% of the reweighted halo. Likelihood gives lambda anywhere from 0.06
+   to 0.98 and changes almost nothing: it does not identify lambda. Held-out likelihood
+   (−24.91, −24.90, −24.89) and realism (full-basket AUC 0.627, 0.621, 0.627) are the same
+   for all three, so lambda costs nothing in fit. **Instrument chosen.** With the latent
+   state held fixed every model is near the truth on other categories; the reweighted
+   counterfactual keeps part of the halo even with competition.
 2. *Hold the latent state fixed* in price and promotion counterfactuals (the environment and
    the scenario scorer), if step 1 does not make it unnecessary. *Done as options:*
    `checks/halo.py` reports both ("reweighted" and "z_fixed"); the promotion environment takes

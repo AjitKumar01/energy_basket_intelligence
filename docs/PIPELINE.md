@@ -444,7 +444,16 @@ makes it worse: a commodity is split over 7 groups on average (soft drinks over 
    Real halo +0.45 (co-purchase +0.46, data −0.15), own display +36%, discount depth slope 1.28
    (1.30): **the partition alone does not change the halo**, as on the stress world, where the
    true categories as partition still had it. It is what lets the competition term (item 1)
-   act on true rivals. Version 4 on this partition is next.
+   act on true rivals.
+   Version 4 on this partition (`runs/commodity/v4_hist_mean.pt`, recency, mean centring, same
+   schedule as `v4_hist`, 8.9 h): validation LL **−37.875** (co-purchase `v4_hist` −38.301, same
+   1,024 trips), basket size in the chains 7.62 (data 7.65). Discount depth slope 1.26 (data
+   0.64 on validation weeks; co-purchase `v4_rec` 1.32). Display weights 38% negative (the
+   rarely displayed products, Known weaknesses). Real halo (12 trips per store-week, 16
+   latent draws) **+0.37** ± 0.02 (co-purchase Version 4 +0.35, data −0.15); own display
+   effect on the 48 well-measured commodities +17.6% (data +13.6%). Size by period (48 trips
+   per period, noisy): 5.62 / 9.74 / 6.38 / 8.24 against real 5.50 / 10.77 / 8.33 / 8.75 —
+   no upward drift. **Better fit, same halo.**
 4. *Measure the real halo:* when one commodity is discounted in a store-week, do other
    commodities' purchases per trip move? *Done* (`checks/halo_real.py`). Discount depth is
    chain-wide here, so the comparison uses display, which varies by store within a week:

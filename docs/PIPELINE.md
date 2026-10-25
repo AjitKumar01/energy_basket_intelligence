@@ -517,6 +517,27 @@ makes it worse: a commodity is split over 7 groups on average (soft drinks over 
    re-estimates it from the current fit before training, after every epoch and at the end.
    First estimate 0.29, 0.13, 0.59; final 0.17, 0.04, 0.40. So the instrument decides the
    result, and on seed 3 it ends eight times too high.
+
+   *Cause and fix* (research agent; reproduced on the checkpoints; `v4/competition_iv.py`).
+   The instrument weighted display and mailer by their fitted per-product weights. Those are
+   fitted on the same trips (a product displayed in weeks it did not sell gets a weight near
+   −2.5), so the instrument partly tracked the outcome. It is now built from price and
+   discount only (display and mailer still count in the inclusive-value change), and the
+   estimator reports a category-jackknife standard error. Re-estimated on the same three
+   checkpoints: 0.18 ± 0.07, −0.08 ± 0.09 (raw; floored at 0.01), 0.12 ± 0.10. Seed 3 refitted
+   with it (`runs/disc_c48_s3_iv2`, same world and base; `--same-fit` accepts it; final
+   lambda_c mean 0.12, start 0.16 ± 0.14):
+
+   | Seed 3, `v4_comp` | 10% / 20% / 30% off all | corr | decisions right | single cuts that gain | own / rest at 30% |
+   |---|---|---|---|---|---|
+   | truth | −3.4 / −7.1 / −10.8% | — | — | 0 / 36 | −28.2% / +0.01% |
+   | old instrument, fixed / reweighted | −6.7%, −2.5% at 30% | 0.94 / 0.55 | 12 / 9 | 0 / 5 | −21.4%, −19.1% / +0.16%, +0.48% |
+   | new instrument, fixed | −3.4 / −6.8 / −10.3% | 0.97 | 12 | 0 | −27.3% / +0.05% |
+   | new instrument, reweighted | −2.9 / −5.9 / −9.0% | 0.88 | 12 | 0 | −26.5% / +0.16% |
+
+   Held-out log-likelihood is unchanged (−26.531 against −26.525). The standard error at this
+   size (about 6,700 training trips) is twice the true value, so λ_c is noisy here; on
+   Dunnhumby the reported standard error has to show it is small enough.
    Making rho_0 linear is not a usable test: even with the mean size matched it shrinks the
    size variance from 87 to 7 (data 74).
 3. *A partition that keeps rivals together on Dunnhumby:* commodities, or affinity groups split

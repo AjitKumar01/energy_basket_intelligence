@@ -37,6 +37,9 @@ I=$OUT/initialization.pt; B=$OUT/additive/v3_pipeline_additive_best.pt
 
 # 2. The exact base model.
 if stage 2; then
+  if [[ "$ADD" == *"--discount-panel"* ]]; then
+    timed discount_panel python3 scripts/build_discount_panel.py --data-root "$D" --output "$OUT/log_discount.npy" > "$OUT/2_discount_panel.log" 2>&1
+  fi
   NMAX=$(python3 -c 'import numpy as np, os; d = np.load(os.environ["ENERGY_MODEL_DATA_ROOT"] + "/basket_input/v3_index_affinity.npz"); print(int(d["trip_nlines"][d["trip_split"] == 0].max()))')
   timed initialize python3 scripts/initialize.py --output "$I" --nmax "$NMAX" --threads "$THREADS" > "$OUT/2_initialize.log" 2>&1
   timed additive python3 -u scripts/fit_additive.py --artifact "$I" --output-dir "$OUT/additive" \

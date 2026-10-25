@@ -7,7 +7,7 @@ import torch
 from tiny import (NMAX, RANK, baskets_of, energy_given_z, full_energy, log_sum_exp, make_batch,
                   make_model)
 from v4 import exact, sampling
-from v4.competition_iv import estimate_competition_iv
+from v4.competition_iv import competition_moments, estimate_competition_iv, jackknife_se
 from v4.price import changed_price_context, own_price_tilt
 from v4.training import pseudo_loglik
 
@@ -327,3 +327,41 @@ def test_instrument_estimator_updates_comp_raw():
     assert torch.isfinite(model.comp_raw).all()
     assert float(lam.min()) >= 0.01 - 1e-12 and float(lam.max()) <= 0.99 + 1e-12
     assert abs(stats["comp_lambda_mean"] - round(float(lam.mean()), 4)) < 1e-12
+
+
+def test_instrument_leaves_out_display_and_mailer():
+    """The instrument is built from price and discount only: the display and mailer weights,
+    fitted on the same trips, do not move N_c, while the discount slope does.  The returned
+    raw pooled lambda is sum N_c / sum D_c."""
+    model = make_model(**BLOCKS["all-competition"])
+    batch = make_batch(basket=((0, 1, 3), (0, 5)))
+
+    class DummyBatcher:
+        def make(self, trips):
+            return batch
+
+    num0, den0 = competition_moments(model, [[0, 1]], DummyBatcher())
+    g = torch.Generator().manual_seed(7)
+    with torch.no_grad():
+        model.w_dsp.copy_(3.0 * torch.randn(model.w_dsp.shape, generator=g))
+        model.w_mlr.copy_(3.0 * torch.randn(model.w_mlr.shape, generator=g))
+    num1, den1 = competition_moments(model, [[0, 1]], DummyBatcher())
+    assert torch.allclose(num0, num1, atol=1e-12, rtol=0)
+    if model.disc_common is not None:
+        with torch.no_grad():
+            model.disc_common.add_(1.0)
+        num2, _ = competition_moments(model, [[0, 1]], DummyBatcher())
+        assert not torch.allclose(num1, num2, atol=1e-9, rtol=0)
+        with torch.no_grad():
+            model.disc_common.sub_(1.0)
+    stats = estimate_competition_iv(model, [[0, 1]], DummyBatcher())
+    assert abs(stats["comp_lambda_pool_raw"] - round(float(num1.sum() / den1.sum()), 4)) < 1e-12
+
+
+def test_jackknife_se_matches_leave_one_category_out():
+    g = torch.Generator().manual_seed(3)
+    num, den = torch.randn(7, generator=g), 1.0 + torch.rand(7, generator=g)
+    loo = [float((num.sum() - num[c]) / (den.sum() - den[c])) for c in range(7)]
+    mean = sum(loo) / 7
+    brute = math.sqrt(6 / 7 * sum((v - mean) ** 2 for v in loo))
+    assert abs(jackknife_se(num, den) - brute) < 1e-12

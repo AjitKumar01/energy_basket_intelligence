@@ -114,6 +114,7 @@ class World:
         # prices and promotions (chain level), weekly
         log_mult = rng.normal(0, 0.08, (J, T))
         promo = rng.random((J, T)) < 0.07
+        self.regular_price = np.round(self.base_price[:, None] * np.exp(log_mult), 2)
         self.price = np.round(self.base_price[:, None] * np.exp(log_mult) * np.where(promo, 0.75, 1.0), 2)
         self.promo = promo
         if getattr(args, "display_separate", False):
@@ -142,6 +143,7 @@ def simulate(world, trips, week_slice_state, price=None, seed_base=0):
     """
     args = world.args
     lam = float(getattr(args, "category_growth", 0.0))
+    disc_slope = float(getattr(args, "discount_slope", 0.0))
     cat_items = [np.flatnonzero(world.category == c) for c in range(world.C)] if lam != 0.0 else None
     price = world.price if price is None else price
     loyalty = week_slice_state["loyalty"].copy()
@@ -162,6 +164,9 @@ def simulate(world, trips, week_slice_state, price=None, seed_base=0):
         available = (world.first_stocked[:, st] <= wk + 1) & ~world.stockout[:, st, wk]
         log_ratio = np.log(price[:, wk] / ref)
         price_term = -world.price_sens[hh] * np.where(log_ratio > 0, 2.0 * log_ratio, log_ratio)
+        if disc_slope != 0.0:
+            disc_log = np.minimum(np.log(price[:, wk] / world.regular_price[:, wk]), 0.0)
+            price_term = price_term - disc_slope * disc_log
         reg_u = world.quality + world.attributes @ taste[hh] + world.idiosyncratic[hh]
         utility = reg_u + price_term + 0.5 * world.promo[:, wk]
         div_cache = {} if lam != 0.0 else None
@@ -249,6 +254,11 @@ def main():
     p.add_argument("--category-growth", type=float, default=0.0,
                    help="inclusive-value slope lambda on category need and variety-seeking "
                         "probabilities (0: pure within-category switching)")
+    p.add_argument("--regular-price", action="store_true",
+                   help="record weekly regular_price in observed.npz so build_discount_panel.py can split "
+                        "price into regular price and discount depth")
+    p.add_argument("--discount-slope", type=float, default=0.0,
+                   help="additional utility slope on log discount depth min(log(price/regular_price), 0)")
     args = p.parse_args()
     started = time.time()
     rng = np.random.default_rng(args.seed)
@@ -388,17 +398,21 @@ def main():
                   "lines": int(len(transactions)), "mean_basket_size": float(sizes.mean())}}, indent=2) + "\n")
     memberships = np.zeros((len(baskets), J), dtype=bool)
     memberships[trip_row, item] = True
-    np.savez_compressed(args.output / "observed.npz", trip_household=remap[hh], trip_store=store,
-                        trip_period=period, memberships=memberships, price=world.price[kept],
-                        promo=world.promo[kept], category=world.category[kept],
-                        subcategory=world.subcategory[kept], base_price=world.base_price[kept],
-                        first_stocked=world.first_stocked[kept], original_item=kept)
+    obs_kw = dict(trip_household=remap[hh], trip_store=store, trip_period=period, memberships=memberships,
+                  price=world.price[kept], promo=world.promo[kept], category=world.category[kept],
+                  subcategory=world.subcategory[kept], base_price=world.base_price[kept],
+                  first_stocked=world.first_stocked[kept], original_item=kept)
+    if args.regular_price:
+        obs_kw["regular_price"] = world.regular_price[kept]
+    np.savez_compressed(args.output / "observed.npz", **obs_kw)
     (args.output / "counterfactual_truth.json").write_text(json.dumps(
         {"test_weeks": [test_start + 1, T], "category_growth": float(args.category_growth),
          "item_ids": "original product ids; observed.npz original_item maps modeled item ids to them",
          "scenarios": scenarios}) + "\n")
+    recorded_args = {k: (str(v) if isinstance(v, Path) else v) for k, v in vars(args).items()
+                     if k not in ("regular_price", "discount_slope") or v}
     summary = {"seed": args.seed, "category_growth": float(args.category_growth),
-               "args": {k: (str(v) if isinstance(v, Path) else v) for k, v in vars(args).items()},
+               "args": recorded_args,
                "households_with_trips": int(len(customers)), "stores": S, "products": J,
                "products_simulated": J_all,
                "categories": C, "weeks": T, "train_weeks": args.train_weeks,

@@ -5,7 +5,8 @@ Utility of product j on a trip of household h at store s on day d (week w):
     b_j = lam_j                                   product popularity
         + theta_h . alpha_j                       household taste (low rank K)
         - g_hj * price term                       price, g_hj = softplus(gamma_h) . softplus(beta_j) >= 0
-        + w_dsp_j * display + w_mlr_j * mailer    promotions
+        + w_dsp_j * display + w_mlr_j * mailer    promotions (with dsp_common, mlr_common:
+                                                  common slopes plus these as deviations)
         + mu_j . delta_w                          season
         + zeta_j . xi_s                           store
         + psi_j . rec                             sub-commodity recency (optional)
@@ -81,7 +82,7 @@ from torch.nn.functional import softplus
 
 PRICE_KEYS = ("dlp", "dlp_bar", "disp", "mail", "dsc")
 OPTIONAL_PARAMETERS = ("disc_kappa", "disc_common", "f_extra", "psi_cat", "u_cat",
-                       "psi_item", "iv_slope_raw", "hist_size", "comp_raw")
+                       "psi_item", "iv_slope_raw", "hist_size", "comp_raw", "dsp_common", "mlr_common")
 HISTORY_KEYS = ("rec", "rec_item")
 # Parameters of an old quantity model and size factorisation that older checkpoints carry;
 # the basket law does not use them.
@@ -198,7 +199,8 @@ class BasketModel(torch.nn.Module):
                 b = b - g * (softplus(self.disc_kappa) - kappa) * c["dsc"]
             if "dsc" in c and self.disc_common is not None:
                 b = b - self.disc_common * c["dsc"]
-            b = b + self.w_dsp[it] * c["disp"] + self.w_mlr[it] * c["mail"]
+            w_dsp, w_mlr = self.promo_weights()
+            b = b + w_dsp[it] * c["disp"] + w_mlr[it] * c["mail"]
             b = b + (self.mu[it] * self.delta_c()[c["week"]]).sum(-1)
             b = b + (self.zeta[it] * self.xi_c()[c["store"]]).sum(-1)
             if "log_avail" in c:
@@ -388,6 +390,14 @@ class BasketModel(torch.nn.Module):
         return e
 
     # ---- loading ------------------------------------------------------------------------------
+    def promo_weights(self):
+        """Per-product display and mailer weights: w_dsp, w_mlr, plus the common slopes
+        dsp_common, mlr_common when present (then w_dsp, w_mlr are deviations, shrunk to
+        zero by a prior in training)."""
+        w_dsp = self.w_dsp if self.dsp_common is None else self.dsp_common + self.w_dsp
+        w_mlr = self.w_mlr if self.mlr_common is None else self.mlr_common + self.w_mlr
+        return w_dsp, w_mlr
+
     def load_fitted_state(self, state):
         """Load a state dict, creating the optional blocks it contains and dropping legacy
         keys.  Flags that are not parameters (rank, size_on_categories) are set by the caller."""

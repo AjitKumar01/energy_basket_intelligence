@@ -9,7 +9,7 @@ from tiny import (NMAX, RANK, baskets_of, energy_given_z, full_energy, log_sum_e
 from v4 import exact, sampling
 from v4.competition_iv import competition_moments, estimate_competition_iv, jackknife_se
 from v4.price import changed_price_context, own_price_tilt
-from v4.training import pseudo_loglik
+from v4.training import Priors, penalties, pseudo_loglik
 
 BLOCKS = {
     "additive": {},
@@ -365,3 +365,42 @@ def test_jackknife_se_matches_leave_one_category_out():
     mean = sum(loo) / 7
     brute = math.sqrt(6 / 7 * sum((v - mean) ** 2 for v in loo))
     assert abs(jackknife_se(num, den) - brute) < 1e-12
+
+
+def test_promo_common_is_a_reparameterisation():
+    """Common display and mailer slopes plus per-product deviations give the same utilities,
+    energies and log Z as the per-product weights they add up to, and survive a checkpoint
+    round trip."""
+    model = make_model(**BLOCKS["all-competition"])
+    batch = make_batch(basket=((0, 1, 3), (0, 5)))
+    batch.bind(model)
+    ix = batch.ix
+    b0, e0 = model.slot_utilities(ix), model.energy(batch)
+    lz0 = exact.log_partition(model, ix, b0)
+    with torch.no_grad():
+        model.dsp_common = torch.nn.Parameter(torch.tensor(0.7))
+        model.mlr_common = torch.nn.Parameter(torch.tensor(-0.2))
+        model.w_dsp.sub_(0.7)
+        model.w_mlr.add_(0.2)
+    batch.bind(model)
+    b1 = model.slot_utilities(ix)
+    assert torch.allclose(b0, b1, atol=1e-12, rtol=0)
+    assert torch.allclose(e0, model.energy(batch), atol=1e-12, rtol=0)
+    assert torch.allclose(lz0, exact.log_partition(model, ix, b1), atol=1e-12, rtol=0)
+    fresh = make_model(**BLOCKS["all-competition"])
+    fresh.load_fitted_state(model.state_dict())
+    for a, b in zip(fresh.promo_weights(), model.promo_weights()):
+        assert torch.allclose(a, b, atol=1e-12, rtol=0)
+
+
+def test_promo_deviation_prior():
+    """With common slopes the prior adds 0.5 * prec * (|w_dsp|^2 + |w_mlr|^2) / n_train."""
+    model = make_model(**BLOCKS["all-competition"])
+    model.dsp_common = torch.nn.Parameter(torch.tensor(0.3))
+    model.mlr_common = torch.nn.Parameter(torch.tensor(0.1))
+    psi, delta = torch.randn(3, RANK), torch.randn(len(model.lam), RANK)
+    off = Priors(0.1, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.0)
+    on = Priors(0.1, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 3.0)
+    gap = float(penalties(model, on, 50, psi, delta, {}, True) - penalties(model, off, 50, psi, delta, {}, True))
+    expected = 0.5 * 3.0 * float(model.w_dsp.square().sum() + model.w_mlr.square().sum()) / 50
+    assert abs(gap - expected) < 1e-12

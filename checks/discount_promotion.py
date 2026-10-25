@@ -335,7 +335,7 @@ def model_check(args):
         p0 = inc.factual()
         np.add.at(acc["fact"], where, p0.numpy())
         np.add.at(acc_cat["fact"], where_cat, p0.numpy())
-        for name, weight in (("disp", model.w_dsp), ("mail", model.w_mlr)):
+        for name, weight in zip(("disp", "mail"), model.promo_weights()):
             w_slot, state = weight[ix.item].double(), batch.ctx[name].double()
             np.add.at(acc[f"{name}_on"], where, own_price_tilt(p0, w_slot * (1.0 - state)).numpy())
             np.add.at(acc[f"{name}_off"], where, own_price_tilt(p0, -w_slot * state).numpy())
@@ -394,7 +394,7 @@ def summarize(events, acc, acc_cat, trips_per_cell, model, empirical, w0):
         share_ratio = np.log(on[ok] / (rest[ok] + on[ok])) - np.log(off[ok] / (rest[ok] + off[ok]))
         rate_ratio = np.log(on[ok]) - np.log(off[ok])
         weight = item[ok] / item[ok].sum()
-        coef = (model.w_dsp if name == "disp" else model.w_mlr).numpy()
+        coef = model.promo_weights()[0 if name == "disp" else 1].detach().numpy()
         return {"events": int(ok.sum()),
                 "choice_share_log_ratio_mean": float(share_ratio.mean()),
                 "choice_share_log_ratio_purchase_weighted": float((weight * share_ratio).sum()),

@@ -15,6 +15,12 @@ Blocks added to the base model (all start at zero or small values):
     comp_raw                     --within-competition: products of a category compete for price
                                  and promotion changes (see v4/model.py and v4/competition_iv.py);
                                  not with --m4c
+    dsp_common, mlr_common       --promo-common: one display and one mailer slope for all
+                                 products; w_dsp, w_mlr become per-product deviations with a
+                                 Gaussian prior at zero (--promo-dev-prec).  The slopes start at
+                                 the base model's weights averaged over displayed (mailed)
+                                 training slots and the deviations at zero; all four are held
+                                 fixed in stage A and learned from stage B
 
 Stages:
     A  pseudo-likelihood (--pl-epochs): warms up phi with exact conditionals
@@ -119,6 +125,10 @@ def parse_args():
     p.add_argument("--price-prec", type=float, default=2.0)
     p.add_argument("--u-cat-prec", type=float, default=2.0)
     p.add_argument("--rec-prec", type=float, default=2.0)
+    p.add_argument("--promo-common", action="store_true",
+                   help="common display and mailer slopes with per-product deviations shrunk to zero")
+    p.add_argument("--promo-dev-prec", type=float, default=4.0,
+                   help="--promo-common: prior precision on the deviations (4: prior sd 0.5)")
     p.add_argument("--progress-every", type=int, default=50,
                    help="print a progress line (to stdout, not the .log) every this many updates")
     p.add_argument("--seed", type=int, default=41001)
@@ -218,15 +228,10 @@ def main():
     if args.warm_start is not None:
         state = torch.load(args.warm_start, map_location="cpu", weights_only=False)["model"]
         missing, unexpected = model.load_state_dict(state, strict=False)
-        if set(unexpected) - {"hist_size"} or set(missing) - {"hist_size", "comp_raw"}:
+        if set(unexpected) - {"hist_size"} or set(missing) - {"hist_size", "comp_raw", "dsp_common", "mlr_common"}:
             raise SystemExit(f"--warm-start does not match this model: missing {missing}, unexpected {unexpected}")
         with torch.no_grad():
             delta.copy_(model.phi[:, :args.rank] - psi[category])
-    use_comp_iv = args.within_competition and args.comp_estimator == "instrument"
-    if use_comp_iv:
-        model.comp_raw.requires_grad_(False)
-        iv_stats = estimate_competition_iv(model, batches, batcher)
-        emit({"event": "comp_iv_init", **iv_stats})
     rec_params = [model.psi, model.psi_item] if args.recency else []
     if args.centre_history:
         rec_params.append(model.hist_size)
@@ -235,7 +240,8 @@ def main():
     base = [getattr(model, n) for n in BASE_NAMES]
     model.phi.requires_grad_(True)
     priors = Priors(args.pool_prod, args.phi_prec, args.delta_prec, args.rho_c_prec,
-                    args.f_extra_prec, args.price_prec, args.u_cat_prec, args.rec_prec)
+                    args.f_extra_prec, args.price_prec, args.u_cat_prec, args.rec_prec,
+                    args.promo_dev_prec if args.promo_common else 0.0)
     capacities = category_capacities(data, nmax)
     gen = torch.Generator().manual_seed(args.seed + 1)
 
@@ -244,9 +250,12 @@ def main():
         k_counts, pair_sum, item_counts, cat_present = (
             torch.zeros(nmax + 1), torch.zeros(C), torch.zeros(J), torch.zeros(C))
         chains = []                                         # persistent SML chains, from the data
+        promo_slots = (torch.zeros(J), torch.zeros(J))      # displayed / mailed training slots
         for trips in batches:
             bt = batcher.make(trips)
             chains.append(bt.observed.clone())
+            for n_slots, key in zip(promo_slots, ("disp", "mail")):
+                n_slots.index_add_(0, bt.ix.item, bt.ctx[key].double())
             n_row = torch.zeros(bt.ix.n_rows).index_add_(0, bt.ix.row_of, bt.observed.double())
             if int(n_row.max()) >= model.R:      # keeps every observed basket (and PL step) inside the cap
                 raise SystemExit(f"a training basket has {int(n_row.max())} products in one category; "
@@ -260,6 +269,26 @@ def main():
         rate_pairs = (pair_sum / N).clamp_min(5e-3)
         rate_item = (item_counts / N).clamp_min(2e-3)
         rate_present = cat_present / N
+
+    promo_names = ()
+    if args.promo_common:
+        with torch.no_grad():
+            start = {}
+            for name, weight, n_slots in (("dsp_common", model.w_dsp, promo_slots[0]),
+                                          ("mlr_common", model.w_mlr, promo_slots[1])):
+                common = float((n_slots * weight).sum() / n_slots.sum().clamp_min(1.0))
+                setattr(model, name, torch.nn.Parameter(torch.tensor(common)))
+                start[name] = round(common, 4)
+                weight.zero_()
+        promo_names = ("w_dsp", "w_mlr", "dsp_common", "mlr_common")
+        for n in promo_names:
+            getattr(model, n).requires_grad_(False)
+        emit({"event": "promo_common_init", **start, "dev_prec": args.promo_dev_prec})
+    use_comp_iv = args.within_competition and args.comp_estimator == "instrument"
+    if use_comp_iv:
+        model.comp_raw.requires_grad_(False)
+        iv_stats = estimate_competition_iv(model, batches, batcher)
+        emit({"event": "comp_iv_init", **iv_stats})
 
     def sync_phi():
         with torch.no_grad():
@@ -293,6 +322,7 @@ def main():
                            ([model.iv_slope_raw] if args.m4c else [], lr_iv),
                            ([model.comp_raw] if (args.within_competition and not use_comp_iv) else [], lr_iv),
                            (rec_params, lr_rec),
+                           ([model.dsp_common, model.mlr_common] if args.promo_common else [], lr_base),
                            ([getattr(model, n) for n in price_names if getattr(model, n).requires_grad], lr_price)):
             if params and lr > 0.0:
                 groups.append({"params": params, "lr": lr})
@@ -435,6 +465,7 @@ def main():
                     "u_cat": True, "unfreeze_price": True, "recency": bool(args.recency),
                     "centre_history": args.centre_history, "within_competition": bool(args.within_competition),
                     "comp_estimator": args.comp_estimator if args.within_competition else None,
+                    "promo_common": bool(args.promo_common),
                     "iv_slope": bool(args.m4c), "iv_price_only": bool(args.m4c), "stage": stage,
                     "seconds": time.time() - started, "args": {k: str(v) for k, v in vars(args).items()}},
                    path)
@@ -446,7 +477,7 @@ def main():
     save(args.out.with_name(args.out.name + "_pl.pt"), "pseudo-likelihood")
 
     # Stage B: SML.  Chains start at the observed baskets and persist across epochs.
-    for n in price_names:
+    for n in price_names + promo_names:
         getattr(model, n).requires_grad_(True)
 
     def sml_step(i, bt):

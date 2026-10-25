@@ -97,6 +97,7 @@ class Priors:
     price_prec: float         # on price parameters, centred at the base model's values
     u_cat_prec: float
     rec_prec: float
+    promo_dev_prec: float = 0.0   # on w_dsp, w_mlr as deviations from the common slopes
 
 
 def add_pooling(loss, model, weight):
@@ -123,8 +124,11 @@ def penalties(model, priors, n_train, psi, delta, price_init, recency):
     rec_prior = priors.rec_prec * (model.psi.square().sum() + model.psi_item.square().sum()) if recency else 0.0
     if model.hist_size is not None:
         rec_prior = rec_prior + priors.rec_prec * model.hist_size.square()
+    promo_prior = 0.0
+    if model.dsp_common is not None and priors.promo_dev_prec > 0.0:
+        promo_prior = priors.promo_dev_prec * (model.w_dsp.square().sum() + model.w_mlr.square().sum())
     return loss + 0.5 * (phi_prior + priors.rho_c_prec * model.rho_c.square().sum() + extra_prior
-                         + price_prior + u_cat_prior + rec_prior) / n_train
+                         + price_prior + u_cat_prior + rec_prior + promo_prior) / n_train
 
 
 def project(model, capacities, optimizer):

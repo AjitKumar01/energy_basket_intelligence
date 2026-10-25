@@ -306,7 +306,9 @@ is a discount level (0/10/20/30%) for each of the 12 highest-revenue commodities
 reward is expected revenue at paid prices relative to the same week with no promotion. The
 simulator is either the base model (exact) or Version 4. It works, but its answers are not yet
 believable: 30% off everything triples revenue in the base model, because of the halo below.
-Do not use it for policy decisions until Phase 2 is done.
+Do not use it for policy decisions until Phase 2 is done. On synthetic worlds, scored against
+the true revenue, it is right when the base model is fitted with the default settings (Phase 2,
+item 2b); on Dunnhumby the discount slope still makes every promotion look profitable.
 
 **The halo** (`checks/halo.py`, stress world, 20% price cut on one product; change in items
 per 1,000 baskets, mean of 16 scenarios):
@@ -341,7 +343,11 @@ makes it worse: a commodity is split over 7 groups on average (soft drinks over 
   display effect is matched (item 4). The discount check's near-zero display effect is the same
   tail: it switches display on across all discount events, 90% of which are never displayed.
 - **The discount response overshoots** (1.42 in Version 4, 1.30 in the base model, against
-  0.64–1.07 in the data).
+  0.64–1.07 in the data). Most of it is the common discount slope (0.76), which also makes
+  the base model's promotions grow the whole basket (item 2b).
+- **Compared worlds must be fitted with the same settings.** The large stress world's base was
+  fitted with `--elast-target -1.86`, which alone breaks it (item 2b); fits on it before
+  2026-10-25 (item 1's table) rest on that base.
 - On the stress world the own-price response is about 1.7× too strong on average.
 
 **Phase 2** (agreed 2026-10-22, in this order):
@@ -428,10 +434,67 @@ makes it worse: a commodity is split over 7 groups on average (soft drinks over 
    for all three, so lambda costs nothing in fit. **Instrument chosen.** With the latent
    state held fixed every model is near the truth on other categories; the reweighted
    counterfactual keeps part of the halo even with competition.
+   *Caveat (2026-10-25):* all three fits were built on a base model fitted with
+   `--elast-target -1.86` instead of the default −0.121, which by itself creates the halo
+   (item 2b). The table above therefore measures the competition term on a broken base; on
+   the default-fit base the promotion environment has no halo with or without competition.
 2. *Hold the latent state fixed* in price and promotion counterfactuals (the environment and
    the scenario scorer), if step 1 does not make it unnecessary. *Done as options:*
    `checks/halo.py` reports both ("reweighted" and "z_fixed"); the promotion environment takes
-   `latent="fixed"` (`sim/run_policies.py --latent fixed`).
+   `latent="fixed"` (`sim/run_policies.py --latent fixed`). On the default-fit base (item 2b)
+   reweighting is as good as holding fixed; the case for "fixed" came from the broken base.
+2b. *The promotion environment against the truth* (2026-10-25; branch `v4-scale`,
+   `sim/stress_check.py`, `run/small_world.sh`, `run/small_world_base.sh`). The generator gives
+   each trip its own random stream, so the test weeks re-simulated at discounted prices from
+   the same state are the true revenue. Actions: 30% off one of the 12 top categories, and
+   10/20/30% off all 12; "decisions right" is the share of the 12 categories where the model's
+   best level equals the truth's.
+
+   The large growth world's halo (base model: 30% off everything +30.5% against truth −11.6%,
+   35 of 36 single cuts "profitable") was not a scale effect. Its base model was fitted with
+   `--elast-target -1.86`; the small worlds used the default −0.121. Refitting the same
+   48-category small world (1,000 households, 5 stores, seed 1) changing one setting at a time:
+
+   | Base fit | 10% / 30% off all | corr | decisions right | single cuts that gain | own / rest at 30% |
+   |---|---|---|---|---|---|
+   | truth | −2.9% / −9.7% | — | — | 0 / 36 | −17.1% / −0.10% |
+   | default | −4.1% / −12.5% | 0.89 | 12 / 12 | 0 / 36 | −26.2% / +0.09% |
+   | `--elast-target -1.86` | +10.3% / +61.8% | −0.64 | 0 / 12 | 36 / 36 | +2.6% / +3.06% |
+
+   `--price-feature-contract chain_and_store` changes nothing on synthetic worlds (their
+   `store_price.npz` is empty); with it the fit is identical to the one without. The −1.86 fit
+   is also worse on validation (−26.60 against −26.52; on the large world −29.75 against
+   −29.51). Mechanism (research agent, checkpoint edits): the size potential rho_0(n) is
+   concave (each extra item costs less), so a large price slope that raises one category's
+   utility enlarges the whole basket.
+
+   Large growth world (476 products, 48 categories, 3,000 households, 15 stores), default-fit
+   base:
+
+   | Model | 10% / 30% off all | corr | decisions right | own / rest at 30% |
+   |---|---|---|---|---|
+   | truth | −2.9% / −11.6% | — | — | −18.3% / −0.03% |
+   | base | −4.4% / −13.5% | 0.92 | 12 / 12 | −21.8% / +0.05% |
+   | `hs_rec`, latent fixed / reweighted | −5.4% / −16.7%, −4.5% / −13.9% | 0.94 / 0.86 | 12 / 12 | −23.9%, −20.5% / −0.15%, −0.08% |
+   | `v4_comp`, latent fixed / reweighted | −5.6% / −17.2%, −4.9% / −15.0% | 0.94 / 0.89 | 12 / 12 | −25.2%, −22.5% / −0.13%, −0.07% |
+
+   Every model gets every decision right and none invents a halo; all overstate the loss a
+   little (own category −21% to −25% against −18%). A full-size world with a new seed
+   (48 categories, 3,000 households, 15 stores, default base) agrees: corr 0.76, 12 / 12.
+   On the default small worlds (12, 24, 48 categories; 1,000 or 3,000 households; 5 or 15
+   stores; 3 seeds each) the base model's rest-of-basket effect stays within ±0.8%.
+
+   *On Dunnhumby* (commodity base, research agent, `checks/halo_surgery.py` on `v4-scale`):
+   the elasticity anchor holds the regular-price slope at 0.21, but the common discount slope
+   (`--disc-common`, 0.76) is outside it, so a discount moves utility with slope 0.94. A 30% cut
+   on one top-12 commodity then raises the rest of the basket by +7.3% and all 12 cuts look
+   profitable. With the common discount slope set to zero the rest-of-basket effect falls to
+   +0.2%, but own items rise only 7% for a 30% cut, while the data's within-commodity share
+   slope is 0.64–1.07. So the slope is not simply wrong: the base model has no
+   within-commodity competition, and turns a share gain into basket growth. Whether
+   `v4_comp` routes it into switching is the next test, on a synthetic world built that way.
+   Making rho_0 linear is not a usable test: even with the mean size matched it shrinks the
+   size variance from 87 to 7 (data 74).
 3. *A partition that keeps rivals together on Dunnhumby:* commodities, or affinity groups split
    by commodity; then refit Steps 3 and 4.
    *Status (2026-10-24).* One group per commodity (`scripts/build_commodity_partition.py`):

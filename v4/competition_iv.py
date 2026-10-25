@@ -18,10 +18,16 @@ How the Wald IV instrument estimator identifies lambda_c:
    For each offered slot j on trip t in category c, we compute a household- and history-
    invariant baseline share within the category from product popularity alone,
        w_tj^(0) = exp(lam_j) / sum_{k in c_t} exp(lam_k),
-   and a population-mean price/promotion utility shock
+   and a population-mean price utility shock
        d_tj = -g_bar_j * [m_t + kappa * (dlp_tj - m_t) + (kappa_dsc - kappa) * dsc_tj]
-              - disc_common * dsc_tj + w_dsp_j * disp_tj + w_mlr_j * mail_tj,
+              - disc_common * dsc_tj,
    where g_bar_j = mean_h(softplus(gamma_h)) . softplus(beta_j).
+   Display and mailer are left out of the instrument.  Their weights are free per product and
+   fitted on the same trips, so a product displayed in weeks it did not sell gets a strongly
+   negative weight: weighted by them, display tracks the outcome and pushes lambda up
+   (stress worlds runs/disc_c48_s{1,2,3} on v4-scale, truth 0.05: final lambda 0.17, 0.04,
+   0.40 with them, 0.19, 0.01, 0.13 with the weights set to zero).  They still count in
+   Delta_IV, so lambda_c applies to every price and promotion change.
    The raw instrument is the baseline-share-weighted price shock Z_tc^raw = sum_{j in c_t} w_tj^(0) d_tj.
    We double-centre Z_tc^raw by subtracting its category mean across training rows and its
    trip mean across offered categories on trip t:
@@ -50,6 +56,8 @@ How the Wald IV instrument estimator identifies lambda_c:
        lambda_bar = clip(sum_c N_c / sum_c D_c, 0.01, 0.99)
    with prior weight tau_0 = prior_strength * mean_c(D_c):
        lambda_hat_c = clip((N_c + tau_0 * lambda_bar) / (D_c + tau_0), 0.01, 0.99).
+   The pooled ratio's standard error is the category jackknife: leave out one category's
+   N_c and D_c at a time (jackknife_se).
    When the true world has pure switching (lambda = 0), N_c approx 0 and lambda_hat_c is
    near 0; when price cuts grow category counts by a fraction lambda of the full additive
    expansion, N_c approx lambda * D_c and lambda_hat_c recovers lambda without attenuation.
@@ -63,15 +71,19 @@ from .exact import incidence as exact_incidence
 from .model import PRICE_KEYS, _row_logsumexp
 
 
-@torch.no_grad()
-def estimate_competition_iv(model, batches, batcher, *, prior_strength: float = 10.0) -> dict:
-    """Estimate ``model.comp_raw`` in place using the exogenous price-instrument Wald IV
-    estimator over ``batches`` (a list of trip-ID arrays).
+def jackknife_se(num, den) -> float:
+    """Category-jackknife standard error of the pooled ratio sum_c num_c / sum_c den_c."""
+    C = num.numel()
+    if C < 2:
+        return float("nan")
+    loo = (num.sum() - num) / (den.sum() - den)
+    return float(((C - 1) / C * ((loo - loo.mean()) ** 2).sum()).sqrt())
 
-    Returns a dictionary of summary diagnostics (pooled lambda, per-category mean/min/max).
-    """
-    if model.comp_raw is None:
-        raise ValueError("estimate_competition_iv requires model.comp_raw to be initialised")
+
+@torch.no_grad()
+def competition_moments(model, batches, batcher):
+    """The Wald IV moments per category, N_c = sum_t n_tc^obs Z_tc and
+    D_c = sum_t (n_tc^(1) - n_tc^(0)) Z_tc, over ``batches`` (a list of trip-ID arrays)."""
     C = model.C
     g_bar = (softplus(model.gamma).mean(0, keepdim=True) * softplus(model.beta)).sum(-1)
     kappa = softplus(model.price_kappa)
@@ -99,7 +111,6 @@ def estimate_competition_iv(model, batches, batcher, *, prior_strength: float = 
             d = d - g_bar[it] * (disc_k - kappa) * c["dsc"]
         if "dsc" in c and model.disc_common is not None:
             d = d - disc_c * c["dsc"]
-        d = d + model.w_dsp[it] * c["disp"] + model.w_mlr[it] * c["mail"]
         z_row = torch.zeros(ix.n_rows).index_add_(0, ix.row_of, share0 * d)
         y_row = torch.zeros(ix.n_rows).index_add_(0, ix.row_of, bt.observed.double())
 
@@ -138,14 +149,31 @@ def estimate_competition_iv(model, batches, batcher, *, prior_strength: float = 
 
     num = torch.zeros(C).index_add_(0, c_all, y_all * z_tilde)
     den = torch.zeros(C).index_add_(0, c_all, dm_all * z_tilde).clamp_min(1e-6)
+    return num, den
 
-    lam_pool = (num.sum() / den.sum()).clamp(0.01, 0.99)
+
+@torch.no_grad()
+def estimate_competition_iv(model, batches, batcher, *, prior_strength: float = 10.0) -> dict:
+    """Estimate ``model.comp_raw`` in place using the exogenous price-instrument Wald IV
+    estimator over ``batches`` (a list of trip-ID arrays).
+
+    Returns a dictionary of summary diagnostics (pooled lambda, its raw value and category-
+    jackknife standard error, per-category mean/min/max).
+    """
+    if model.comp_raw is None:
+        raise ValueError("estimate_competition_iv requires model.comp_raw to be initialised")
+    num, den = competition_moments(model, batches, batcher)
+
+    raw_pool = num.sum() / den.sum()
+    lam_pool = raw_pool.clamp(0.01, 0.99)
     tau0 = float(prior_strength) * den.mean().clamp_min(1e-4)
     lam_c = ((num + tau0 * lam_pool) / (den + tau0)).clamp(0.01, 0.99)
     model.comp_raw.copy_(torch.logit(lam_c))
 
     return {
         "comp_lambda_pool": round(float(lam_pool), 4),
+        "comp_lambda_pool_raw": round(float(raw_pool), 4),
+        "comp_lambda_pool_se": round(jackknife_se(num, den), 4),
         "comp_lambda_mean": round(float(lam_c.mean()), 4),
         "comp_lambda_min": round(float(lam_c.min()), 4),
         "comp_lambda_max": round(float(lam_c.max()), 4),

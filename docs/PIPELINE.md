@@ -491,8 +491,31 @@ makes it worse: a commodity is split over 7 groups on average (soft drinks over 
    profitable. With the common discount slope set to zero the rest-of-basket effect falls to
    +0.2%, but own items rise only 7% for a 30% cut, while the data's within-commodity share
    slope is 0.64–1.07. So the slope is not simply wrong: the base model has no
-   within-commodity competition, and turns a share gain into basket growth. Whether
-   `v4_comp` routes it into switching is the next test, on a synthetic world built that way.
+   within-commodity competition, and turns a share gain into basket growth.
+
+   *Discount worlds* (2026-10-25, `runs/disc_c48_s{1,2,3}` on `v4-scale`): 48 categories,
+   1,000 households, 5 stores, category growth 0.05 (a discount mostly moves shoppers between
+   products of its category), `--regular-price`, and the base fitted with the Dunnhumby
+   discount split (`--discount-panel --disc-kappa --disc-common`). `--same-fit` accepts each
+   seed's five reports. Values are seeds 1, 2, 3:
+
+   | Model | 30% off all | corr | decisions right | single cuts that gain | own / rest at 30% |
+   |---|---|---|---|---|---|
+   | truth | −11.0, −12.7, −10.8% | — | — | 0, 0, 0 / 36 | −28.2, −27.9, −28.2% / ±0.01% |
+   | base | +14.0, +9.4, +11.7% | −0.86, −0.49, −0.76 | 0, 0, 0 | 36, 36, 36 | −5.7, −9.2, −7.8% / +1.31, +1.14, +1.23% |
+   | `hs_rec` fixed | −2.1, −3.3, −0.1% | 0.58, 0.83, 0.33 | 11, 12, 4 | 3, 0, 21 | −12.1, −13.7, −10.6% / +0.22, +0.25, +0.34% |
+   | `hs_rec` reweighted | +7.0, +5.7, +9.2% | −0.55, −0.25, −0.80 | 0, 0, 0 | 36, 36, 36 | −4.8, −7.2, −5.2% / +0.76, +0.79, +0.99% |
+   | `v4_comp` fixed | −9.9, −13.2, −6.7% | 0.97, 0.99, 0.94 | 12, 12, 12 | 0, 0, 0 | −26.4, −29.3, −21.4% / +0.05, +0.01, +0.16% |
+   | `v4_comp` reweighted | −8.0, −12.8, −2.5% | 0.89, 0.99, 0.55 | 12, 12, 9 | 0, 0, 5 | −25.0, −29.0, −19.1% / +0.17, +0.04, +0.48% |
+
+   ("Rest" is the rest of the whole basket: total revenue minus the cut category, averaged
+   over the 12 cuts.) The Dunnhumby failure reproduces: the base model makes every cut
+   profitable. Version 4 without competition does not fix it. With competition it does on
+   seeds 1 and 2; on seed 3 it gets the decisions right with the latent state fixed, but the
+   losses are a third too small and reweighting loses 3 decisions. The difference between the
+   seeds is lambda_c (truth 0.05): calibrated mean 0.17, 0.04, 0.40, starting from the price
+   instrument's 0.29, 0.13, 0.59. Calibration lowers it only part of the way, so the
+   instrument's estimate decides the result, and on seed 3 it is eight times too high.
    Making rho_0 linear is not a usable test: even with the mean size matched it shrinks the
    size variance from 87 to 7 (data 74).
 3. *A partition that keeps rivals together on Dunnhumby:* commodities, or affinity groups split

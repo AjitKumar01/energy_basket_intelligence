@@ -87,6 +87,10 @@ def parse_args():
                    help="estimator for within-category competition lambda_c: 'instrument' (exogenous "
                         "price-instrument Wald IV, default) or 'likelihood' (SML gradient steps)")
     p.add_argument("--comp-init", type=float, default=0.0, help="competition: starting logit of lambda_c")
+    p.add_argument("--comp-iv-trips", type=int, default=0,
+                   help="instrument: estimate lambda_c on this many training trips (a fixed random subset, "
+                        "whole batches; 0: all). Each estimate is a full exact pass over its trips and runs "
+                        "about twice per epoch")
     p.add_argument("--rank", type=int, default=16)
     p.add_argument("--max-per-category", type=int,
                    help="largest number of products from one category in a basket (default: nmax); "
@@ -196,6 +200,8 @@ def main():
     train_trips = np.sort(held[args.val_trips:])
     order = rng.permutation(train_trips)
     batches = [np.sort(order[s:s + args.batch]) for s in range(0, len(order), args.batch)]
+    # The batches hold shuffled trips, so the first ones are a fixed random subset.
+    iv_batches = batches if args.comp_iv_trips <= 0 else batches[:max(1, -(-args.comp_iv_trips // args.batch))]
     N = len(train_trips)
     args.out.parent.mkdir(parents=True, exist_ok=True)
     log_file = open(args.out.with_suffix(".log"), "a")
@@ -287,8 +293,10 @@ def main():
     use_comp_iv = args.within_competition and args.comp_estimator == "instrument"
     if use_comp_iv:
         model.comp_raw.requires_grad_(False)
-        iv_stats = estimate_competition_iv(model, batches, batcher)
-        emit({"event": "comp_iv_init", **iv_stats})
+        t_iv = time.time()
+        iv_stats = estimate_competition_iv(model, iv_batches, batcher)
+        emit({"event": "comp_iv_init", **iv_stats, "iv_trips": int(sum(len(b) for b in iv_batches)),
+              "iv_seconds": round(time.time() - t_iv, 1)})
 
     def sync_phi():
         with torch.no_grad():
@@ -398,7 +406,7 @@ def main():
                         model.lam.sub_(0.35 * (la / rate_item).clamp(-0.35, 0.35))
                 project(model, capacities, opt)
             if use_comp_iv:
-                estimate_competition_iv(model, batches, batcher)
+                estimate_competition_iv(model, iv_batches, batcher)
                 if avg is not None:
                     avg["comp_raw"] = model.comp_raw.detach().clone()
             sv = torch.linalg.svdvals(model.phi_r().detach())
@@ -426,7 +434,7 @@ def main():
                 scored = avg if avg is not None else current
                 model.load_state_dict(scored)
                 if use_comp_iv:
-                    estimate_competition_iv(model, batches, batcher)
+                    estimate_competition_iv(model, iv_batches, batcher)
                     scored["comp_raw"] = model.comp_raw.detach().clone()
                 ll, ess = validation_ll()
                 row.update(val_ll=round(ll, 4), val_ess=round(ess, 4))
@@ -452,7 +460,7 @@ def main():
         elif avg is not None:
             model.load_state_dict(avg)
         if use_comp_iv:
-            estimate_competition_iv(model, batches, batcher)
+            estimate_competition_iv(model, iv_batches, batcher)
         with torch.no_grad():                               # re-derive delta from the kept phi
             delta.copy_(model.phi[:, :args.rank] - psi[category])
 

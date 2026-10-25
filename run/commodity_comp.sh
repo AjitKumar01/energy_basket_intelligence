@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Version 4 on the commodity partition with within-category competition (lambda_c from the
-# price instrument, display and mailer left out of it) and common display and mailer slopes
+# price instrument on a fixed 40,000 training trips, display and mailer left out of it) and common
+# display and mailer slopes
 # (--promo-common), fitted afresh from the commodity base model with the schedule of
 # run/commodity.sh stage 4; then the discount check, basket size by period and the real halo.
 # Run detached, e.g.
@@ -27,7 +28,7 @@ if [[ $FROM -le 1 ]]; then
   stamp FIT_START
   python3 -u scripts/fit_interactions.py --initialization "$INIT" --additive "$ADDITIVE" \
     --out "$V4" --recency --centre-history mean \
-    --within-competition --comp-estimator instrument --promo-common \
+    --within-competition --comp-estimator instrument --comp-iv-trips 40000 --promo-common \
     --pl-epochs 1 --sml-epochs 6 --min-sml-epochs 3 --val-every 1 --cal-epochs 1 \
     --val-trips 1024 --val-draws 128 --max-per-category 40 --threads 4 > "$OUT/4_$NAME.out" 2>&1
   stamp FIT_DONE

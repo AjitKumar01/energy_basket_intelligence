@@ -11,10 +11,15 @@ v4-training) load too: their extra keys are ignored and their flags are translat
 from __future__ import annotations
 
 import hashlib
+import pathlib
 from pathlib import Path
+import sys
 
 import numpy as np
 import torch
+
+# Checkpoints saved under Python 3.13 pickle Path objects as pathlib._local.PosixPath.
+sys.modules.setdefault("pathlib._local", pathlib)
 
 from .batches import Batcher, PurchaseHistory
 from .bundle import data_root, require_fingerprint

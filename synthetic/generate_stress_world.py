@@ -10,6 +10,9 @@ come from a procedural shopping story built from standard marketing-science mech
   complementarity is higher order and mission-driven;
 * nested choice: each need picks a subcategory, then a product (nested logit, nest
   parameter 0.5); substitution comes from "one product per need", nested, never uniform;
+  with --category-growth > 0, a price or promotion gain in a category's inclusive value
+  also scales its mission-need and variety-seeking probabilities by exp(category_growth *
+  Delta_IV_c), so price cuts partly grow the category and partly switch within it;
 * long-tailed catalogue: Zipf quality inside categories, uneven subcategory sizes;
 * heterogeneity and dynamics: household taste over three product attributes drifting
   weekly (AR(1)); brand loyalty to the last product bought in a category; pantry
@@ -105,7 +108,7 @@ class World:
         self.intensity = rng.gamma(2.0, 0.6, H)
         self.visit_rate = rng.beta(1.1, 3.0, H)
         self.home = rng.integers(0, S, H)
-        self.price_sens = np.exp(rng.normal(0.4, 0.5, H))      # household price sensitivity
+        self.price_sens = np.exp(rng.normal(float(getattr(args, "price_sens_mean", 0.4)), 0.5, H))  # household price sensitivity
         self.taste0 = rng.normal(0, 0.6, (H, 3))
         self.idiosyncratic = rng.normal(0, 0.5, (H, J)) * (rng.random((H, J)) < 0.15)
         # prices and promotions (chain level), weekly
@@ -113,6 +116,11 @@ class World:
         promo = rng.random((J, T)) < 0.07
         self.price = np.round(self.base_price[:, None] * np.exp(log_mult) * np.where(promo, 0.75, 1.0), 2)
         self.promo = promo
+        if getattr(args, "display_separate", False):
+            # displays on their own schedule (separate stream, so the rest of the world is unchanged):
+            # the 25% price cuts stay where they are, and the display bonus and stockpiling follow
+            # the displays, so price and display effects can be told apart
+            self.promo = np.random.default_rng([args.seed, 5151]).random((J, T)) < 0.07
         # assortment: launches seen in the retail feed, and unrecorded stockouts
         first = np.where(rng.random((J, S)) < 0.85, 1, T + 1).astype(np.int16)
         launched = rng.choice(J, size=J // 10, replace=False)
@@ -133,6 +141,8 @@ def simulate(world, trips, week_slice_state, price=None, seed_base=0):
     Each trip draws from its own stream seeded by (seed_base, trip_id).
     """
     args = world.args
+    lam = float(getattr(args, "category_growth", 0.0))
+    cat_items = [np.flatnonzero(world.category == c) for c in range(world.C)] if lam != 0.0 else None
     price = world.price if price is None else price
     loyalty = week_slice_state["loyalty"].copy()
     inventory = week_slice_state["inventory"].copy()
@@ -152,8 +162,25 @@ def simulate(world, trips, week_slice_state, price=None, seed_base=0):
         available = (world.first_stocked[:, st] <= wk + 1) & ~world.stockout[:, st, wk]
         log_ratio = np.log(price[:, wk] / ref)
         price_term = -world.price_sens[hh] * np.where(log_ratio > 0, 2.0 * log_ratio, log_ratio)
-        utility = (world.quality + world.attributes @ taste[hh] + world.idiosyncratic[hh]
-                   + price_term + 0.5 * world.promo[:, wk])
+        reg_u = world.quality + world.attributes @ taste[hh] + world.idiosyncratic[hh]
+        utility = reg_u + price_term + 0.5 * world.promo[:, wk]
+        div_cache = {} if lam != 0.0 else None
+
+        def get_div(c_idx):
+            if c_idx not in div_cache:
+                its = cat_items[c_idx]
+                its = its[available[its]]
+                if not len(its):
+                    div_cache[c_idx] = 0.0
+                else:
+                    loy = 1.2 * (its == loyalty[hh, c_idx])
+                    u1 = utility[its] + loy
+                    u0 = reg_u[its] + loy
+                    m1, m0 = u1.max(), u0.max()
+                    div_cache[c_idx] = float((m1 + np.log(np.exp(u1 - m1).sum()))
+                                             - (m0 + np.log(np.exp(u0 - m0).sum())))
+            return div_cache[c_idx]
+
         needs = set()
         n_missions = 1 + r.poisson(world.intensity[hh])
         for m in r.choice(len(MISSIONS), size=n_missions, p=world.mission_pref[hh]):
@@ -163,8 +190,11 @@ def simulate(world, trips, week_slice_state, price=None, seed_base=0):
                 v = world.usual_variant[hh, m] if r.random() < 0.6 else r.integers(world.variants)
                 t = world.variant_templates[m][v]
             for c, p in zip(t["categories"], t["probs"]):
-                if inventory[hh, c] == 0 and r.random() < p:
-                    needs.add(int(c))
+                if inventory[hh, c] == 0:
+                    c_int = int(c)
+                    p_eff = p if lam == 0.0 else p * np.exp(lam * get_div(c_int))
+                    if r.random() < p_eff:
+                        needs.add(c_int)
             for recipe in t["recipes"]:
                 if r.random() < t["recipe_prob"]:
                     needs.update(int(c) for c in recipe)
@@ -186,7 +216,8 @@ def simulate(world, trips, week_slice_state, price=None, seed_base=0):
             loyalty[hh, c] = j
             if world.promo[j, wk] and r.random() < 0.5:
                 inventory[hh, c] = int(r.integers(2, 5))  # stockpile
-            if r.random() < 0.10 and len(items) > 1:      # variety seeking
+            v_prob = 0.10 if lam == 0.0 else 0.10 * np.exp(lam * get_div(c))
+            if r.random() < v_prob and len(items) > 1:    # variety seeking
                 others = items[items != j]; w2 = np.exp(utility[others] - utility[others].max())
                 basket.add(int(r.choice(others, p=w2 / w2.sum())))
         for _ in range(r.poisson(0.4)):                      # impulse purchases
@@ -211,6 +242,13 @@ def main():
     p.add_argument("--train-weeks", type=int, default=32)
     p.add_argument("--validation-weeks", type=int, default=10)
     p.add_argument("--scenario-products", type=int, default=16)
+    p.add_argument("--price-sens-mean", type=float, default=0.4,
+                   help="mean of the households' log price sensitivity (higher: price cuts move more)")
+    p.add_argument("--display-separate", action="store_true",
+                   help="displays on their own schedule instead of always with the 25%% price cut")
+    p.add_argument("--category-growth", type=float, default=0.0,
+                   help="inclusive-value slope lambda on category need and variety-seeking "
+                        "probabilities (0: pure within-category switching)")
     args = p.parse_args()
     started = time.time()
     rng = np.random.default_rng(args.seed)
@@ -356,9 +394,12 @@ def main():
                         subcategory=world.subcategory[kept], base_price=world.base_price[kept],
                         first_stocked=world.first_stocked[kept], original_item=kept)
     (args.output / "counterfactual_truth.json").write_text(json.dumps(
-        {"test_weeks": [test_start + 1, T], "item_ids": "original product ids; observed.npz original_item maps "
-         "modeled item ids to them", "scenarios": scenarios}) + "\n")
-    summary = {"seed": args.seed, "households_with_trips": int(len(customers)), "stores": S, "products": J,
+        {"test_weeks": [test_start + 1, T], "category_growth": float(args.category_growth),
+         "item_ids": "original product ids; observed.npz original_item maps modeled item ids to them",
+         "scenarios": scenarios}) + "\n")
+    summary = {"seed": args.seed, "category_growth": float(args.category_growth),
+               "args": {k: (str(v) if isinstance(v, Path) else v) for k, v in vars(args).items()},
+               "households_with_trips": int(len(customers)), "stores": S, "products": J,
                "products_simulated": J_all,
                "categories": C, "weeks": T, "train_weeks": args.train_weeks,
                "validation_weeks": args.validation_weeks, "trips": int(len(baskets)),

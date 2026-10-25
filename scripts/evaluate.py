@@ -202,6 +202,10 @@ def main():
         lam = model.iv_lambda()
         report["iv_slope_lambda"] = {"mean": float(lam.mean()), "min": float(lam.min()), "max": float(lam.max()),
                                      "values": [round(float(v), 4) for v in lam]}
+    if model.comp_raw is not None:
+        lam = model.comp_lambda()
+        report["comp_lambda"] = {"mean": float(lam.mean()), "min": float(lam.min()), "max": float(lam.max()),
+                                 "values": [round(float(v), 4) for v in lam]}
     started = time.time()
 
     report["likelihood"], (trips, ll, half, ess) = likelihood(model, batcher, np.load(args.reference), args, gen, tag)

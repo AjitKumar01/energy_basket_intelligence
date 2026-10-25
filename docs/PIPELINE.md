@@ -513,9 +513,10 @@ makes it worse: a commodity is split over 7 groups on average (soft drinks over 
    profitable. Version 4 without competition does not fix it. With competition it does on
    seeds 1 and 2; on seed 3 it gets the decisions right with the latent state fixed, but the
    losses are a third too small and reweighting loses 3 decisions. The difference between the
-   seeds is lambda_c (truth 0.05): calibrated mean 0.17, 0.04, 0.40, starting from the price
-   instrument's 0.29, 0.13, 0.59. Calibration lowers it only part of the way, so the
-   instrument's estimate decides the result, and on seed 3 it is eight times too high.
+   seeds is lambda_c (truth 0.05). It is not learned by gradient: the price instrument
+   re-estimates it from the current fit before training, after every epoch and at the end.
+   First estimate 0.29, 0.13, 0.59; final 0.17, 0.04, 0.40. So the instrument decides the
+   result, and on seed 3 it ends eight times too high.
    Making rho_0 linear is not a usable test: even with the mean size matched it shrinks the
    size variance from 87 to 7 (data 74).
 3. *A partition that keeps rivals together on Dunnhumby:* commodities, or affinity groups split

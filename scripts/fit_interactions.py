@@ -21,7 +21,9 @@ Stages:
     B  SML (--sml-epochs): stochastic maximum likelihood with one persistent Gibbs chain per
        training trip; price parameters are unfrozen here (centred prior at the base model);
        the running average of the parameters is scored on held-out training trips every
-       --val-every epochs and the best one is kept (early stop after --patience)
+       --val-every epochs and the best one is kept (early stop after --patience); each new
+       best is also written to <out>_best.pt at once, so a crash or kill keeps it (it has
+       not been through stage C)
     C  calibration (--cal-epochs): SML with phi and the context factors frozen, so the size
        and category terms settle to the final interactions
 
@@ -398,6 +400,9 @@ def main():
                     scored["comp_raw"] = model.comp_raw.detach().clone()
                 ll, ess = validation_ll()
                 row.update(val_ll=round(ll, 4), val_ess=round(ess, 4))
+                if ll > best_ll:                            # on disk too, so a crash or kill keeps it
+                    save(args.out.with_name(args.out.name + "_best.pt"), f"{name} epoch {epoch} (best so far)",
+                         state=scored)
                 if ll > best_ll + args.val_tol:
                     best_ll, best_state, bad = ll, {k: v.clone() for k, v in scored.items()}, 0
                 else:
@@ -421,8 +426,9 @@ def main():
         with torch.no_grad():                               # re-derive delta from the kept phi
             delta.copy_(model.phi[:, :args.rank] - psi[category])
 
-    def save(path, stage):
-        torch.save({"model": {k: v.detach().clone() for k, v in model.state_dict().items()},
+    def save(path, stage, state=None):
+        state = model.state_dict() if state is None else state
+        torch.save({"model": {k: v.detach().clone() for k, v in state.items()},
                     "initialization": str(args.initialization.resolve()),
                     "additive": str(args.additive.resolve()),
                     "rank": args.rank, "max_per_category": model.R, "use_f_extra": True, "presence_phi": True, "cat_rho0": True,

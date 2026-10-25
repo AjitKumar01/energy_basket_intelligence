@@ -19,6 +19,17 @@ revenue when only that category is promoted) and what the combined choice earns 
 
     stress_check.py --world WORLD --out FILE [--checkpoint CK --simulator base|v4 ...]
     (without --checkpoint: only the truth, cached in --truth-cache)
+
+Results are only comparable when their base models were fitted with the same settings (a
+large world fitted with --elast-target -1.86 against small ones with the default -0.121 once
+passed for a scale effect).  Every report therefore records ``base_fit``: the base model's
+elasticity anchor, price contract and discount split (for Version 4, those of the base model
+it was fitted from).  Before comparing reports, check them:
+
+    stress_check.py --same-fit A.json B.json ...
+
+which exits with status 1 and lists the differences if the settings differ or cannot be
+read.  Reports written before ``base_fit`` existed are read through the checkpoint they name.
 """
 from __future__ import annotations
 
@@ -165,8 +176,64 @@ def summarise(rows, K, L, levels):
             "same_level_share": float(np.mean(np.array(best["truth"]) == np.array(best["model"])))}
 
 
+BASE_FIT_KEYS = ("elast_w", "elast_target", "price_feature_contract", "discount_panel", "disc_kappa", "disc_common")
+
+
+def _existing(path, *anchors):
+    """``path`` if it exists, else the first existing ``anchor / path`` (relative paths)."""
+    path = Path(path)
+    for cand in [path] + ([Path(a) / path for a in anchors] if not path.is_absolute() else []):
+        if cand.exists():
+            return cand.resolve()
+    raise FileNotFoundError(path)
+
+
+def base_fit(checkpoint, simulator, *anchors) -> dict:
+    """The fit settings of the base model behind ``checkpoint`` (BASE_FIT_KEYS)."""
+    import torch
+    path = _existing(checkpoint, *anchors)
+    ck = torch.load(path, map_location="cpu", weights_only=False)
+    if simulator == "v4":
+        path = _existing(ck["additive"], *anchors, *path.parents)
+        ck = torch.load(path, map_location="cpu", weights_only=False)
+    cfg = ck.get("config") or ck.get("args") or {}
+    cfg = cfg if isinstance(cfg, dict) else vars(cfg)
+    out = {"base_checkpoint": str(path)}
+    for k in BASE_FIT_KEYS:
+        v = cfg.get(k)
+        out[k] = str(Path(v).resolve()) if k == "discount_panel" and v else (v if isinstance(v, (int, float, bool, type(None))) else str(v))
+    return out
+
+
+def same_fit(reports) -> int:
+    """Check that the reports' base models share their fit settings; 0 if so, else 1."""
+    fits, bad = {}, []
+    for r in reports:
+        rep = json.loads(Path(r).read_text())
+        try:
+            fits[r] = rep.get("base_fit") or base_fit(rep["checkpoint"], rep["simulator"], Path.cwd(),
+                                                      *Path(r).resolve().parents)
+        except (FileNotFoundError, KeyError) as e:
+            bad.append(f"{r}: base fit settings unreadable ({e})")
+    keys = [k for k in BASE_FIT_KEYS if len({json.dumps((f or {}).get(k)) for f in fits.values()}) > 1]
+    for k in keys:
+        bad.append(f"{k} differs: " + ", ".join(f"{r}={fits[r].get(k)!r}" for r in fits))
+    for r, f in fits.items():
+        print(f"[same-fit] {r}: " + " ".join(f"{k}={f.get(k)}" for k in BASE_FIT_KEYS), flush=True)
+    for b in bad:
+        print(f"[same-fit] REFUSED: {b}", flush=True)
+    if not bad:
+        print(f"[same-fit] OK: {len(fits)} reports share their base fit settings", flush=True)
+    return 1 if bad else 0
+
+
 def main():
+    if "--same-fit" in sys.argv:
+        q = argparse.ArgumentParser(description="check that reports share their base fit settings")
+        q.add_argument("--same-fit", nargs="+", type=Path, required=True)
+        raise SystemExit(same_fit(q.parse_args().same_fit))
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    p.add_argument("--same-fit", nargs="+", type=Path, help="only check that these reports share their base fit settings")
     p.add_argument("--world", type=Path, required=True)
     p.add_argument("--checkpoint", type=Path)
     p.add_argument("--initialization", type=Path)
@@ -190,6 +257,8 @@ def main():
                        latent=a.latent) if a.checkpoint else None
     if env is None:                                          # truth only: the environment's choices without a model
         raise SystemExit("--checkpoint is needed to fix the environment's trips and categories")
+    fit = base_fit(a.checkpoint, a.simulator)
+    print("[stress_check] base fit: " + " ".join(f"{k}={fit[k]}" for k in BASE_FIT_KEYS), flush=True)
     K, L, levels = len(env.categories), len(env.levels), env.levels
     rows_used = np.concatenate([env.week_trips[w] for w in test_weeks])
     gen_cats = [int(c[3:]) for c in env.categories]          # 'cat017' -> 17
@@ -234,7 +303,7 @@ def main():
     summary["combined_choice_true_uplift"] = combined
 
     report = {"world": str(a.world), "checkpoint": str(a.checkpoint), "simulator": a.simulator,
-              "latent": a.latent if a.simulator == "v4" else None, "categories": env.categories,
+              "latent": a.latent if a.simulator == "v4" else None, "base_fit": fit, "categories": env.categories,
               "levels": levels.tolist(), "test_weeks": test_weeks, "trips": int(len(rows_used)),
               "summary": summary, "actions": rows, "seconds": round(time.time() - started, 1)}
     a.out.write_text(json.dumps(report, indent=1) + "\n")

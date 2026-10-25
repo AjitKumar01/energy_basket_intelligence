@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import ctypes
 import importlib
+import importlib.machinery
 import os
 import platform
 import shutil
@@ -37,8 +38,9 @@ def exact_dp():
     global _exact_dp
     if _exact_dp is None:
         BUILD.mkdir(parents=True, exist_ok=True)
-        built = sorted(BUILD.glob("v4_exact_dp*.so"))
-        if not built or _stale(built[0], SOURCE / "exact_dp.cpp"):
+        # Only a build for this Python (its extension suffix, e.g. .cpython-313-darwin.so).
+        built = BUILD / f"v4_exact_dp{importlib.machinery.EXTENSION_SUFFIXES[0]}"
+        if _stale(built, SOURCE / "exact_dp.cpp"):
             subprocess.run([sys.executable, str(SOURCE / "setup_exact_dp.py"), "build_ext",
                             "--build-lib", str(BUILD), "--build-temp", str(BUILD / "temp")],
                            check=True, cwd=SOURCE, stdout=subprocess.DEVNULL)

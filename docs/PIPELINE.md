@@ -306,7 +306,9 @@ is a discount level (0/10/20/30%) for each of the 12 highest-revenue commodities
 reward is expected revenue at paid prices relative to the same week with no promotion. The
 simulator is either the base model (exact) or Version 4. It works, but its answers are not yet
 believable: 30% off everything triples revenue in the base model, because of the halo below.
-Do not use it for policy decisions until Phase 2 is done.
+Do not use it for policy decisions until Phase 2 is done. On synthetic worlds, scored against
+the true revenue, it is right when the base model is fitted with the default settings (Phase 2,
+item 2b); on Dunnhumby the discount slope still makes every promotion look profitable.
 
 **The halo** (`checks/halo.py`, stress world, 20% price cut on one product; change in items
 per 1,000 baskets, mean of 16 scenarios):
@@ -332,11 +334,20 @@ makes it worse: a commodity is split over 7 groups on average (soft drinks over 
 - **Basket size drifts with time** through the purchase-history features (above).
 - **The halo and too little switching** (above). This affects every price and promotion
   counterfactual on real data.
-- **Display is too weak**, and Version 4 made it weaker (0.06 purchase-weighted, against 0.38–0.43
-  in the data). Likely cause: display is learned separately per product with no pooling, while
-  in Dunnhumby display nearly always comes with a discount.
+- **Display weights of rarely displayed products are wrong.** Display is learned separately per
+  product with no prior. About 860 products were displayed but never bought on display; their
+  weights run to about −3 to −4, and each Version-4 epoch pushes them further. That is 85% of
+  the negative display weights (34% of the catalogue in the base model, 38% in Version 4), so
+  displaying such a product in a counterfactual predicts a fall. Where display actually happens
+  the weights are sound (+0.34 base, +0.31 Version 4, weighted by display trips), and the real
+  display effect is matched (item 4). The discount check's near-zero display effect is the same
+  tail: it switches display on across all discount events, 90% of which are never displayed.
 - **The discount response overshoots** (1.42 in Version 4, 1.30 in the base model, against
-  0.64–1.07 in the data).
+  0.64–1.07 in the data). Most of it is the common discount slope (0.76), which also makes
+  the base model's promotions grow the whole basket (item 2b).
+- **Compared worlds must be fitted with the same settings.** The large stress world's base was
+  fitted with `--elast-target -1.86`, which alone breaks it (item 2b); fits on it before
+  2026-10-25 (item 1's table) rest on that base.
 - On the stress world the own-price response is about 1.7× too strong on average.
 
 **Phase 2** (agreed 2026-10-22, in this order):
@@ -378,18 +389,162 @@ makes it worse: a commodity is split over 7 groups on average (soft drinks over 
    o_t = log sum_j exp(b0_tj + h_tj) - log sum_j exp(b0_tj), which removes the spread effect to
    first order and is still a per-trip constant (exact); check it on v4_rec without a refit
    first, as before.
+
+   *Inclusive centring, refitted* (`--centre-history inclusive`, warm-started from v4_hist,
+   one pseudo-likelihood epoch, hist_size −0.065). Expected size by period, 96 trips each
+   (mean, with the median in brackets; real 7.33 / 8.04 / 8.69 / 8.06):
+   inclusive 6.71 (4.7) / 8.53 (7.1) / 12.16 (7.9) / 16.93 (9.0), against mean centring
+   6.70 (5.0) / 9.60 (7.4) / 11.00 (7.2) / 11.95 (7.0). Validation log-likelihood on the
+   4,096 trips **−39.749, +0.071 ± 0.021 per basket over mean centring**; MRR 0.123 against
+   0.121 (± 0.007); on the 1,024 held-out training trips it is slightly behind (−38.372 against
+   −38.325). So inclusive centring fits a little better but does not stop the drift; its
+   mean size on the test weeks is larger (the tail grows), its median slightly closer.
+   Mean centring is kept for the next refits (the commodity partition): simpler and less
+   drift where it matters for generation; the remaining drift is a tail to study separately.
 1. *Within-group competition in the model:* a learned term that changes the energy of buying a
    second product from the same group, so a price change moves purchases within the group
    instead of adding items. It goes in the exact per-group DP. Test it on the stress world
    with `checks/halo.py` (switching and halo) before anything else.
+   *Status (2026-10-24).* Design (research agent, branch `v4-competition`): every product of a
+   category is shifted by iota_tc = (lambda_c - 1) x the price/promotion-driven change of the
+   category's inclusive value, so only a fraction lambda_c of a price cut's attraction gain
+   grows the category. It is a per-(trip, category) constant, so the normaliser stays exact.
+   The agent's version redefines M4c and learns lambda_c from an instrument rather than by
+   likelihood. A clean version is on branch `v4-competition-lik` (`--within-competition`,
+   its own parameter, lambda_c by likelihood, M4c unchanged, 29 exact tests); with the
+   latent term the switching is close to, not exactly, what lambda_c says. Both are being
+   fitted on the stress world and will be compared on `checks/halo.py`, held-out likelihood
+   and realism.
+   *Result on the partial-growth stress world* (category_growth 0.45: a cut partly grows the
+   category, partly switches within it; branch `v4-competition`, `--within-competition`).
+   Change in items per 1,000 baskets, 16 products at price x 0.8:
+
+   | | own product | own category | other categories |
+   |---|---|---|---|
+   | truth | +9.7 | +4.8 | +0.5 |
+   | no competition (`hs_rec`), reweighted / z fixed | +10.5 / +8.8 | +9.1 / +5.7 | +3.3 / −0.2 |
+   | lambda by instrument (`v4_comp`) | +9.9 / +8.7 | **+6.5 / +4.1** | **+2.0 / −0.3** |
+   | lambda by likelihood (`v4_complik`) | +10.5 / +8.8 | +8.6 / +5.4 | +3.3 / −0.1 |
+
+   The instrument gives lambda 0.61–0.73 across categories (mean 0.67; somewhat above the
+   generator's 0.45 growth slope) and on the pure-switching world 0.02–0.09 (truth 0), and
+   it removes about 40% of the reweighted halo. Likelihood gives lambda anywhere from 0.06
+   to 0.98 and changes almost nothing: it does not identify lambda. Held-out likelihood
+   (−24.91, −24.90, −24.89) and realism (full-basket AUC 0.627, 0.621, 0.627) are the same
+   for all three, so lambda costs nothing in fit. **Instrument chosen.** With the latent
+   state held fixed every model is near the truth on other categories; the reweighted
+   counterfactual keeps part of the halo even with competition.
+   *Caveat (2026-10-25):* all three fits were built on a base model fitted with
+   `--elast-target -1.86` instead of the default −0.121, which by itself creates the halo
+   (item 2b). The table above therefore measures the competition term on a broken base; on
+   the default-fit base the promotion environment has no halo with or without competition.
 2. *Hold the latent state fixed* in price and promotion counterfactuals (the environment and
-   the scenario scorer), if step 1 does not make it unnecessary.
+   the scenario scorer), if step 1 does not make it unnecessary. *Done as options:*
+   `checks/halo.py` reports both ("reweighted" and "z_fixed"); the promotion environment takes
+   `latent="fixed"` (`sim/run_policies.py --latent fixed`). On the default-fit base (item 2b)
+   reweighting is as good as holding fixed; the case for "fixed" came from the broken base.
+2b. *The promotion environment against the truth* (2026-10-25; branch `v4-scale`,
+   `sim/stress_check.py`, `run/small_world.sh`, `run/small_world_base.sh`). The generator gives
+   each trip its own random stream, so the test weeks re-simulated at discounted prices from
+   the same state are the true revenue. Actions: 30% off one of the 12 top categories, and
+   10/20/30% off all 12; "decisions right" is the share of the 12 categories where the model's
+   best level equals the truth's.
+
+   The large growth world's halo (base model: 30% off everything +30.5% against truth −11.6%,
+   35 of 36 single cuts "profitable") was not a scale effect. Its base model was fitted with
+   `--elast-target -1.86`; the small worlds used the default −0.121. Refitting the same
+   48-category small world (1,000 households, 5 stores, seed 1) changing one setting at a time:
+
+   | Base fit | 10% / 30% off all | corr | decisions right | single cuts that gain | own / rest at 30% |
+   |---|---|---|---|---|---|
+   | truth | −2.9% / −9.7% | — | — | 0 / 36 | −17.1% / −0.10% |
+   | default | −4.1% / −12.5% | 0.89 | 12 / 12 | 0 / 36 | −26.2% / +0.09% |
+   | `--elast-target -1.86` | +10.3% / +61.8% | −0.64 | 0 / 12 | 36 / 36 | +2.6% / +3.06% |
+
+   `--price-feature-contract chain_and_store` changes nothing on synthetic worlds (their
+   `store_price.npz` is empty); with it the fit is identical to the one without. The −1.86 fit
+   is also worse on validation (−26.60 against −26.52; on the large world −29.75 against
+   −29.51). Mechanism (research agent, checkpoint edits): the size potential rho_0(n) is
+   concave (each extra item costs less), so a large price slope that raises one category's
+   utility enlarges the whole basket.
+
+   Large growth world (476 products, 48 categories, 3,000 households, 15 stores), default-fit
+   base:
+
+   | Model | 10% / 30% off all | corr | decisions right | own / rest at 30% |
+   |---|---|---|---|---|
+   | truth | −2.9% / −11.6% | — | — | −18.3% / −0.03% |
+   | base | −4.4% / −13.5% | 0.92 | 12 / 12 | −21.8% / +0.05% |
+   | `hs_rec`, latent fixed / reweighted | −5.4% / −16.7%, −4.5% / −13.9% | 0.94 / 0.86 | 12 / 12 | −23.9%, −20.5% / −0.15%, −0.08% |
+   | `v4_comp`, latent fixed / reweighted | −5.6% / −17.2%, −4.9% / −15.0% | 0.94 / 0.89 | 12 / 12 | −25.2%, −22.5% / −0.13%, −0.07% |
+
+   Every model gets every decision right and none invents a halo; all overstate the loss a
+   little (own category −21% to −25% against −18%). A full-size world with a new seed
+   (48 categories, 3,000 households, 15 stores, default base) agrees: corr 0.76, 12 / 12.
+   On the default small worlds (12, 24, 48 categories; 1,000 or 3,000 households; 5 or 15
+   stores; 3 seeds each) the base model's rest-of-basket effect stays within ±0.8%.
+
+   *On Dunnhumby* (commodity base, research agent, `checks/halo_surgery.py` on `v4-scale`):
+   the elasticity anchor holds the regular-price slope at 0.21, but the common discount slope
+   (`--disc-common`, 0.76) is outside it, so a discount moves utility with slope 0.94. A 30% cut
+   on one top-12 commodity then raises the rest of the basket by +7.3% and all 12 cuts look
+   profitable. With the common discount slope set to zero the rest-of-basket effect falls to
+   +0.2%, but own items rise only 7% for a 30% cut, while the data's within-commodity share
+   slope is 0.64–1.07. So the slope is not simply wrong: the base model has no
+   within-commodity competition, and turns a share gain into basket growth. Whether
+   `v4_comp` routes it into switching is the next test, on a synthetic world built that way.
+   Making rho_0 linear is not a usable test: even with the mean size matched it shrinks the
+   size variance from 87 to 7 (data 74).
 3. *A partition that keeps rivals together on Dunnhumby:* commodities, or affinity groups split
    by commodity; then refit Steps 3 and 4.
+   *Status (2026-10-24).* One group per commodity (`scripts/build_commodity_partition.py`):
+   187 groups, largest 236 products (soft drinks), median 14, no residual group. The exact
+   dynamic program costs (products offered) x R per trip whatever the group sizes, so no cap
+   is needed. `run/commodity_bundle.sh` makes a linked copy of the bundle with this partition
+   and its own fingerprint; `run/commodity.sh` refits on it, warm-started from the co-purchase
+   fits (all product-level blocks; the per-category ones start afresh).
+   Base model: validation LL **−44.655** (co-purchase partition −44.706, same 1,024 trips).
+   Real halo +0.45 (co-purchase +0.46, data −0.15), own display +36%, discount depth slope 1.28
+   (1.30): **the partition alone does not change the halo**, as on the stress world, where the
+   true categories as partition still had it. It is what lets the competition term (item 1)
+   act on true rivals.
+   Version 4 on this partition (`runs/commodity/v4_hist_mean.pt`, recency, mean centring, same
+   schedule as `v4_hist`, 8.9 h): validation LL **−37.875** (co-purchase `v4_hist` −38.301, same
+   1,024 trips), basket size in the chains 7.62 (data 7.65). Discount depth slope 1.26 (data
+   0.64 on validation weeks; co-purchase `v4_rec` 1.32). Display weights 38% negative (the
+   rarely displayed products, Known weaknesses). Real halo (12 trips per store-week, 16
+   latent draws) **+0.37** ± 0.02 (co-purchase Version 4 +0.35, data −0.15); own display
+   effect on the 48 well-measured commodities +17.6% (data +13.6%). Size by period (48 trips
+   per period, noisy): 5.62 / 9.74 / 6.38 / 8.24 against real 5.50 / 10.77 / 8.33 / 8.75 —
+   no upward drift. **Better fit, same halo.**
 4. *Measure the real halo:* when one commodity is discounted in a store-week, do other
-   commodities' purchases per trip move?
-5. *Promotions:* a common display slope with per-product variation shrunk toward it, and a
-   firmer prior on the promotion weights during Version-4 training.
+   commodities' purchases per trip move? *Done* (`checks/halo_real.py`). Discount depth is
+   chain-wide here, so the comparison uses display, which varies by store within a week:
+   1,560 store-weeks (70 stores, at least 30 trips each), store and week fixed effects, the 60
+   most-bought commodities. 100 more products on display elsewhere in the store change the
+   other commodities' items per trip by **−0.15 in the data** (± 0.03 if the commodities were
+   independent) and by **+0.46 in the base model** on the same trips. So the model's halo has
+   the wrong sign on real data. Version 4 (`v4_hist`, 12 trips per store-week, 16 latent
+   draws): halo **+0.35** (± 0.03): the latent term shrinks the halo only a little.
+   Own display effect per 10 products, relative to the commodity's items per trip:
+
+   | | data | base | Version 4 |
+   |---|---|---|---|
+   | plain mean, 60 commodities | +46% | +36% | +14% |
+   | 48 well-measured commodities (data relative se < 0.5) | +13.6% | +17.0% | +16.1% |
+   | weighted by the data's precision | +2.7% | +6.2% | +6.0% |
+
+   The plain mean is dominated by a few produce commodities that are almost never displayed
+   (PEPPERS-ALL alone is +12.4 ± 3.5 in the data, adding +0.23 to the mean), so the earlier
+   reading "Version 4 loses most of the display effect" was wrong: on the measurable
+   commodities both models match the data, slightly above it. (Version 4 was also run at 12
+   trips per store-week against 24 for the base model; compare at the same `--model-trips`.)
+5. *Promotions:* the display problem is the rarely displayed products (Known weaknesses), not
+   the real display effect. Fix: a common display slope (and mailer slope) with per-product
+   deviations shrunk to zero, held fixed during pseudo-likelihood. Small enough to fold into
+   the next Version-4 fit, not a separate refit. Judge it by the share of negative weights
+   and the precision-weighted own effect, not the plain mean. Diagnosis:
+   `v4-promotions` branch, `checks/diagnose_display.py`.
 6. Then the promotion environment, the test weeks for the chosen model, and SHOPPER on Dunnhumby.
 
 ## 8. Commands

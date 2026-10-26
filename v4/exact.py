@@ -19,11 +19,27 @@ The gradient of log Z with respect to u is the incidence P(j in S) of every slot
 """
 from __future__ import annotations
 
+import os
+
 import torch
 
 from .kernels import CategoryProduct, CategoryProduct2D, RowESP
 
 ESP_BUCKETS = (8, 32, 96, 256)
+
+# With M3 a basket's weight depends on its size only through m, the number of categories
+# present, so log Z needs a pass over categories only (log_partition_by_categories); the item
+# count enters the 2-D program only through the cap at nmax items, whose excluded mass is
+# negligible (below 1e-8 in log Z on real trips).  V4_CATEGORY_DP=0 restores the 2-D program.
+CATEGORY_DP = os.environ.get("V4_CATEGORY_DP", "1") != "0"
+
+
+def size_mode(model):
+    """The sampler's size flag: 0 size potential on items, 1 on categories with the item cap
+    (2-D program), 2 on categories without it (pass over categories)."""
+    if not model.size_on_categories:
+        return 0
+    return 2 if CATEGORY_DP else 1
 
 
 def trip_max(u, ix):
@@ -121,8 +137,33 @@ def log_mass_by_size_and_categories(model, ix, log_g, scale):
             - model.rho_0()[None, None, 1:model.nmax + 1])
 
 
+def log_partition_by_categories(model, ix, u, *, z=None, beta=1.0, iv=None):
+    """log Z per trip of an M3 law, summing over the number of categories present only:
+
+        Z = sum_{m=1..M} exp(-rho_0(m)) e_m(W_1..W_C),   W_c = sum_{k>=1} g_c(k)
+
+    (g_c(0) = 1; M = min(nmax, Cpad)).  No cap on the number of items."""
+    log_g, scale = category_polynomials(model, ix, u, z=z, beta=beta, iv=iv)
+    k = torch.arange(log_g.shape[1], dtype=log_g.dtype)
+    log_g = log_g + k * scale[ix.row_trip][:, None]                        # undo the centring
+    log_w = torch.logsumexp(log_g[:, 1:], 1)
+    # empty entries are a large finite negative, not -inf: logaddexp's gradient at (-inf, -inf) is nan
+    empty = -1e100
+    padded = torch.full((ix.B * ix.Cpad,), empty, dtype=log_w.dtype).index_copy(
+        0, ix.flat_slot, log_w).view(ix.B, ix.Cpad)
+    M = min(int(model.nmax), ix.Cpad)
+    # e_0..e_M one category at a time, in log space (stable for any spread of the W_c)
+    log_e = torch.cat([torch.zeros(ix.B, 1, dtype=log_w.dtype),
+                       torch.full((ix.B, M), empty, dtype=log_w.dtype)], 1)
+    for c in range(ix.Cpad):
+        log_e = torch.cat([log_e[:, :1], torch.logaddexp(log_e[:, 1:], log_e[:, :-1] + padded[:, c:c + 1])], 1)
+    return torch.logsumexp(log_e[:, 1:] - model.rho_0()[1:M + 1], 1)
+
+
 def log_partition(model, ix, u, *, z=None, beta=1.0, iv=None):
     """log Z per trip of the law of S given slot utilities u (and z for M2)."""
+    if size_mode(model) == 2:
+        return log_partition_by_categories(model, ix, u, z=z, beta=beta, iv=iv)
     log_g, scale = category_polynomials(model, ix, u, z=z, beta=beta, iv=iv)
     if model.size_on_categories:
         return torch.logsumexp(log_mass_by_size_and_categories(model, ix, log_g, scale).reshape(ix.B, -1), -1)

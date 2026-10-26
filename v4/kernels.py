@@ -73,8 +73,8 @@ def sampler():
         so.gibbs_four_chains_cpp.argtypes = [I] * 11 + [P] * 4 + [I] + [P] * 25
         so.log_partition_cpp.argtypes = [I] * 8 + [P] * 13
         so.log_partition_batch_z_cpp.argtypes = [I] * 10 + [D] + [P] * 15
-        so.log_degree_2d_forward_cpp.argtypes = [I] * 4 + [P] * 5
-        so.log_degree_2d_backward_cpp.argtypes = [I] * 4 + [P] * 5
+        so.log_degree_2d_forward_cpp.argtypes = [I] * 4 + [P] * 7
+        so.log_degree_2d_backward_cpp.argtypes = [I] * 4 + [P] * 7
         for f in (so.sample_slots_cpp, so.gibbs_sweeps_cpp, so.gibbs_stages_cpp,
                   so.gibbs_four_chains_cpp, so.log_partition_cpp, so.log_partition_batch_z_cpp,
                   so.log_degree_2d_forward_cpp, so.log_degree_2d_backward_cpp):
@@ -169,7 +169,7 @@ class CategoryProduct2D(torch.autograd.Function):
         B, Cpad, stride = lp.shape
         out = torch.empty((B, nmax + 1, nmax + 1))
         check(sampler().log_degree_2d_forward_cpp(B, Cpad, stride, nmax, ptr(lp), ptr(deg),
-                                                  ptr(out), 0, 0), "2-D DP")
+                                                  ptr(out), 0, 0, 0, 0), "2-D DP")
         ctx.save_for_backward(lp, deg)
         ctx.nmax = nmax
         return out
@@ -184,13 +184,17 @@ class CategoryProduct2D(torch.autograd.Function):
         grad_in = torch.empty_like(lp)
         step = CategoryProduct2D.CHUNK
         states = torch.empty((min(step, B), Cpad + 1, n, n))
+        state_exp = torch.empty((min(step, B), Cpad + 1, n))      # power-of-two exponent per row
         for s in range(0, B, step):
             e = min(s + step, B)
             lp_c, deg_c, g_c = lp[s:e], deg[s:e], g[s:e]
             q_c, out_c, grad_c = torch.empty_like(lp_c), torch.empty((e - s, n, n)), torch.empty_like(lp_c)
+            qx_c = torch.empty_like(lp_c)
             check(sampler().log_degree_2d_forward_cpp(e - s, Cpad, stride, ctx.nmax, ptr(lp_c), ptr(deg_c),
-                                                      ptr(out_c), ptr(q_c), ptr(states)), "2-D DP")
+                                                      ptr(out_c), ptr(q_c), ptr(states), ptr(qx_c),
+                                                      ptr(state_exp)), "2-D DP")
             check(sampler().log_degree_2d_backward_cpp(e - s, Cpad, stride, ctx.nmax, ptr(g_c), ptr(q_c),
-                                                       ptr(deg_c), ptr(states), ptr(grad_c)), "2-D DP backward")
+                                                       ptr(deg_c), ptr(states), ptr(grad_c), ptr(qx_c),
+                                                       ptr(state_exp)), "2-D DP backward")
             grad_in[s:e] = grad_c
         return grad_in, None, None

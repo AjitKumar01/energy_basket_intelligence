@@ -482,3 +482,36 @@ def test_single_basket_four_chains_and_truncated_sampler_against_enumeration():
         model, ix1, torch.Generator().manual_seed(19), burn=50, components=16, thin=2, draws=512)
     assert abs(float(est1[0]) - exact_lz0) < 0.02
     assert 1 <= int(X_out.sum()) <= NMAX
+
+
+@pytest.mark.parametrize("name", ["M3", "all", "all-competition"])
+def test_log_partition_with_sizes_beyond_double_range(name):
+    """Basket weights of different sizes that differ by far more than a double can hold:
+    one product at utility 1000 and four at 740, so after centring at the trip's largest
+    utility a size-4 basket is e^-780 in the table, yet e^2220 heavier than size 1 once n * 1000
+    is added back.  A single tilt per trip rounded size 4 to zero and lost about 740 nats of log Z
+    here (and 123 nats on a real Dunnhumby trip at a chain-end z).  Both the training path
+    (with gradient: CategoryProduct2D) and the fast path (log_partition_cpp) must match
+    enumeration, and so must the incidence."""
+    model = make_model(**BLOCKS[name])
+    batch = make_batch()
+    batch.bind(model)
+    ix = batch.ix
+    z = torch.randn(2, RANK, generator=torch.Generator().manual_seed(3))
+    u = model.slot_utilities_given_z(ix, z).detach().clone()
+    iv = model.iv_shift(ix)
+    trip0 = [s for s in range(len(ix.item)) if int(ix.item_trip[s]) == 0]
+    for s in trip0:
+        j = int(ix.item[s])
+        u[s] = 1000.0 if j == 0 else 740.0
+    lz_grad, p = exact.incidence(model, ix, u, z=z, iv=iv)
+    with torch.no_grad():
+        lz_fast = exact.log_partition(model, ix, u, z=z, iv=iv)
+    for t in range(2):
+        energies = {S: energy_given_z(model, ix, u, z, iv, S) for S in baskets_of(ix, t)}
+        lz_t = log_sum_exp(list(energies.values()))
+        assert abs(float(lz_grad[t]) - lz_t) < 1e-8
+        assert abs(float(lz_fast[t]) - lz_t) < 1e-8
+        for s in (s for s in range(len(ix.item)) if int(ix.item_trip[s]) == t):
+            prob = sum(math.exp(e - lz_t) for S, e in energies.items() if s in S)
+            assert abs(float(p[s]) - prob) < 1e-10

@@ -12,8 +12,11 @@ prod_c g_c(t), weighted by exp(-rho_0(n)).  With M3 the product also tracks the 
 categories present, m, and the weight is exp(-rho_0(m)) instead (the 2-D program).
 
 Numerics: utilities are centred at each trip's largest value (``scale``; added back as
-n * scale), and each category polynomial is tilted by its largest per-degree slope before
-the product (added back as n * slope), so every intermediate stays in range.
+n * scale) and the category polynomials are tilted by the trip's largest per-degree slope
+(added back as n * slope).  The product over categories then keeps a power-of-two exponent
+for every basket size n (v4/native/sampler.cpp, "Row-scaled (n, m) tables"): weights of
+different sizes can differ by far more than a double holds, and a single scale per trip
+rounded whole sizes to zero (123 nats of log Z lost on a real trip at a chain-end z).
 
 The gradient of log Z with respect to u is the incidence P(j in S) of every slot.
 """

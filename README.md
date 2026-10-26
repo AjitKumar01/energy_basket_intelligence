@@ -11,6 +11,7 @@ as a baseline and scored the same way.
 | [`docs/STRESS_WORLD.md`](docs/STRESS_WORLD.md) | the synthetic stress world: how its baskets are generated, its causal price truth, what it tests |
 | [`docs/PIPELINE.md`](docs/PIPELINE.md) | the stages, which parameters each learns, what is decided on validation data, checks, results, known weaknesses |
 | [`docs/SHOPPER_BASELINE_PROTOCOL.md`](docs/SHOPPER_BASELINE_PROTOCOL.md) | the locked protocol for the SHOPPER comparison |
+| [`docs/textbook.html`](docs/textbook.html) ([PDF](docs/textbook.pdf)) | the Textbook: what the model adds, related work, the problem and how it is solved, components, applications, evidence and limits (2026-10-26) |
 
 | Folder | Content |
 |---|---|

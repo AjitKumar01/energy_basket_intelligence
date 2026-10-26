@@ -515,3 +515,34 @@ def test_log_partition_with_sizes_beyond_double_range(name):
         for s in (s for s in range(len(ix.item)) if int(ix.item_trip[s]) == t):
             prob = sum(math.exp(e - lz_t) for S, e in energies.items() if s in S)
             assert abs(float(p[s]) - prob) < 1e-10
+
+
+@pytest.mark.parametrize("name", ["additive", "M3", "all"])
+def test_log_partition_with_categories_far_below_the_trip(name):
+    """Category 0 at utilities 800, -400, -400 and the two products of category 1 at 400:
+    after centring at the trip's largest utility, category 1's pair term is e^-800, below the
+    double range, yet the basket {800, 400, 400} is e^400 heavier than any basket without
+    that pair.  The
+    within-category sums must keep it (each category centred at its own largest weight), on
+    the training path (with gradient) and on the fast path, and so must the incidence.
+    (A spread of more than about 745 nats inside one category is still not supported.)"""
+    model = make_model(**BLOCKS[name])
+    batch = make_batch()
+    batch.bind(model)
+    ix = batch.ix
+    z = torch.randn(2, RANK, generator=torch.Generator().manual_seed(3))
+    u = model.slot_utilities_given_z(ix, z).detach().clone()
+    iv = model.iv_shift(ix)
+    for s in (s for s in range(len(ix.item)) if int(ix.item_trip[s]) == 0):
+        u[s] = {0: 800.0, 1: -400.0, 2: -400.0, 3: 400.0, 4: 400.0}[int(ix.item[s])]
+    lz_grad, p = exact.incidence(model, ix, u, z=z, iv=iv)
+    with torch.no_grad():
+        lz_fast = exact.log_partition(model, ix, u, z=z, iv=iv)
+    for t in range(2):
+        energies = {S: energy_given_z(model, ix, u, z, iv, S) for S in baskets_of(ix, t)}
+        lz_t = log_sum_exp(list(energies.values()))
+        assert abs(float(lz_grad[t]) - lz_t) < 1e-8
+        assert abs(float(lz_fast[t]) - lz_t) < 1e-8
+        for s in (s for s in range(len(ix.item)) if int(ix.item_trip[s]) == t):
+            prob = sum(math.exp(e - lz_t) for S, e in energies.items() if s in S)
+            assert abs(float(p[s]) - prob) < 1e-10

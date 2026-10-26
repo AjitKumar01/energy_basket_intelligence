@@ -50,7 +50,22 @@ def trip_max(u, ix):
 
 
 def row_esp(log_w, ix, R):
-    """log e_0..e_R for every row, [rows, R+1]."""
+    """log e_0..e_R for every row, [rows, R+1].
+
+    Each row is centred at its own largest log weight m_r before the kernels, which sum in
+    plain numbers, and k m_r is added back to log e_k (exact: e_k(w) = e^{k m} e_k(w e^{-m})).
+    Centred at the trip's largest utility instead, a category far below it had every
+    multi-product term under e^-745 rounded to zero (57-62 nats of log Z lost on real trips
+    whose chains reach the size cap).  m_r is detached: the shift's own gradient is
+    exactly zero, because sum_j d log e_k / d log w_j = k."""
+    m = torch.full((ix.n_rows,), -float("inf")).index_reduce_(
+        0, ix.row_of, log_w.detach(), "amax", include_self=True)
+    m = torch.where(torch.isfinite(m), m, torch.zeros_like(m))
+    k = torch.arange(R + 1, dtype=log_w.dtype)
+    return _row_esp_centred(log_w - m[ix.row_of], ix, R) + m[:, None] * k[None, :]
+
+
+def _row_esp_centred(log_w, ix, R):
     row_start, contig = _ragged_meta(ix)
     if contig:                                # products stored row by row: one ragged pass
         return RowESPRagged.apply(log_w, row_start, ix.row_size, R)

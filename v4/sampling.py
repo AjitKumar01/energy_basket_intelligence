@@ -48,7 +48,10 @@ def _max_count(model, ix):
 
 
 def _min_cap(model):
-    if os.environ.get("V4_LEGACY") == "1" or os.environ.get("V4_EXACT_SWEEPS") == "1":
+    """Smallest per-(trip, z) item cap of the sampler (the cap is certified: <= 1e-8 of the
+    mass is cut).  V4_LEGACY=1 turns it off; V4_EXACT_SWEEPS=1 only restores the old sweep
+    schedule of importance_log_z and leaves the cap on."""
+    if os.environ.get("V4_LEGACY") == "1":
         return int(model.nmax)
     return int(getattr(model, "trunc_min_cap", 32))
 

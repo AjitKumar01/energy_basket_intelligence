@@ -23,7 +23,8 @@ import torch
 
 HERE = Path(__file__).resolve().parent
 SOURCE = HERE / "native"
-BUILD = HERE.parent / "build" / "native"
+# V4_BUILD_DIR keeps the builds of different Python installs apart (they share extension suffixes).
+BUILD = Path(os.environ["V4_BUILD_DIR"]) if os.environ.get("V4_BUILD_DIR") else HERE.parent / "build" / "native"
 
 _exact_dp = None
 _sampler = None

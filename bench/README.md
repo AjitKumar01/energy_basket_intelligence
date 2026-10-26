@@ -11,13 +11,15 @@ cd /Users/ajit/Projects/nf_dunnhumby/ebi_v4_pipeline
 source bench/env.sh            # sets PY, the model paths and OMP_NUM_THREADS=4
 ```
 
-- Use `$PY` (Python 3.13.4 at `/Users/ajit/.pyenv/versions/3.13.4/bin/python3`). It has torch,
-  pandas, scipy and pytest. Do not use the Homebrew Python 3.11: it has no pytest, and its
-  timings differ (one synthetic basket: 0.198 s there, 0.265 s here). Compare old and new code
-  with the same interpreter.
-- The C++ kernels build themselves on first use (clang++) into `build/`, and rebuild when
-  the `.cpp` file is newer than the library. After editing a `.cpp` file, the first run
-  prints nothing for a few seconds while it compiles.
+- Use `$PY`: `/Users/ajit/Projects/nf_dunnhumby/.bench-python/venv/bin/python3`, a
+  standalone CPython 3.13.4 with the pinned `requirements.txt` (torch 2.9.1, numpy 2.3.5,
+  pandas, scipy, scikit-learn, pyarrow, pytest, gymnasium), all inside the project folder
+  (`.bench-python/`, 786 MB); it needs nothing from pyenv or Homebrew. Do not use other
+  Pythons on the machine. Compare old and new code with this same interpreter.
+- The C++ kernels build themselves on first use with `clang++` (Xcode command-line tools,
+  `/usr/bin/clang++`) into `$V4_BUILD_DIR` = `build/native-bench`, and rebuild when the
+  `.cpp` file is newer than the library. After editing a `.cpp` file the first run is
+  silent for 5-10 s while it compiles. If compiling fails, report the compiler's message.
 - Write outputs under `runs/bench/` (git-ignored). Never pipe a run through `grep` into a
   file: grep buffers and the log stays empty until the end. Use `$PY -u ... > file 2>&1`
   and follow it with `tail -f file`.
@@ -27,7 +29,7 @@ source bench/env.sh            # sets PY, the model paths and OMP_NUM_THREADS=4
 ## Tests (exactness against enumeration of every basket)
 
 ```bash
-$PY -m pytest -q tests/test_law.py          # 35 passed in about 2 s
+$PY -m pytest -q tests/test_law.py          # 35 passed (about 10 s the first time: it compiles the kernels)
 ```
 
 `tests/tiny.py` builds a world where every basket can be listed; `tests/test_law.py` checks
@@ -76,16 +78,16 @@ commits 31ad866 and b503a4a) matched log Z to 7e-12 at fixed z but its chains ra
 real trip went to about 2,660 items in 100 sweeps). Always also run `--check chain` with
 several seeds and compare the size paths, and `--check ll` with `compare.py`.
 
-## Baseline (current code, Python 3.13.4, 4 threads, machine idle)
+## Baseline (current code, `$PY`, 4 threads, machine idle)
 
-Synthetic (`runs/bench/baseline/syn_timing.log`, `syn_chain.log`):
+Synthetic (`runs/bench/baseline/syn_timing_benchpy.log`, `syn_chain_benchpy.log`):
 
 | measure | value |
 |---|---|
 | exact log Z, 256 trips | 0.0072 s |
-| one Gibbs sweep, 256 trips | 0.0072 s |
-| likelihood, 1 basket (128 draws) | 0.265 s |
-| likelihood, per basket in 256 | 0.0443 s |
+| one Gibbs sweep, 256 trips | 0.0073 s |
+| likelihood, 1 basket (128 draws) | 0.267 s |
+| likelihood, per basket in 256 | 0.043 s |
 | chain seed 9, mean size after 0/10/50/100/200/400 sweeps | 9.39 / 8.89 / 8.17 / 8.89 / 9.53 / 9.75 (largest 31 = cap at 200) |
 
 Real (`bench/timing.py --world real --quick`, and earlier runs with the same settings):
@@ -94,5 +96,5 @@ Real (`bench/timing.py --world real --quick`, and earlier runs with the same set
 |---|---|
 | exact log Z, 256 trips | 0.28 s |
 | one Gibbs sweep, 256 trips | 0.39-0.49 s |
-| likelihood, 1 basket (128 draws) | 3.95 s |
+| likelihood, 1 basket (128 draws) | 3.98 s |
 | likelihood, per basket in 256 | 1.46 s |

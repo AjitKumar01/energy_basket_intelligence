@@ -1,7 +1,10 @@
 # Source this before any bench command:  source bench/env.sh
-# One Python for everything (it has torch, pandas, scipy, pytest).
-export PY=/Users/ajit/.pyenv/versions/3.13.4/bin/python3
+# One self-contained Python for everything (standalone CPython 3.13.4 plus the pinned
+# requirements.txt, all inside the project folder; no pyenv or Homebrew needed).
+export PY=/Users/ajit/Projects/nf_dunnhumby/.bench-python/venv/bin/python3
 export REPO=/Users/ajit/Projects/nf_dunnhumby/ebi_v4_pipeline
+# Its own build of the C++ kernels (built on first use with clang++).
+export V4_BUILD_DIR=$REPO/build/native-bench
 export OMP_NUM_THREADS=4
 # Synthetic world, seed 3 (nmax 31, 48 categories, 522 products).  Its checkpoint records paths
 # relative to SYN_RUN_DIR, so the scripts change into that directory before loading.

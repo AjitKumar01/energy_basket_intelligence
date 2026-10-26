@@ -123,6 +123,18 @@ nohup run/dunnhumby.sh > runs/dunnhumby/pipeline.out 2>&1 &
 | 4 | `scripts/fit_interactions.py` (recency; recency + M4c), then the discount check and the support-cap check on each | `v4_rec.pt`, `v4_m4c.pt`, `v4_*_discount_check.json`, `v4_*_support_cap.json` |
 | 5 | test weeks, once, for the chosen variant: `CHOSEN=rec FROM=5 run/dunnhumby.sh` | `reference_test_trips.npz`, `v4_rec.eval.json` |
 
+**The current model: commodity partition** (one category per Dunnhumby commodity, within-
+category competition, common display and mailer slopes; `docs/PIPELINE.md` §7.0). From a
+Dunnhumby run (its `initialization.pt` and base model), build the commodity bundle and base
+model, then Version 4 and its checks (discount, basket size by period, real halo):
+
+```bash
+SRC=data/dunnhumby DEST=runs/bundle_commodity run/commodity_bundle.sh          # the partition
+PANEL=runs/dunnhumby/log_discount.npy WARM=runs/dunnhumby/additive/v3_pipeline_additive_best.pt \
+  nohup run/commodity.sh > runs/commodity/pipeline.out 2>&1 &                  # base model
+nohup run/commodity_comp.sh > runs/commodity/comp_promo.out 2>&1 &             # Version 4 + checks
+```
+
 **Version 4 only, from an existing base model** (the update-matched schedule, at most 40
 products per category):
 
@@ -176,6 +188,7 @@ tail -f runs/dunnhumby/4_v4_rec.out                               # everything, 
 ps -eo pid,etime,rss,pcpu,command | grep "[f]it_"                 # running jobs, memory, CPU
 ```
 
-This branch (`v4-pipeline`) is self-contained: from raw data to fitted, checked models, it needs
-nothing outside it. It was distilled from the research branch `v4-training`, which keeps the
+This branch is self-contained: from raw data to fitted, checked models, it needs nothing
+outside it. `bench/` times the normaliser and sampler and checks that a change keeps the law
+(`bench/README.md`). It was distilled from the research branch `v4-training`, which keeps the
 full history of experiments and diagnostics (see `docs/PIPELINE.md` §9).

@@ -176,7 +176,67 @@ Two related fixed rules:
 5. **SHOPPER baseline**: a sequential model (Ruiz, Athey and Blei), refitted in PyTorch on the
    same trips, scored the same way.
 
-## 7. Where things stand (2026-10-22)
+## 7. Where things stand
+
+### 7.0 Latest (2026-10-26): the commodity model and the exact normaliser
+
+**The current Dunnhumby model** is Version 4 on the commodity partition (`run/commodity.sh`
+for the bundle and base model, then `run/commodity_comp.sh`): recency with mean-centred
+history, within-category competition with lambda_c from the price instrument on a fixed
+40,000 training trips (`--within-competition --comp-estimator instrument --comp-iv-trips
+40000`), and one common display slope and one mailer slope with per-product deviations
+shrunk to zero (`--promo-common`).
+
+Fit before the normaliser fix (`runs/commodity/v4_comp_promo.pt`), against the data:
+
+| Measure | Model | Data |
+|---|---|---|
+| Validation log-likelihood (1,024 trips) | −37.889 | — |
+| Discount depth slope | 1.51 | 0.64 validation (0.35–0.93), 1.07 train |
+| Display, purchase-weighted log-ratio (negative weights) | 0.363 (0.02%) | 0.375 |
+| Mailer, purchase-weighted | 0.383 | 0.347 |
+| Real halo (items per trip per 100 displayed products elsewhere) | +0.088 ± 0.023 | −0.148 ± 0.025 |
+| Basket size: train early / train late / validation / test | 5.59 / 9.79 / 6.60 / 7.39 | 5.50 / 10.77 / 8.33 / 8.75 |
+
+**Underflow in the exact normaliser (found and fixed 2026-10-26).** The size table of the
+normaliser (total weight of baskets with n products in m categories) used one scale per
+trip. When one category is far stronger than the others, as happens at the latent z reached
+by long Gibbs chains, large baskets fell below the double range (about e^-745) in the table
+and were rounded to zero, although they dominate once n x scale is added back. On the
+commodity model, at z after 200 Gibbs sweeps, log Z was 55–113 too low on 5 of 256 held-out
+trips (one trip: 123 too low, incidence 47.9 products instead of 119.5); at z near the
+observed basket it never happened, and on the synthetic worlds (31-product cap) never
+(largest difference 7e-15). Training (SML) evaluates exactly this log Z and its gradient at
+chain z, so the fit above was trained with the error on about 2% of trips per step. The
+fitted size potential matches that: rho_0(m) rises to m = 9 and then falls to −26 at 39
+categories and −273 at 120, 130 of 187 categories have rho_c <= 0, and Gibbs chains from the
+observed baskets put 1 or 2 of 64 trips at the 120-product cap within 400 sweeps. The fix
+gives every basket size its own power-of-two exponent (2-D and 1-D tables, forward and
+gradient, `v4/native/sampler.cpp` "Row-scaled (n, m) tables", `v4/native/exact_dp.cpp`).
+Checked against a fully log-space reference on 64 real trips (largest difference 1.5e-10, the
+sampler's truncation tolerance) and by `test_log_partition_with_sizes_beyond_double_range`,
+which the old code fails by 740. Left as is: the per-category ESP can drop terms below e^-745
+of a category's largest; on the real chain-end trips this changed log Z by less than 1e-11.
+The model is being refitted with the fix (`runs/commodity/v4_comp_promo_fixed`).
+
+**Speed** (research agent, re-measured; real commodity model, 4 threads, idle machine):
+
+| | Before | Now |
+|---|---|---|
+| Exact log Z, 256 trips | 0.154 s | 0.050 s |
+| One Gibbs sweep, 256 trips | 0.261 s | 0.047 s |
+| Likelihood of one basket (128 draws) | 3.86 s | see below |
+
+The gains: a per-(trip, z) product cap K chosen with a certified bound (the baskets above K
+carry at most 1e-8 of the mass; K grows to nmax when z needs it), in-place 2-D tables, whole
+Gibbs chains in C++, cached trip utilities. Gibbs chains are identical draw for draw with and
+without the cap (5 seeds, synthetic and real). A shorter importance-sampling schedule (35%
+fewer sweeps, one basket 0.10 s) was tried and dropped: on 256 real baskets it moved the
+held-out log-likelihood by −0.0052 ± 0.0039, too close to the differences used to choose
+models. Training is barely faster (about 12%): one SML step is mostly the gradient of the
+utilities and of the exact size table, which these changes do not touch.
+
+### 7.1 Earlier results (to 2026-10-22)
 
 **Stress world**, model with recency (`hs_rec`; M4c in brackets):
 

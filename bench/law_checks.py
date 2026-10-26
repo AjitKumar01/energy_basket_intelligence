@@ -6,11 +6,11 @@
            the end of long Gibbs chains (where z can be far from typical).
   chain    block-Gibbs chains on (z, S) started at the observed baskets: mean and largest basket
            size and the number of trips at the item cap after 0, 10, 50, 100, 200, 400 sweeps
-           (the check that caught the uncapped variant running away to ~2,660 items).
+           (the check that caught an uncapped variant running away to ~2,660 items).
   logz     exact log Z at the same (trip, z) pairs, written to --save (.npz) so two code
-           versions can be compared trip by trip with  bench/compare_logz.py.
+           versions can be compared trip by trip with  bench/compare.py.
   ll       log-likelihood of held-out baskets at draws 1024 (burn 200, components 128, thin 4),
-           saved per basket to --save for a paired comparison (bench/compare_ll.py).
+           saved per basket to --save for a paired comparison (bench/compare.py).
 
     python bench/law_checks.py --world syn --check chain [--trips 64] [--seed 9]
 """

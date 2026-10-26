@@ -756,8 +756,7 @@ int sample_trip_categories_2d_impl(
 }
 
 // Compute exact log Z for a single trip b given its row polynomials G (with G[fslot*K1 + 0] = 0)
-// and per-trip max slot utility trip_scale (M3: row-scaled 2-D table; the 1-D branch still uses
-// one tilt per trip).
+// and per-trip max slot utility trip_scale; both branches keep an exponent per basket size.
 double trip_log_partition_from_G(
     int64_t b,
     int64_t Cpad,
@@ -784,7 +783,6 @@ double trip_log_partition_from_G(
     }
     int64_t n_active = 0;
     int64_t sum_Kr = 0;
-    double slope = 0.0;
     for (int64_t c = 0; c < Cpad; ++c) {
         int64_t fslot = b * Cpad + c;
         int64_t r = slot_row[fslot];
@@ -795,14 +793,6 @@ double trip_log_partition_from_G(
         sc.act_fslot[n_active] = fslot;
         sc.act_Kr[n_active] = Kr;
         sum_Kr += Kr;
-        const double* g_ptr = &G[fslot * K1];
-        for (int64_t k = 1; k <= Kr; ++k) {
-            double v = g_ptr[k];
-            if (v > neg_inf) {
-                double sk = (v - static_cast<double>(k) * trip_scale) / static_cast<double>(k);
-                if (sk > slope) slope = sk;
-            }
-        }
         ++n_active;
     }
     if (n_active == 0) return neg_inf;
@@ -812,34 +802,66 @@ double trip_log_partition_from_G(
     }
 
     if (!cat_rho0) {
+        // 1-D product over sizes n, each coefficient with its own power-of-two exponent.
         int64_t D_tot = std::min(nmax, sum_Kr);
         if ((int64_t)sc.Fs2d.size() < D_tot + 1) sc.Fs2d.resize(D_tot + 1);
+        if ((int64_t)sc.row_exp.size() < D_tot + 1) {
+            sc.row_exp.resize(D_tot + 1);
+            sc.row_exp_next.resize(D_tot + 1);
+        }
+        if ((int64_t)sc.q_exp.size() < K1) sc.q_exp.resize(K1);
         double* F1 = sc.Fs2d.data();
+        int64_t* E = sc.row_exp.data();
+        int64_t* NB = sc.row_exp_next.data();
         F1[0] = 1.0;
+        E[0] = 0;
         std::fill(F1 + 1, F1 + D_tot + 1, 0.0);
+        std::fill(E + 1, E + D_tot + 1, ROW_EMPTY);
         int64_t deg_cur = 0;
         double* q_c = sc.gl.data();
+        int64_t* q_e = sc.q_exp.data();
         for (int64_t ia = 0; ia < n_active; ++ia) {
             int64_t fslot = sc.act_fslot[ia];
             int64_t Kr_max = std::min(sc.act_Kr[ia], D_tot);
             const double* g_ptr = &G[fslot * K1];
             int64_t d = 0;
             for (int64_t k = 1; k <= Kr_max; ++k) {
-                double v = (g_ptr[k] > neg_inf)
-                               ? std::exp((g_ptr[k] - static_cast<double>(k) * trip_scale) - static_cast<double>(k) * slope)
-                               : 0.0;
-                q_c[k] = v;
-                if (v > 0.0) d = k;
+                split_log(g_ptr[k] - static_cast<double>(k) * trip_scale, q_c[k], q_e[k]);
+                if (q_c[k] > 0.0) d = k;
             }
             if (d <= 0) continue;
             int64_t next_deg = std::min(D_tot, deg_cur + d);
-            for (int64_t n = deg_cur; n >= 0; --n) {
-                double fn = F1[n];
-                if (fn == 0.0) continue;
+            // target exponent per n (the absent term has weight exactly 1 = 1 * 2^0)
+            for (int64_t n = 0; n <= next_deg; ++n) NB[n] = (n <= deg_cur) ? E[n] : ROW_EMPTY;
+            for (int64_t n = 0; n <= deg_cur; ++n) {
+                if (E[n] == ROW_EMPTY) continue;
                 int64_t k_max = std::min(d, D_tot - n);
                 for (int64_t k = 1; k <= k_max; ++k) {
-                    F1[n + k] += fn * q_c[k];
+                    if (q_c[k] > 0.0) NB[n + k] = std::max(NB[n + k], E[n] + q_e[k]);
                 }
+            }
+            for (int64_t n = deg_cur + 1; n <= next_deg; ++n) F1[n] = 0.0;
+            // Downward in n: F1[n] still holds its old value (old exponent) when it is read; it
+            // is moved to its new exponent after it has been added to the larger sizes.
+            for (int64_t n = deg_cur; n >= 0; --n) {
+                if (E[n] == ROW_EMPTY) continue;
+                double fn = F1[n];
+                int64_t k_max = std::min(d, D_tot - n);
+                for (int64_t k = 1; k <= k_max; ++k) {
+                    if (q_c[k] == 0.0) continue;
+                    F1[n + k] += fn * q_c[k] * pow2i(E[n] + q_e[k] - NB[n + k]);
+                }
+                F1[n] = fn * pow2i(E[n] - NB[n]);
+            }
+            for (int64_t n = 0; n <= next_deg; ++n) {
+                if (NB[n] == ROW_EMPTY || !(F1[n] > 0.0)) {
+                    F1[n] = 0.0;
+                    E[n] = ROW_EMPTY;
+                    continue;
+                }
+                int ex;
+                F1[n] = std::frexp(F1[n], &ex);
+                E[n] = NB[n] + ex;
             }
             deg_cur = next_deg;
         }
@@ -847,8 +869,8 @@ double trip_log_partition_from_G(
         if ((int64_t)sc.lp2d.size() < deg_cur + 1) sc.lp2d.resize(deg_cur + 1);
         for (int64_t n = 1; n <= deg_cur; ++n) {
             double v = F1[n];
-            double lp = (v > 0.0)
-                            ? (std::log(v) + static_cast<double>(n) * slope + static_cast<double>(n) * trip_scale - rho_0[n])
+            double lp = (v > 0.0 && E[n] != ROW_EMPTY)
+                            ? (std::log(v) + static_cast<double>(E[n]) * M_LN2 + static_cast<double>(n) * trip_scale - rho_0[n])
                             : neg_inf;
             sc.lp2d[n] = lp;
             if (lp > max_lp) max_lp = lp;

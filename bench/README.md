@@ -1,100 +1,55 @@
 # Bench: timing and law checks for the normaliser and sampler
 
-Everything needed to measure and check a change to `v4/exact.py`, `v4/sampling.py`,
-`v4/native/exact_dp.cpp` or `v4/native/sampler.cpp` on the two fitted models. All commands
-have been run as written on this machine.
+Tools for changing `v4/exact.py`, `v4/sampling.py` or the C++ kernels in `v4/native/`
+safely: time the costly operations on a fitted model, and check that a change keeps the law
+(exact log Z, exact draws, Gibbs chains, held-out likelihood).
 
-## Setup (every new shell)
-
-```bash
-cd /Users/ajit/Projects/nf_dunnhumby/ebi_v4_pipeline
-source bench/env.sh            # sets PY, the model paths and OMP_NUM_THREADS=4
-```
-
-- Use `$PY`: `/Users/ajit/Projects/nf_dunnhumby/.bench-python/venv/bin/python3`, a
-  standalone CPython 3.13.4 with the pinned `requirements.txt` (torch 2.9.1, numpy 2.3.5,
-  pandas, scipy, scikit-learn, pyarrow, pytest, gymnasium), all inside the project folder
-  (`.bench-python/`, 786 MB); it needs nothing from pyenv or Homebrew. Do not use other
-  Pythons on the machine. Compare old and new code with this same interpreter.
-- The C++ kernels build themselves on first use with `clang++` (Xcode command-line tools,
-  `/usr/bin/clang++`) into `$V4_BUILD_DIR` = `build/native-bench`, and rebuild when the
-  `.cpp` file is newer than the library. After editing a `.cpp` file the first run is
-  silent for 5-10 s while it compiles. If compiling fails, report the compiler's message.
-- Write outputs under `runs/bench/` (git-ignored). Never pipe a run through `grep` into a
-  file: grep buffers and the log stays empty until the end. Use `$PY -u ... > file 2>&1`
-  and follow it with `tail -f file`.
-- At most 4 threads per job. Run timings with nothing else running (check with `top`), and
-  never kill a process you did not start.
-
-## Tests (exactness against enumeration of every basket)
+## Setup
 
 ```bash
-$PY -m pytest -q tests/test_law.py          # 35 passed (about 10 s the first time: it compiles the kernels)
+source bench/env.sh       # PY, kernel build folder, 4 threads, the two models (all overridable)
 ```
 
-`tests/tiny.py` builds a world where every basket can be listed; `tests/test_law.py` checks
-log Z, incidence, the exact draw, Gibbs and importance sampling against that list. Add a
-test there for any new computation.
+The two fitted models the scripts load (`--world`):
 
-## The two models
-
-| `--world` | model | nmax | categories | products per trip | load time |
+| `--world` | model | variables | nmax | categories | products per trip |
 |---|---|---|---|---|---|
-| `syn` | synthetic world, seed 3 (`ebi_v4_scale/runs/disc_c48_s3_promo/v4_comp.pt`) | 31 | 48 | 522 | ~2 s |
-| `real` | Dunnhumby commodity model (`runs/commodity/v4_comp_promo.pt`) | 120 | 187 | 5,455 | ~15 s |
+| `syn` | synthetic discount world, seed 3 (`run/small_world.sh`) | `SYN_RUN_DIR`, `SYN_DATA`, `SYN_CK` | 31 | 48 | 522 |
+| `real` | Dunnhumby commodity model (`run/commodity_comp.sh`) | `REAL_RUN_DIR`, `REAL_DATA`, `REAL_CK` | 120 | 187 | 5,455 |
 
-`bench/common.py` loads either (it changes into the directory the checkpoint's paths are
-relative to) and takes the fit's own held-out trips in a fixed order, so two code versions
-see the same trips.
+`*_RUN_DIR` is the folder the checkpoint's recorded paths are relative to (the scripts change
+into it). Set them if the runs are elsewhere than this checkout's `runs/`. The held-out trips
+are the fit's own validation split, in a fixed order, so two code versions see the same trips.
+
+Write outputs under `runs/bench/`. Use `$PY -u ... > file 2>&1` (never pipe a run through
+`grep` into a file: grep buffers and the log stays empty), at most 4 threads per job, and time
+only on an otherwise idle machine.
 
 ## Scripts
 
-| command | what it measures | time on syn / real |
-|---|---|---|
-| `$PY -u bench/timing.py --world syn --quick` | smoke test: 32 trips | 4 s / 48 s |
-| `$PY -u bench/timing.py --world syn` | exact log Z and one Gibbs sweep per 256 trips; likelihood per basket, 1 basket and 256, at 128 draws | 30 s / ~8 min |
-| `$PY -u bench/law_checks.py --world syn --check chain [--seed 9]` | Gibbs chains from the observed baskets: mean and largest basket size, trips at the item cap, after 0-400 sweeps | 10 s / ~2 min |
-| `$PY -u bench/law_checks.py --world syn --check draws` | exact draws given z against the exact incidence, at z near the observed basket and at z from 200-sweep chains | 10 s / ~3 min |
-| `$PY -u bench/law_checks.py --world syn --check logz --save F.npz` | exact log Z at fixed (trip, z) pairs, saved for a trip-by-trip comparison | 5 s / 1 min |
-| `$PY -u bench/law_checks.py --world syn --check ll --trips 256 --save F.npz` | log-likelihood of held-out baskets at 1,024 draws, saved per basket | ~1 min / ~1 h |
-| `$PY bench/compare.py OLD.npz NEW.npz` | per-trip NEW - OLD: min, max, mean and standard error | instant |
-| `$PY -u bench/cap_profile.py --world real` | cost of log Z and a sweep at item caps K < nmax, and the log Z each trip loses at one typical z | ~1 min |
+| command | what it gives |
+|---|---|
+| `$PY -u bench/timing.py --world W [--quick]` | exact log Z and one Gibbs sweep per 256 trips; likelihood of one basket and per basket in 256, at the validation setting |
+| `$PY -u bench/law_checks.py --world W --check chain [--seed S]` | Gibbs chains from the observed baskets: mean and largest basket size, trips at the item cap, after 0–400 sweeps |
+| `$PY -u bench/law_checks.py --world W --check draws` | exact draws given z against the exact incidence, at z near the observed basket and at z from 200-sweep chains |
+| `$PY -u bench/law_checks.py --world W --check logz --save F.npz` | exact log Z at fixed (trip, z) pairs |
+| `$PY -u bench/law_checks.py --world W --check ll --trips 256 --save F.npz` | held-out log-likelihood at 1,024 draws, per basket |
+| `$PY bench/compare.py OLD.npz NEW.npz` | per-trip NEW − OLD: min, max, mean, standard error |
 
-Options: `--trips N` (number of held-out trips), `--seed S`, `--threads N`; see `--help`.
+## Checking a change
 
-## Comparing old and new code
-
-Keep the old code reachable (for example an environment switch read at call time) or
-use two git worktrees, and run the same command with each:
+Run the same command on the old and the new code (two git worktrees; give each its own
+`V4_BUILD_DIR`), then compare:
 
 ```bash
-$PY -u bench/law_checks.py --world syn --check logz --save runs/bench/old_logz.npz   # old code
-$PY -u bench/law_checks.py --world syn --check logz --save runs/bench/new_logz.npz   # new code
+$PY -m pytest -q tests/                       # exactness against enumeration of every basket
+$PY -u bench/law_checks.py --world real --check logz --save runs/bench/new_logz.npz
 $PY bench/compare.py runs/bench/old_logz.npz runs/bench/new_logz.npz
 ```
 
-Fixed-z agreement is not enough. The uncapped variant (branch `v4-category-dp`,
-commits 31ad866 and b503a4a) matched log Z to 7e-12 at fixed z but its chains ran away (one
-real trip went to about 2,660 items in 100 sweeps). Always also run `--check chain` with
-several seeds and compare the size paths, and `--check ll` with `compare.py`.
-
-## Baseline (current code, `$PY`, 4 threads, machine idle)
-
-Synthetic (`runs/bench/baseline/syn_timing_benchpy.log`, `syn_chain_benchpy.log`):
-
-| measure | value |
-|---|---|
-| exact log Z, 256 trips | 0.0072 s |
-| one Gibbs sweep, 256 trips | 0.0073 s |
-| likelihood, 1 basket (128 draws) | 0.267 s |
-| likelihood, per basket in 256 | 0.043 s |
-| chain seed 9, mean size after 0/10/50/100/200/400 sweeps | 9.39 / 8.89 / 8.17 / 8.89 / 9.53 / 9.75 (largest 31 = cap at 200) |
-
-Real (`bench/timing.py --world real --quick`, and earlier runs with the same settings):
-
-| measure | value |
-|---|---|
-| exact log Z, 256 trips | 0.28 s |
-| one Gibbs sweep, 256 trips | 0.39-0.49 s |
-| likelihood, 1 basket (128 draws) | 3.98 s |
-| likelihood, per basket in 256 | 1.46 s |
+Agreement of log Z at fixed z is not enough. An uncapped variant once matched log Z to 7e-12
+at fixed z, but its chains ran away (one real trip went to about 2,660 products in 100
+sweeps). Always also compare `--check chain` on several seeds and `--check ll` with
+`compare.py`. And check against an independent calculation where values are extreme: the
+2-D size table once lost 123 nats of log Z on a real trip at a chain-end z, identically in the
+old and new code, so old-against-new agreement did not show it (`docs/PIPELINE.md` §7.0).

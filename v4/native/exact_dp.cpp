@@ -18,6 +18,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <limits>
 #include <vector>
 
@@ -324,6 +325,39 @@ torch::Tensor esp_blocked_log_backward(
   return grad_log_weights;
 }
 
+// Basket weights of different sizes n can differ by far more than a double holds (one
+// strong product next to many ordinary ones), so every coefficient n of the running product
+// keeps its own power-of-two exponent: true value = mantissa * 2^exponent.  A single scale
+// per trip rounded whole sizes to zero.
+constexpr int64_t EMPTY_EXP = std::numeric_limits<int64_t>::min() / 4;   // coefficient is zero
+
+inline double pow2i(int64_t e) {             // 2^e for e <= 1023; 0 below the normal range
+  if (e < -1022) return 0.0;
+  if (e > 1023) return std::numeric_limits<double>::infinity();
+  uint64_t bits = static_cast<uint64_t>(e + 1023) << 52;
+  double v;
+  std::memcpy(&v, &bits, sizeof v);
+  return v;
+}
+
+// exp(lp) = qm * 2^qe with qm in [0.5, 1); qm = 0 for lp = -inf.
+inline void split_log(double lp, double& qm, int64_t& qe) {
+  if (!(lp > -std::numeric_limits<double>::infinity())) {
+    qm = 0.0;
+    qe = EMPTY_EXP;
+    return;
+  }
+  if (std::fabs(lp) < 700.0) {
+    int ex;
+    qm = std::frexp(std::exp(lp), &ex);
+    qe = ex;
+    return;
+  }
+  const double t = std::floor(lp / M_LN2) + 1.0;
+  qe = static_cast<int64_t>(t);
+  qm = std::exp(lp - t * M_LN2);
+}
+
 std::vector<torch::Tensor> log_degree_product_forward(
     torch::Tensor log_coefficients, torch::Tensor degree, int64_t nmax) {
   log_coefficients = log_coefficients.contiguous();
@@ -335,62 +369,101 @@ std::vector<torch::Tensor> log_degree_product_forward(
   const int64_t stride = log_coefficients.size(3);
   const int64_t width = nmax + 1;
   const int64_t sequences = draws * batch;
-  auto normalized = torch::zeros_like(log_coefficients);
+  auto normalized = torch::zeros_like(log_coefficients);       // mantissas of exp(log coefficient)
+  auto normalized_exp = torch::zeros_like(log_coefficients);   // and their exponents
   auto prefix = torch::zeros({draws, batch, categories + 1, width},
                              log_coefficients.options());
+  auto prefix_exp = torch::full({draws, batch, categories + 1, width},
+      static_cast<double>(EMPTY_EXP), log_coefficients.options());
   auto log_output = torch::full({draws, batch, width},
       -std::numeric_limits<double>::infinity(), log_coefficients.options());
   const double* input = log_coefficients.data_ptr<double>();
   const int64_t* degrees = degree.data_ptr<int64_t>();
   double* q_all = normalized.data_ptr<double>();
+  double* qe_all = normalized_exp.data_ptr<double>();
   double* states = prefix.data_ptr<double>();
+  double* state_exp = prefix_exp.data_ptr<double>();
   double* result = log_output.data_ptr<double>();
 
   at::parallel_for(0, sequences, 1, [&](int64_t begin, int64_t end) {
+    std::vector<int64_t> qe(stride), Ep(width), En(width);
+    std::vector<double> qm(stride);
     for (int64_t sequence = begin; sequence < end; ++sequence) {
       const int64_t b = sequence % batch;
       double* first = states + sequence * (categories + 1) * width;
+      double* first_exp = state_exp + sequence * (categories + 1) * width;
       first[0] = 1.0;
-      double log_scale = 0.0;
+      first_exp[0] = 0.0;
+      std::fill(Ep.begin(), Ep.end(), EMPTY_EXP);
+      Ep[0] = 0;
       int64_t deg_cur = 0;
       for (int64_t c = 0; c < categories; ++c) {
         const int64_t d = std::clamp<int64_t>(degrees[b * categories + c], 0, nmax);
         const double* lp = input + (sequence * categories + c) * stride;
         double* q = q_all + (sequence * categories + c) * stride;
-        double maximum = -std::numeric_limits<double>::infinity();
-        for (int64_t k = 0; k <= d; ++k) maximum = std::max(maximum, lp[k]);
-        TORCH_CHECK(std::isfinite(maximum), "category polynomial has no finite coefficient");
-        for (int64_t k = 0; k <= d; ++k) q[k] = std::exp(lp[k] - maximum);
-        log_scale += maximum;
-        double* previous = first + c * width;
-        double* next = previous + width;
-        int64_t next_deg = std::min<int64_t>(nmax, deg_cur + d);
+        double* qx = qe_all + (sequence * categories + c) * stride;
+        bool any = false;
+        for (int64_t k = 0; k <= d; ++k) {
+          split_log(lp[k], qm[k], qe[k]);
+          q[k] = qm[k];
+          qx[k] = static_cast<double>(qe[k]);
+          any = any || qm[k] > 0.0;
+        }
+        TORCH_CHECK(any, "category polynomial has no finite coefficient");
+        const double* previous = first + c * width;
+        double* next = first + (c + 1) * width;
+        double* next_exp = first_exp + (c + 1) * width;
+        const int64_t next_deg = std::min<int64_t>(nmax, deg_cur + d);
         for (int64_t n = 0; n <= next_deg; ++n) {
-          double value = 0.0;
           const int64_t k_lo = std::max<int64_t>(0, n - deg_cur);
           const int64_t upper = std::min<int64_t>(d, n);
-          for (int64_t k = k_lo; k <= upper; ++k) value += previous[n - k] * q[k];
-          next[n] = value;
+          int64_t target = EMPTY_EXP;
+          for (int64_t k = k_lo; k <= upper; ++k) {
+            if (qm[k] > 0.0 && Ep[n - k] != EMPTY_EXP) target = std::max(target, Ep[n - k] + qe[k]);
+          }
+          double value = 0.0;
+          if (target != EMPTY_EXP) {
+            for (int64_t k = k_lo; k <= upper; ++k) {
+              if (qm[k] == 0.0 || Ep[n - k] == EMPTY_EXP) continue;
+              value += previous[n - k] * qm[k] * pow2i(Ep[n - k] + qe[k] - target);
+            }
+          }
+          if (value > 0.0) {
+            int ex;
+            next[n] = std::frexp(value, &ex);
+            En[n] = target + ex;
+          } else {
+            next[n] = 0.0;
+            En[n] = EMPTY_EXP;
+          }
+          next_exp[n] = static_cast<double>(En[n]);
         }
+        for (int64_t n = next_deg + 1; n <= nmax; ++n) En[n] = EMPTY_EXP;
+        std::swap(Ep, En);
         deg_cur = next_deg;
       }
       const double* final_state = first + categories * width;
       double* out = result + sequence * width;
       for (int64_t n = 0; n <= deg_cur; ++n) {
-        if (final_state[n] > 0.0) out[n] = std::log(final_state[n]) + log_scale;
+        if (final_state[n] > 0.0 && Ep[n] != EMPTY_EXP) {
+          out[n] = std::log(final_state[n]) + static_cast<double>(Ep[n]) * M_LN2;
+        }
       }
     }
   });
-  return {log_output, normalized, prefix};
+  return {log_output, normalized, prefix, normalized_exp, prefix_exp};
 }
 
 torch::Tensor log_degree_product_backward(
     torch::Tensor grad_log_output, torch::Tensor normalized,
-    torch::Tensor degree, torch::Tensor prefix, int64_t nmax) {
+    torch::Tensor degree, torch::Tensor prefix, torch::Tensor normalized_exp,
+    torch::Tensor prefix_exp, int64_t nmax) {
   grad_log_output = grad_log_output.contiguous();
   normalized = normalized.contiguous();
+  normalized_exp = normalized_exp.contiguous();
   degree = degree.contiguous();
   prefix = prefix.contiguous();
+  prefix_exp = prefix_exp.contiguous();
   check_inputs(normalized, degree, nmax);
   const int64_t draws = normalized.size(0);
   const int64_t batch = normalized.size(1);
@@ -400,8 +473,10 @@ torch::Tensor log_degree_product_backward(
   const int64_t sequences = draws * batch;
   auto grad_log_coefficients = torch::zeros_like(normalized);
   const double* q_all = normalized.data_ptr<double>();
+  const double* qe_all = normalized_exp.data_ptr<double>();
   const int64_t* degrees = degree.data_ptr<int64_t>();
   const double* states = prefix.data_ptr<double>();
+  const double* state_exp = prefix_exp.data_ptr<double>();
   const double* output_grad = grad_log_output.data_ptr<double>();
   double* input_grad = grad_log_coefficients.data_ptr<double>();
 
@@ -412,21 +487,28 @@ torch::Tensor log_degree_product_backward(
                 output_grad + (sequence + 1) * width, hnext.begin());
       const int64_t b = sequence % batch;
       const double* first = states + sequence * (categories + 1) * width;
+      const double* first_exp = state_exp + sequence * (categories + 1) * width;
       for (int64_t c = categories - 1; c >= 0; --c) {
         std::fill(hprevious.begin(), hprevious.end(), 0.0);
         const int64_t d = std::clamp<int64_t>(degrees[b * categories + c], 0, nmax);
         const double* previous = first + c * width;
         const double* next = previous + width;
+        const double* prev_exp = first_exp + c * width;
+        const double* next_exp = prev_exp + width;
         const double* q = q_all + (sequence * categories + c) * stride;
+        const double* qx = qe_all + (sequence * categories + c) * stride;
         double* hq = input_grad + (sequence * categories + c) * stride;
         for (int64_t n = 0; n <= nmax; ++n) {
           if (next[n] <= 0.0 || hnext[n] == 0.0) continue;
+          const int64_t en = static_cast<int64_t>(next_exp[n]);
           const double inverse = 1.0 / next[n];
           const bool ordinary = std::isfinite(inverse);
           const int64_t upper = std::min<int64_t>(d, n);
           for (int64_t k = 0; k <= upper; ++k) {
             const int64_t m = n - k;
-            const double term = previous[m] * q[k];
+            if (q[k] == 0.0 || previous[m] <= 0.0) continue;
+            const int64_t ep = static_cast<int64_t>(prev_exp[m]);
+            const double term = previous[m] * q[k] * pow2i(ep + static_cast<int64_t>(qx[k]) - en);
             const double fraction = ordinary ? term * inverse : term / next[n];
             const double contribution = hnext[n] * fraction;
             hprevious[m] += contribution;

@@ -484,15 +484,15 @@ def test_single_basket_four_chains_and_truncated_sampler_against_enumeration():
     assert 1 <= int(X_out.sum()) <= NMAX
 
 
-@pytest.mark.parametrize("name", ["M3", "all", "all-competition"])
+@pytest.mark.parametrize("name", ["additive", "M1", "M2", "M3", "all", "all-competition"])
 def test_log_partition_with_sizes_beyond_double_range(name):
     """Basket weights of different sizes that differ by far more than a double can hold:
     one product at utility 1000 and four at 740, so after centring at the trip's largest
     utility a size-4 basket is e^-780 in the table, yet e^2220 heavier than size 1 once n * 1000
     is added back.  A single tilt per trip rounded size 4 to zero and lost about 740 nats of log Z
     here (and 123 nats on a real Dunnhumby trip at a chain-end z).  Both the training path
-    (with gradient: CategoryProduct2D) and the fast path (log_partition_cpp) must match
-    enumeration, and so must the incidence."""
+    (with gradient: CategoryProduct2D for M3, CategoryProduct otherwise) and the fast path
+    (log_partition_cpp) must match enumeration, and so must the incidence."""
     model = make_model(**BLOCKS[name])
     batch = make_batch()
     batch.bind(model)

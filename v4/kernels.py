@@ -138,18 +138,18 @@ class CategoryProduct(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, log_polys, degree, nmax):
-        value, normalized, prefix = exact_dp().log_degree_forward(
+        value, normalized, prefix, normalized_exp, prefix_exp = exact_dp().log_degree_forward(
             log_polys.contiguous(), degree.contiguous(), int(nmax))
-        ctx.save_for_backward(normalized, degree, prefix)
+        ctx.save_for_backward(normalized, degree, prefix, normalized_exp, prefix_exp)
         ctx.nmax = int(nmax)
         return value
 
     @staticmethod
     @torch.autograd.function.once_differentiable
     def backward(ctx, grad):
-        normalized, degree, prefix = ctx.saved_tensors
+        normalized, degree, prefix, normalized_exp, prefix_exp = ctx.saved_tensors
         return (exact_dp().log_degree_backward(grad.contiguous(), normalized, degree, prefix,
-                                               ctx.nmax), None, None)
+                                               normalized_exp, prefix_exp, ctx.nmax), None, None)
 
 
 class CategoryProduct2D(torch.autograd.Function):

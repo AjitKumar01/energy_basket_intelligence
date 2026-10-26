@@ -19,11 +19,9 @@ per call, so a generator seed fixes every result.
 from __future__ import annotations
 
 import math
-import os
 
 import torch
 
-from .exact import log_partition
 from .kernels import check, ptr, sampler
 
 
@@ -48,11 +46,9 @@ def _max_count(model, ix):
 
 
 def _min_cap(model):
-    """Smallest per-(trip, z) item cap of the sampler (the cap is certified: <= 1e-8 of the
-    mass is cut).  V4_LEGACY=1 turns it off; V4_EXACT_SWEEPS=1 only restores the old sweep
-    schedule of importance_log_z and leaves the cap on."""
-    if os.environ.get("V4_LEGACY") == "1":
-        return int(model.nmax)
+    """Smallest per-(trip, z) item cap of the sampler.  Each trip's cap K is chosen so that
+    the baskets with more than K products carry at most 1e-8 of the mass (a certified bound;
+    the cap grows to nmax whenever z needs it)."""
     return int(getattr(model, "trunc_min_cap", 32))
 
 
@@ -98,14 +94,8 @@ def sample_baskets(model, ix, u, gen, *, z=None, beta=1.0, iv=None):
 @torch.no_grad()
 def gibbs(model, ix, X, gen, *, sweeps=1, beta=1.0, iv=None):
     """``sweeps`` block-Gibbs sweeps from slot mask X: z ~ N(s(X), I), then X ~ S | z."""
-    if os.environ.get("V4_LEGACY") == "1":
-        b = model.slot_utilities(ix).detach()
-        iv = model.iv_shift(ix, b_slot=b) if iv is None else iv
-        ph = model.phi_r()[ix.item].detach().contiguous()
-        b_base = (b - 0.5 * beta * ph.square().sum(-1)).contiguous()
-    else:
-        b, iv, ph, half_phi_sq = _cached_trip_statics(model, ix, iv=iv)
-        b_base = (b - float(beta) * half_phi_sq).contiguous()
+    b, iv, ph, half_phi_sq = _cached_trip_statics(model, ix, iv=iv)
+    b_base = (b - float(beta) * half_phi_sq).contiguous()
     a = _arrays(model, iv=iv, psi=model.psi_cat)
     seed = _seed(gen)
     mask = X.to(torch.uint8).contiguous().clone()
@@ -123,9 +113,6 @@ def gibbs(model, ix, X, gen, *, sweeps=1, beta=1.0, iv=None):
 def draw_from_model(model, ix, gen, burn):
     """A basket per trip from the full model: start from the law without pairwise terms
     (beta = 0), then ``burn`` Gibbs sweeps."""
-    if os.environ.get("V4_LEGACY") == "1":
-        X = sample_baskets(model, ix, model.slot_utilities_given_z(ix, None, beta=0.0), gen, beta=0.0)
-        return gibbs(model, ix, X, gen, sweeps=burn)
     b, iv, _, _ = _cached_trip_statics(model, ix)
     X = sample_baskets(model, ix, b, gen, beta=0.0, iv=iv)
     return gibbs(model, ix, X, gen, sweeps=burn, iv=iv)
@@ -152,51 +139,21 @@ def importance_log_z(model, ix, gen, *, burn, components, thin, draws, defensive
     sig = torch.where(strong, torch.full_like(sv, 1.35), torch.ones_like(sv))
     log_det = sig.log().sum()
 
-    if os.environ.get("V4_LEGACY") == "1":
-        X = draw_from_model(model, ix, gen, burn)
-        centres, per_chain, thin_c = [], max(components // 2, 64), max(thin // 2, 1)
-        X_out = None
-        for k in range(max(components * thin, per_chain * thin_c)):
-            X = gibbs(model, ix, X, gen)
-            if (k + 1) % thin_c == 0 and len(centres) < per_chain:
-                centres.append(model.basket_field(ix, X))
-            if k + 1 == components * thin:
-                X_out = X.clone()
-        X_out = X.clone() if X_out is None else X_out
-
-        anneal = max(burn // 8, 25)
-        for chain in range(1, 4):
-            if chain == 1:
-                z0 = torch.zeros(B, r)
-            elif float(sv[0]) > 1.0:
-                z0 = ((1.0 if chain == 2 else -1.0) * 1.5 * sv[0] * Vt[0])[None, :].expand(B, r)
-            else:
-                z0 = None
-            if z0 is None:
-                Xc = sample_baskets(model, ix, model.slot_utilities_given_z(ix, None, beta=0.0), gen, beta=0.0)
-            else:
-                Xc = sample_baskets(model, ix, model.slot_utilities_given_z(ix, z0), gen, z=z0)
-            for b_temp in (0.25, 0.5, 0.75, 1.0):
-                Xc = gibbs(model, ix, Xc, gen, sweeps=anneal, beta=b_temp)
-            for k in range(per_chain * thin_c):
-                Xc = gibbs(model, ix, Xc, gen)
-                if (k + 1) % thin_c == 0:
-                    centres.append(model.basket_field(ix, Xc))
-        centres = torch.stack(centres, 1) @ Vt.T
-    elif not model.size_on_categories:
+    # Schedule: per_chain centres from each of the four chains (every thin_c sweeps), annealing
+    # through beta = 0.25, 0.5, 0.75, 1 for ``anneal`` sweeps each on chains 1-3.
+    per_chain, thin_c, anneal = max(components // 2, 64), max(thin // 2, 1), max(burn // 8, 25)
+    if not model.size_on_categories:
         b_slot, iv, ph_slot, _ = _cached_trip_statics(model, ix)
         X = sample_baskets(model, ix, b_slot, gen, beta=0.0, iv=iv)
         X = gibbs(model, ix, X, gen, sweeps=burn, iv=iv)
-        centres, per_chain, thin_c = [], max(components // 2, 48), max(thin // 2, 1)
-        X_out = None
-        for k in range(per_chain * thin_c):
+        centres, X_out = [], None
+        for k in range(max(components * thin, per_chain * thin_c)):
             X = gibbs(model, ix, X, gen, iv=iv)
             if (k + 1) % thin_c == 0 and len(centres) < per_chain:
                 centres.append(model.basket_field(ix, X))
             if k + 1 == components * thin:
                 X_out = X.clone()
         X_out = X.clone() if X_out is None else X_out
-        anneal = max(burn // 12, 12)
         for chain in range(1, 4):
             if chain == 1:
                 z0 = torch.zeros(B, r)
@@ -217,10 +174,6 @@ def importance_log_z(model, ix, gen, *, burn, components, thin, draws, defensive
         centres = torch.stack(centres, 1) @ Vt.T
     else:
         b_slot, iv, ph_slot, half_phi_sq = _cached_trip_statics(model, ix)
-        exact_sweeps = os.environ.get("V4_EXACT_SWEEPS") == "1"
-        per_chain = max(components // 2, 64 if exact_sweeps else 48)
-        thin_c = max(thin // 2, 1)
-        anneal = max(burn // 8, 25) if exact_sweeps else max(burn // 12, 12)
         Kc = 4 * per_chain
         centres_raw = torch.empty((Kc, B, r), dtype=torch.float64)
         a = _arrays(model, iv=iv, psi=model.psi_cat)
@@ -230,7 +183,7 @@ def importance_log_z(model, ix, gen, *, burn, components, thin, draws, defensive
 
         # Chain 0 stage parameters
         X0 = sample_baskets(model, ix, b_slot, gen, beta=0.0, iv=iv)
-        n_k0 = max(components * thin, per_chain * thin_c) if exact_sweeps else (per_chain * thin_c)
+        n_k0 = max(components * thin, per_chain * thin_c)
         st_sweeps0 = [int(burn)] + [1] * n_k0
         st_sbeta0 = [1.0] * (1 + n_k0)
         st_seeds0 = [_seed(gen) for _ in range(1 + n_k0)]
@@ -372,27 +325,19 @@ def importance_log_z(model, ix, gen, *, burn, components, thin, draws, defensive
     log_q = torch.logaddexp(math.log1p(-defensive) + torch.logsumexp(log_comp, 2) - math.log(Kc),
                             math.log(defensive) + log_wide)
 
-    if os.environ.get("V4_LEGACY") == "1":
-        ph_slot = ph[ix.item]
-        b = model.slot_utilities(ix)
-        u0 = b - 0.5 * ph_slot.square().sum(-1)
-        iv = model.iv_shift(ix, b_slot=b)
-        log_zz = torch.stack([log_partition(model, ix, u0 + (z_all[:, d][ix.item_trip] * ph_slot).sum(-1),
-                                            z=z_all[:, d], iv=iv) for d in range(draws)], 1)
-    else:
-        b_slot, iv, ph_slot, half_phi_sq = _cached_trip_statics(model, ix)
-        u0 = (b_slot - half_phi_sq).contiguous()
-        a = _arrays(model, iv=iv, psi=model.psi_cat)
-        K_max = _max_count(model, ix)
-        min_cap = _min_cap(model)
-        log_zz = torch.empty((B, draws), dtype=torch.float64)
-        check(sampler().log_partition_batch_z_cpp(
-            B, int(draws), ix.n_rows, len(ix.item), ix.Cpad, K_max, int(model.nmax), r,
-            int(model.size_on_categories), min_cap, 1.0,
-            ptr(u0), ptr(ph_slot), ptr(z_all), ptr(ix.row_of), ptr(ix.item_pos),
-            ptr(ix.row_size), ptr(ix.row_cat), ptr(ix.row_trip), ptr(ix.flat_slot),
-            ptr(a["rho_c"]), ptr(a["rho_0"]), ptr(a["f_extra"]), ptr(a["psi"]),
-            ptr(a["iv"]), ptr(log_zz)), "log_partition_batch_z")
+    b_slot, iv, ph_slot, half_phi_sq = _cached_trip_statics(model, ix)
+    u0 = (b_slot - half_phi_sq).contiguous()
+    a = _arrays(model, iv=iv, psi=model.psi_cat)
+    K_max = _max_count(model, ix)
+    min_cap = _min_cap(model)
+    log_zz = torch.empty((B, draws), dtype=torch.float64)
+    check(sampler().log_partition_batch_z_cpp(
+        B, int(draws), ix.n_rows, len(ix.item), ix.Cpad, K_max, int(model.nmax), r,
+        int(model.size_on_categories), min_cap, 1.0,
+        ptr(u0), ptr(ph_slot), ptr(z_all), ptr(ix.row_of), ptr(ix.item_pos),
+        ptr(ix.row_size), ptr(ix.row_cat), ptr(ix.row_trip), ptr(ix.flat_slot),
+        ptr(a["rho_c"]), ptr(a["rho_0"]), ptr(a["f_extra"]), ptr(a["psi"]),
+        ptr(a["iv"]), ptr(log_zz)), "log_partition_batch_z")
 
     log_w = log_prior + log_zz - log_q
     est = torch.logsumexp(log_w, 1) - math.log(draws)

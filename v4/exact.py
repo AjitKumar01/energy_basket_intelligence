@@ -22,8 +22,6 @@ The gradient of log Z with respect to u is the incidence P(j in S) of every slot
 """
 from __future__ import annotations
 
-import os
-
 import torch
 
 from .kernels import CategoryProduct, CategoryProduct2D, RowESP, RowESPRagged, check, ptr, sampler
@@ -53,10 +51,10 @@ def trip_max(u, ix):
 
 def row_esp(log_w, ix, R):
     """log e_0..e_R for every row, [rows, R+1]."""
-    if os.environ.get("V4_LEGACY") != "1":
-        row_start, contig = _ragged_meta(ix)
-        if contig:
-            return RowESPRagged.apply(log_w, row_start, ix.row_size, R)
+    row_start, contig = _ragged_meta(ix)
+    if contig:                                # products stored row by row: one ragged pass
+        return RowESPRagged.apply(log_w, row_start, ix.row_size, R)
+    # otherwise rows are padded into size buckets
     out = torch.full((ix.n_rows, R + 1), -float("inf"))
     out[:, 0] = 0.0
     largest = int(ix.row_size.max()) if ix.row_size.numel() else 0
@@ -151,7 +149,7 @@ def log_mass_by_size_and_categories(model, ix, log_g, scale):
 
 def log_partition(model, ix, u, *, z=None, beta=1.0, iv=None):
     """log Z per trip of the law of S given slot utilities u (and z for M2)."""
-    if (not torch.is_grad_enabled() or not u.requires_grad) and os.environ.get("V4_LEGACY") != "1":
+    if not torch.is_grad_enabled() or not u.requires_grad:    # no gradient: the fused C++ path
         shift = model.presence_shift(ix, z, beta=beta)
         if shift is not None:
             shift = shift.detach().contiguous()

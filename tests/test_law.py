@@ -29,15 +29,8 @@ BLOCKS = {
 }
 
 
-@pytest.fixture(params=[True, False], ids=["category-dp", "2d-dp"])
-def category_dp(request, monkeypatch):
-    """M3 laws both ways: without the item cap (pass over categories) and with it (2-D program)."""
-    monkeypatch.setattr(exact, "CATEGORY_DP", request.param)
-    return request.param
-
-
 @pytest.mark.parametrize("name", BLOCKS)
-def test_log_partition_and_incidence_given_z(name, category_dp):
+def test_log_partition_and_incidence_given_z(name):
     model = make_model(**BLOCKS[name])
     batch = make_batch()
     batch.bind(model)
@@ -47,7 +40,7 @@ def test_log_partition_and_incidence_given_z(name, category_dp):
     iv = model.iv_shift(ix)
     lz, p = exact.incidence(model, ix, u, z=z, iv=iv)
     for t in range(2):
-        energies = {S: energy_given_z(model, ix, u, z, iv, S) for S in baskets_of(ix, t, model=model)}
+        energies = {S: energy_given_z(model, ix, u, z, iv, S) for S in baskets_of(ix, t)}
         lz_t = log_sum_exp(list(energies.values()))
         assert abs(float(lz[t]) - lz_t) < 1e-10
         for s in (s for s in range(len(ix.item)) if int(ix.item_trip[s]) == t):
@@ -85,7 +78,7 @@ def test_energy_matches_gaussian_identity(name):
 
 
 @pytest.mark.parametrize("cap", [NMAX, 2])
-def test_sampler_matches_exact_marginals(cap, category_dp):
+def test_sampler_matches_exact_marginals(cap):
     model = make_model(**BLOCKS["all"])
     model.R = cap
     base = make_batch()
@@ -113,16 +106,12 @@ def test_sampler_matches_exact_marginals(cap, category_dp):
     exact_p = p.view(reps, T)[0]
     assert float((freq - exact_p).abs().max()) < 4 * math.sqrt(0.25 / reps)
     sizes = torch.zeros(2 * reps).index_add_(0, ix.item_trip, X.double())
-    present = torch.zeros(ix.n_rows).index_add_(0, ix.row_of, X.double()) > 0
-    cats = torch.zeros(2 * reps).index_add_(0, ix.row_trip, present.double())
-    assert int(sizes.min()) >= 1 and int(cats.max()) <= NMAX
-    if not category_dp:
-        assert int(sizes.max()) <= NMAX
+    assert int(sizes.min()) >= 1 and int(sizes.max()) <= NMAX
     assert int(torch.zeros(ix.n_rows).index_add_(0, ix.row_of, X.double()).max()) <= cap
 
 
 @pytest.mark.parametrize("name", ["all", "all-competition"])
-def test_gibbs_and_importance_sampling_match_full_law(name, category_dp):
+def test_gibbs_and_importance_sampling_match_full_law(name):
     model = make_model(**BLOCKS[name])
     base = make_batch()
     base.bind(model)
@@ -131,7 +120,7 @@ def test_gibbs_and_importance_sampling_match_full_law(name, category_dp):
     iv0 = None if iv0 is None else iv0.detach()
     exact_lz, exact_inc = [], torch.zeros(len(ix0.item))
     for t in range(2):
-        energies = {S: full_energy(model, ix0, b0, iv0, S) for S in baskets_of(ix0, t, model=model)}
+        energies = {S: full_energy(model, ix0, b0, iv0, S) for S in baskets_of(ix0, t)}
         lz = log_sum_exp(list(energies.values()))
         exact_lz.append(lz)
         for S, e in energies.items():
@@ -208,7 +197,7 @@ def test_price_context_and_single_utility_tilt():
 
 
 @pytest.mark.parametrize("name", ["additive", "all"])
-def test_cap_on_products_per_category(name, category_dp):
+def test_cap_on_products_per_category(name):
     """With R < nmax the law is the same law restricted to at most R products per category."""
     model = make_model(**BLOCKS[name])
     model.R = 2
@@ -220,7 +209,7 @@ def test_cap_on_products_per_category(name, category_dp):
     iv = model.iv_shift(ix)
     lz, p = exact.incidence(model, ix, u, z=z, iv=iv)
     for t in range(2):
-        energies = {S: energy_given_z(model, ix, u, z, iv, S) for S in baskets_of(ix, t, max_per_category=2, model=model)}
+        energies = {S: energy_given_z(model, ix, u, z, iv, S) for S in baskets_of(ix, t, max_per_category=2)}
         lz_t = log_sum_exp(list(energies.values()))
         assert abs(float(lz[t]) - lz_t) < 1e-10
         for s in (s for s in range(len(ix.item)) if int(ix.item_trip[s]) == t):

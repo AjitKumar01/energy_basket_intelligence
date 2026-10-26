@@ -99,17 +99,14 @@ def make_batch(basket=((0, 3), (1, 5)), seed=1):
                  torch.tensor([PRODUCT_CAT[j] for j in line_item.tolist()]), observed)
 
 
-def baskets_of(ix, trip, max_per_category=NMAX, model=None):
+def baskets_of(ix, trip, max_per_category=NMAX):
     """All baskets (tuples of slot indices) of a trip with 1..nmax products and at most
-    ``max_per_category`` from any one category.  For an M3 model drawn without the item cap
-    (exact.size_mode(model) == 2) any number of products, in at most nmax categories."""
-    from v4 import exact
-    item_cap = model is None or exact.size_mode(model) != 2
+    ``max_per_category`` from any one category."""
     slots = [s for s in range(len(ix.item)) if int(ix.item_trip[s]) == trip]
-    for n in range(1, (NMAX if item_cap else len(slots)) + 1):
+    for n in range(1, NMAX + 1):
         for S in itertools.combinations(slots, n):
             rows = [int(ix.row_of[s]) for s in S]
-            if max(rows.count(r) for r in set(rows)) <= max_per_category and len(set(rows)) <= NMAX:
+            if max(rows.count(r) for r in set(rows)) <= max_per_category:
                 yield S
 
 

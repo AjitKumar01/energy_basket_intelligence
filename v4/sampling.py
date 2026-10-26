@@ -22,7 +22,6 @@ import math
 
 import torch
 
-from . import exact
 from .exact import log_partition
 from .kernels import check, ptr, sampler
 
@@ -59,7 +58,7 @@ def sample_baskets(model, ix, u, gen, *, z=None, beta=1.0, iv=None):
     seed = _seed(gen)
     check(sampler().sample_slots_cpp(
         ix.B, ix.n_rows, len(ix.item), ix.Cpad, _max_count(model, ix), model.nmax,
-        exact.size_mode(model), seed,
+        int(model.size_on_categories), seed,
         ptr(a["u"]), ptr(ix.row_of), ptr(ix.item_pos), ptr(ix.row_size), ptr(ix.row_cat),
         ptr(ix.flat_slot), ptr(a["rho_c"]), ptr(a["rho_0"]), ptr(a["f_extra"]),
         ptr(a["shift"]), ptr(a["iv"]), ptr(out)), "sampler")
@@ -78,7 +77,7 @@ def gibbs(model, ix, X, gen, *, sweeps=1, beta=1.0, iv=None):
     mask = X.to(torch.uint8).contiguous().clone()
     check(sampler().gibbs_sweeps_cpp(
         ix.B, ix.n_rows, len(ix.item), ix.Cpad, _max_count(model, ix), model.nmax, model.rank,
-        int(sweeps), exact.size_mode(model), math.sqrt(float(beta)), seed,
+        int(sweeps), int(model.size_on_categories), math.sqrt(float(beta)), seed,
         ptr(b_base), ptr(ph), ptr(ix.item_trip), ptr(ix.row_of), ptr(ix.item_pos),
         ptr(ix.row_size), ptr(ix.row_cat), ptr(ix.row_trip), ptr(ix.flat_slot),
         ptr(a["rho_c"]), ptr(a["rho_0"]), ptr(a["f_extra"]), ptr(a["psi"]), ptr(a["iv"]),

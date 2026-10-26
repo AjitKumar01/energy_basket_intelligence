@@ -11,9 +11,7 @@
 //
 // Optional terms arrive as null pointers when absent: f_extra (M1 count potentials),
 // row_cat_shift / psi_cat (M2 presence coupling), row_iv_shift (M4c inclusive value);
-// cat_rho0 = 1 puts the size potential rho_0 on the number of categories (M3), drawn with the
-// 2-D program over (items, categories); cat_rho0 = 2 is the same law without the cap at nmax
-// items, drawn with a pass over categories only (sample_trip_categories_m).
+// cat_rho0 = 1 puts the size potential rho_0 on the number of categories (M3).
 #include <algorithm>
 #include <atomic>
 #include <cmath>
@@ -240,120 +238,6 @@ int sample_trip_categories_2d(
         if (chosen_k > 0) rem_m -= 1;
     }
     return (rem_n == 0 && rem_m == 0) ? 0 : -1;
-}
-
-// M3 without the item cap (cat_rho0 = 2).  The weight of a basket depends on its size only
-// through m, the number of categories present, so each category is either absent (weight 1)
-// or present with total weight W_c = sum_{k>=1} g_c(k).  A forward pass over categories on
-// m = 0..M (M = min(nmax, Cpad)), a draw of m with weight exp(-rho_0(m)), a backward draw of
-// which categories are present, then each present category's count k with weight g_c(k).
-// Baskets above nmax items are not excluded (unlike the 2-D program); m is capped at M.
-int sample_trip_categories_m(
-    int64_t b,
-    int64_t Cpad,
-    int64_t K,
-    int64_t K1,
-    int64_t M,
-    const int64_t* slot_row,
-    const int64_t* row_size,
-    const double* G,
-    const double* rho_0,
-    SplitMix64& rng,
-    std::vector<double>& Fm,
-    std::vector<double>& log_w,
-    std::vector<int64_t>& cat_hist,
-    std::vector<double>& lp,
-    std::vector<int64_t>& need_row
-) {
-    const double neg_inf = -1.0 / 0.0;
-    const int64_t M1 = M + 1;
-    std::fill(Fm.begin(), Fm.begin() + M1, 0.0);
-    Fm[0] = 1.0;
-    int64_t cat_so_far = 0;
-
-    for (int64_t c = 0; c < Cpad; ++c) {
-        cat_hist[c] = cat_so_far;
-        const double* f_prev = &Fm[c * M1];
-        double* f_cur = &Fm[(c + 1) * M1];
-        int64_t r = slot_row[b * Cpad + c];
-        if (r < 0) {
-            log_w[c] = neg_inf;
-            std::copy(f_prev, f_prev + cat_so_far + 1, f_cur);
-            continue;
-        }
-        int64_t Kr = std::min(K, row_size[r]);
-        const double* g_ptr = &G[(b * Cpad + c) * K1];
-        double mg = neg_inf;
-        for (int64_t k = 1; k <= Kr; ++k) if (g_ptr[k] > mg) mg = g_ptr[k];
-        double sum_g = 0.0;
-        if (mg > neg_inf)
-            for (int64_t k = 1; k <= Kr; ++k) if (g_ptr[k] > neg_inf) sum_g += std::exp(g_ptr[k] - mg);
-        double lw = (sum_g > 0.0) ? (mg + std::log(sum_g)) : neg_inf;   // log W_c (g_c(0) = 1)
-        log_w[c] = lw;
-        int64_t next_cat = std::min(M, cat_so_far + 1);
-        // f_cur[m] = f_prev[m] + W_c f_prev[m-1], computed as a multiple of max(1, W_c).
-        double a = (lw > 0.0) ? std::exp(-lw) : 1.0;          // weight of absent
-        double p = (lw > 0.0) ? 1.0 : std::exp(lw);           // weight of present
-        double max_cv = 0.0;
-        for (int64_t m = 0; m <= next_cat; ++m) {
-            double v = (m <= cat_so_far ? f_prev[m] * a : 0.0) + (m >= 1 ? f_prev[m - 1] * p : 0.0);
-            f_cur[m] = v;
-            if (v > max_cv) max_cv = v;
-        }
-        if (max_cv <= 0.0) return -1;
-        double inv = 1.0 / max_cv;
-        for (int64_t m = 0; m <= next_cat; ++m) f_cur[m] *= inv;
-        cat_so_far = next_cat;
-    }
-
-    const double* f_last = &Fm[Cpad * M1];
-    double max_lp = neg_inf;
-    for (int64_t m = 1; m <= cat_so_far; ++m) {
-        lp[m] = (f_last[m] > 0.0) ? (std::log(f_last[m]) - rho_0[m]) : neg_inf;
-        if (lp[m] > max_lp) max_lp = lp[m];
-    }
-    if (!(max_lp > neg_inf)) return -1;
-    double sum_p = 0.0;
-    for (int64_t m = 1; m <= cat_so_far; ++m) {
-        lp[m] = (lp[m] > neg_inf) ? std::exp(lp[m] - max_lp) : 0.0;
-        sum_p += lp[m];
-    }
-    double target = rng.uniform() * sum_p, acc = 0.0;
-    int64_t rem_m = cat_so_far;
-    for (int64_t m = 1; m <= cat_so_far; ++m) {
-        acc += lp[m];
-        if (target <= acc) { rem_m = m; break; }
-    }
-
-    for (int64_t c = Cpad - 1; c >= 0 && rem_m > 0; --c) {
-        int64_t r = slot_row[b * Cpad + c];
-        if (r < 0) continue;
-        const double* f_prev = &Fm[c * M1];
-        double l_absent = (rem_m <= cat_hist[c] && f_prev[rem_m] > 0.0) ? std::log(f_prev[rem_m]) : neg_inf;
-        double l_present = (rem_m - 1 <= cat_hist[c] && f_prev[rem_m - 1] > 0.0 && log_w[c] > neg_inf)
-                               ? (std::log(f_prev[rem_m - 1]) + log_w[c]) : neg_inf;
-        if (!(l_present > neg_inf)) continue;
-        double prob = (l_absent > neg_inf) ? 1.0 / (1.0 + std::exp(l_absent - l_present)) : 1.0;
-        if (rng.uniform() >= prob) continue;
-        int64_t Kr = std::min(K, row_size[r]);
-        const double* g_ptr = &G[(b * Cpad + c) * K1];
-        double mg = neg_inf;
-        for (int64_t k = 1; k <= Kr; ++k) if (g_ptr[k] > mg) mg = g_ptr[k];
-        double sum_k = 0.0;
-        for (int64_t k = 1; k <= Kr; ++k) {
-            lp[k] = (g_ptr[k] > neg_inf) ? std::exp(g_ptr[k] - mg) : 0.0;
-            sum_k += lp[k];
-        }
-        double t_k = rng.uniform() * sum_k, acc_k = 0.0;
-        int64_t chosen = Kr;
-        for (int64_t k = 1; k <= Kr; ++k) {
-            acc_k += lp[k];
-            if (t_k <= acc_k) { chosen = k; break; }
-        }
-        need_row[r] = chosen;
-        rem_m -= 1;
-    }
-    return rem_m == 0 ? 0 : -1;
 }
 
 }  // namespace
@@ -661,24 +545,14 @@ extern "C" int sample_slots_cpp(
         auto worker = [&](int64_t tid) {
             int64_t b_start = (B * tid) / n_threads;
             int64_t b_end = (B * (tid + 1)) / n_threads;
-            const bool by_m = cat_rho0 == 2;
-            const int64_t M = std::min(nmax, Cpad);
-            std::vector<double> Fs2d(by_m ? 0 : (Cpad + 1) * N1 * N1, neg_inf);
-            std::vector<double> fl2d(by_m ? 0 : N1 * N1, 0.0), conv2d(by_m ? 0 : N1 * N1, 0.0),
-                lp2d(by_m ? 0 : N1 * N1, neg_inf);
-            std::vector<double> gl_loc(by_m ? 0 : (Cpad + 1) * K1, 0.0);
-            std::vector<double> Fm(by_m ? (Cpad + 1) * (M + 1) : 0, 0.0), log_w(by_m ? Cpad : 0),
-                lp_m(by_m ? std::max(M, K) + 1 : 0);
-            std::vector<int64_t> cat_hist(by_m ? Cpad : 0);
+            std::vector<double> Fs2d((Cpad + 1) * N1 * N1, neg_inf);
+            std::vector<double> fl2d(N1 * N1, 0.0), conv2d(N1 * N1, 0.0), lp2d(N1 * N1, neg_inf);
+            std::vector<double> gl_loc((Cpad + 1) * K1, 0.0);
             for (int64_t b = b_start; b < b_end; ++b) {
                 SplitMix64 rng_b(trip_seeds[b]);
-                int rc = by_m
-                    ? sample_trip_categories_m(
-                          b, Cpad, K, K1, M, slot_row.data(), row_size, G.data(), rho_0,
-                          rng_b, Fm, log_w, cat_hist, lp_m, need_row)
-                    : sample_trip_categories_2d(
-                          b, Cpad, K, K1, nmax, N1, slot_row.data(), row_size, G.data(), rho_0,
-                          rng_b, Fs2d, fl2d, conv2d, gl_loc, lp2d, need_row);
+                int rc = sample_trip_categories_2d(
+                    b, Cpad, K, K1, nmax, N1, slot_row.data(), row_size, G.data(), rho_0,
+                    rng_b, Fs2d, fl2d, conv2d, gl_loc, lp2d, need_row);
                 if (rc != 0) {
                     err.store(rc, std::memory_order_relaxed);
                     return;
@@ -927,8 +801,8 @@ extern "C" int gibbs_sweeps_cpp(
     std::vector<double> e_cur(K1);
     std::vector<double> Fs(cat_rho0 ? 0 : (Cpad + 1) * N1, neg_inf);
     std::vector<double> fl(cat_rho0 ? 0 : N1), gl(K1), conv(cat_rho0 ? 0 : N1), lp(cat_rho0 ? 0 : N1);
-    std::vector<double> Fs2d(cat_rho0 == 1 ? (Cpad + 1) * N1 * N1 : 0, neg_inf);
-    std::vector<double> fl2d(cat_rho0 == 1 ? N1 * N1 : 0, 0.0), conv2d(cat_rho0 == 1 ? N1 * N1 : 0, 0.0), lp2d(cat_rho0 == 1 ? N1 * N1 : 0, neg_inf);
+    std::vector<double> Fs2d(cat_rho0 ? (Cpad + 1) * N1 * N1 : 0, neg_inf);
+    std::vector<double> fl2d(cat_rho0 ? N1 * N1 : 0, 0.0), conv2d(cat_rho0 ? N1 * N1 : 0, 0.0), lp2d(cat_rho0 ? N1 * N1 : 0, neg_inf);
     std::vector<int64_t> need_row(n_rows, 0);
     std::vector<double> E_row;
 
@@ -1011,24 +885,14 @@ extern "C" int gibbs_sweeps_cpp(
             auto worker = [&](int64_t tid) {
                 int64_t b_start = (B * tid) / n_threads;
                 int64_t b_end = (B * (tid + 1)) / n_threads;
-                const bool by_m = cat_rho0 == 2;
-                const int64_t M = std::min(nmax, Cpad);
-                std::vector<double> Fs2d_loc(by_m ? 0 : (Cpad + 1) * N1 * N1, neg_inf);
-                std::vector<double> fl2d_loc(by_m ? 0 : N1 * N1, 0.0), conv2d_loc(by_m ? 0 : N1 * N1, 0.0),
-                    lp2d_loc(by_m ? 0 : N1 * N1, neg_inf);
-                std::vector<double> gl_loc(by_m ? 0 : (Cpad + 1) * K1, 0.0);
-                std::vector<double> Fm(by_m ? (Cpad + 1) * (M + 1) : 0, 0.0), log_w(by_m ? Cpad : 0),
-                    lp_m(by_m ? std::max(M, K) + 1 : 0);
-                std::vector<int64_t> cat_hist(by_m ? Cpad : 0);
+                std::vector<double> Fs2d_loc((Cpad + 1) * N1 * N1, neg_inf);
+                std::vector<double> fl2d_loc(N1 * N1, 0.0), conv2d_loc(N1 * N1, 0.0), lp2d_loc(N1 * N1, neg_inf);
+                std::vector<double> gl_loc((Cpad + 1) * K1, 0.0);
                 for (int64_t b = b_start; b < b_end; ++b) {
                     SplitMix64 rng_b(trip_seeds[b]);
-                    int rc = by_m
-                        ? sample_trip_categories_m(
-                              b, Cpad, K, K1, M, slot_row.data(), row_size, G.data(), rho_0,
-                              rng_b, Fm, log_w, cat_hist, lp_m, need_row)
-                        : sample_trip_categories_2d(
-                              b, Cpad, K, K1, nmax, N1, slot_row.data(), row_size, G.data(), rho_0,
-                              rng_b, Fs2d_loc, fl2d_loc, conv2d_loc, gl_loc, lp2d_loc, need_row);
+                    int rc = sample_trip_categories_2d(
+                        b, Cpad, K, K1, nmax, N1, slot_row.data(), row_size, G.data(), rho_0,
+                        rng_b, Fs2d_loc, fl2d_loc, conv2d_loc, gl_loc, lp2d_loc, need_row);
                     if (rc != 0) {
                         err.store(rc, std::memory_order_relaxed);
                         return;

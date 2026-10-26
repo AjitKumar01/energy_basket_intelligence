@@ -404,3 +404,81 @@ def test_promo_deviation_prior():
     gap = float(penalties(model, on, 50, psi, delta, {}, True) - penalties(model, off, 50, psi, delta, {}, True))
     expected = 0.5 * 3.0 * float(model.w_dsp.square().sum() + model.w_mlr.square().sum()) / 50
     assert abs(gap - expected) < 1e-12
+
+
+@pytest.mark.parametrize("name", ["additive", "M3", "all", "all-competition"])
+def test_fast_log_partition_and_batch_z_against_enumeration(name):
+    """Fused C++ log_partition_cpp and log_partition_batch_z_cpp (including dynamic item-axis
+    truncation with trunc_min_cap=1 and fallback at large z) match basket enumeration."""
+    model = make_model(**BLOCKS[name])
+    model.trunc_min_cap = 1
+    batch = make_batch()
+    batch.bind(model)
+    ix = batch.ix
+    b = model.slot_utilities(ix).detach()
+    iv = model.iv_shift(ix, b_slot=b)
+    ph_slot = model.phi_r()[ix.item].detach().contiguous()
+    u0 = (b - 0.5 * ph_slot.square().sum(-1)).contiguous()
+
+    # Check both moderate z (where truncation can trigger if tail is tiny) and extreme z
+    # (where mass near nmax forces fallback to full cap).
+    g = torch.Generator().manual_seed(42)
+    z_draws = torch.cat([
+        torch.randn(2, 4, RANK, generator=g) * 0.5,
+        torch.randn(2, 4, RANK, generator=g) * 6.0,
+        torch.full((2, 2, RANK), -8.0),
+    ], dim=1).contiguous()
+    D = z_draws.shape[1]
+
+    from v4.kernels import check, ptr, sampler
+    a = sampling._arrays(model, iv=iv, psi=model.psi_cat)
+    K_max = sampling._max_count(model, ix)
+    out_batch = torch.empty((2, D), dtype=torch.float64)
+    with torch.no_grad():
+        check(sampler().log_partition_batch_z_cpp(
+            2, D, ix.n_rows, len(ix.item), ix.Cpad, K_max, int(model.nmax), RANK,
+            int(model.size_on_categories), 1, 1.0,
+            ptr(u0), ptr(ph_slot), ptr(z_draws), ptr(ix.row_of), ptr(ix.item_pos),
+            ptr(ix.row_size), ptr(ix.row_cat), ptr(ix.row_trip), ptr(ix.flat_slot),
+            ptr(a["rho_c"]), ptr(a["rho_0"]), ptr(a["f_extra"]), ptr(a["psi"]),
+            ptr(a["iv"]), ptr(out_batch)), "log_partition_batch_z")
+
+        for d in range(D):
+            zd = z_draws[:, d]
+            ud = model.slot_utilities_given_z(ix, zd, b=b).detach()
+            lz_fast = exact.log_partition(model, ix, ud, z=zd, iv=iv)
+            for t in range(2):
+                energies = [energy_given_z(model, ix, ud, zd, iv, S) for S in baskets_of(ix, t)]
+                lz_enum = log_sum_exp(energies)
+                assert abs(float(lz_fast[t]) - lz_enum) <= 1e-8
+                assert abs(float(out_batch[t, d]) - lz_enum) <= 1e-8
+
+
+def test_single_basket_four_chains_and_truncated_sampler_against_enumeration():
+    """Single-basket (B=1) parallel 4-chain importance_log_z and truncated sampler match
+    exact enumeration of the full model."""
+    model = make_model(**BLOCKS["all"])
+    model.trunc_min_cap = 1
+    base = make_batch()
+    base.bind(model)
+    ix0 = base.ix
+    b0, iv0 = model.slot_utilities(ix0).detach(), model.iv_shift(ix0)
+    iv0 = None if iv0 is None else iv0.detach()
+    energies0 = {S: full_energy(model, ix0, b0, iv0, S) for S in baskets_of(ix0, 0)}
+    exact_lz0 = log_sum_exp(list(energies0.values()))
+
+    # Build a single-trip (B=1) Batch for trip 0 to exercise gibbs_four_chains_cpp.
+    from v4.batches import RaggedIndex
+    slot_mask0 = ix0.item_trip == 0
+    row_mask0 = ix0.row_trip == 0
+    ix1 = RaggedIndex(ix0.item[slot_mask0], ix0.row_of[slot_mask0],
+                      ix0.row_trip[row_mask0], ix0.row_cat[row_mask0], 1)
+    base.ix = ix1
+    base.house = base.house[:1]
+    base.ctx = {k: (v[:1] if k == "dlp_bar" else v[slot_mask0]) for k, v in base.ctx.items()}
+    base.bind(model)
+
+    est1, _, _, X_out = sampling.importance_log_z(
+        model, ix1, torch.Generator().manual_seed(19), burn=50, components=16, thin=2, draws=512)
+    assert abs(float(est1[0]) - exact_lz0) < 0.02
+    assert 1 <= int(X_out.sum()) <= NMAX

@@ -19,11 +19,29 @@ The gradient of log Z with respect to u is the incidence P(j in S) of every slot
 """
 from __future__ import annotations
 
+import os
+
 import torch
 
-from .kernels import CategoryProduct, CategoryProduct2D, RowESP
+from .kernels import CategoryProduct, CategoryProduct2D, RowESP, RowESPRagged, check, ptr, sampler
 
 ESP_BUCKETS = (8, 32, 96, 256)
+
+
+def _ragged_meta(ix):
+    """Cached (row_start, is_contiguous_by_row) on a RaggedIndex."""
+    meta = getattr(ix, "_esp_meta", None)
+    if meta is None:
+        row_start = torch.zeros(ix.n_rows + 1, dtype=torch.long)
+        torch.cumsum(ix.row_size, 0, out=row_start[1:])
+        T = len(ix.item)
+        if T == 0:
+            contig = True
+        else:
+            contig = bool((row_start[ix.row_of] + ix.item_pos == torch.arange(T, dtype=torch.long)).all())
+        meta = (row_start.contiguous(), contig)
+        ix._esp_meta = meta
+    return meta
 
 
 def trip_max(u, ix):
@@ -31,10 +49,11 @@ def trip_max(u, ix):
 
 
 def row_esp(log_w, ix, R):
-    """log e_0..e_R for every row, [rows, R+1].
-
-    Rows are grouped by size into buckets (8, 32, 96, 256, then doubling) and each bucket
-    is padded only to its own largest row; padded items have weight 0 (log -inf)."""
+    """log e_0..e_R for every row, [rows, R+1]."""
+    if os.environ.get("V4_LEGACY") != "1":
+        row_start, contig = _ragged_meta(ix)
+        if contig:
+            return RowESPRagged.apply(log_w, row_start, ix.row_size, R)
     out = torch.full((ix.n_rows, R + 1), -float("inf"))
     out[:, 0] = 0.0
     largest = int(ix.row_size.max()) if ix.row_size.numel() else 0
@@ -92,11 +111,17 @@ def _trip_grid(model, ix, log_g):
     grid = torch.full((1, ix.B * ix.Cpad, R + 1), -float("inf"))
     grid[..., 0] = 0.0
     grid = grid.index_copy(1, ix.flat_slot, log_g.unsqueeze(0)).view(1, ix.B, ix.Cpad, R + 1)
-    degree = torch.zeros(ix.B * ix.Cpad, dtype=torch.long)
-    degree[ix.flat_slot] = ix.row_size.clamp(max=R)
+    deg_cache = getattr(ix, "_deg_cache", None)
+    if deg_cache is None or deg_cache[0] != R:
+        degree = torch.zeros(ix.B * ix.Cpad, dtype=torch.long)
+        degree[ix.flat_slot] = ix.row_size.clamp(max=R)
+        degree = degree.view(ix.B, ix.Cpad).contiguous()
+        ix._deg_cache = (R, degree)
+    else:
+        degree = deg_cache[1]
     k = torch.arange(R + 1, dtype=log_g.dtype)
     slope = (grid[..., 1:] / k[1:]).amax(dim=(2, 3)).clamp_min(0.0)        # [1, B]
-    return grid - slope[:, :, None, None] * k, degree.view(ix.B, ix.Cpad), slope
+    return grid - slope[:, :, None, None] * k, degree, slope
 
 
 def log_mass_by_size(model, ix, log_g, scale):
@@ -123,6 +148,25 @@ def log_mass_by_size_and_categories(model, ix, log_g, scale):
 
 def log_partition(model, ix, u, *, z=None, beta=1.0, iv=None):
     """log Z per trip of the law of S given slot utilities u (and z for M2)."""
+    if (not torch.is_grad_enabled() or not u.requires_grad) and os.environ.get("V4_LEGACY") != "1":
+        shift = model.presence_shift(ix, z, beta=beta)
+        if shift is not None:
+            shift = shift.detach().contiguous()
+        iv_t = None if iv is None else iv.detach().contiguous()
+        u_t = u.detach().contiguous()
+        rho_c = model.rho_c.detach().contiguous()
+        rho_0 = model.rho_0().detach().contiguous()
+        f_extra = None if model.f_extra is None else model.f_extra.detach().contiguous()
+        K = min(int(model.R), int(ix.row_size.max()) if ix.row_size.numel() else 0, int(model.nmax))
+        min_cap = int(getattr(model, "trunc_min_cap", 32))
+        out = torch.empty(ix.B, dtype=torch.float64)
+        check(sampler().log_partition_cpp(
+            ix.B, ix.n_rows, len(ix.item), ix.Cpad, K, int(model.nmax),
+            int(model.size_on_categories), min_cap,
+            ptr(u_t), ptr(ix.row_of), ptr(ix.item_pos), ptr(ix.row_size), ptr(ix.row_cat),
+            ptr(ix.row_trip), ptr(ix.flat_slot), ptr(rho_c), ptr(rho_0), ptr(f_extra),
+            ptr(shift), ptr(iv_t), ptr(out)), "log_partition")
+        return out
     log_g, scale = category_polynomials(model, ix, u, z=z, beta=beta, iv=iv)
     if model.size_on_categories:
         return torch.logsumexp(log_mass_by_size_and_categories(model, ix, log_g, scale).reshape(ix.B, -1), -1)

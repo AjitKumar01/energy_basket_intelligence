@@ -67,11 +67,16 @@ def sampler():
             subprocess.run([compiler, *flags, str(SOURCE / "sampler.cpp"), "-o", str(lib), "-pthread"], check=True)
         so = ctypes.CDLL(str(lib))
         I, U, D, P = ctypes.c_int64, ctypes.c_uint64, ctypes.c_double, ctypes.c_void_p
-        so.sample_slots_cpp.argtypes = [I] * 7 + [U] + [P] * 12
-        so.gibbs_sweeps_cpp.argtypes = [I] * 9 + [D, U] + [P] * 15
+        so.sample_slots_cpp.argtypes = [I] * 8 + [U] + [P] * 12
+        so.gibbs_sweeps_cpp.argtypes = [I] * 10 + [D, U] + [P] * 15
+        so.gibbs_stages_cpp.argtypes = [I] * 11 + [P] * 21
+        so.gibbs_four_chains_cpp.argtypes = [I] * 11 + [P] * 4 + [I] + [P] * 25
+        so.log_partition_cpp.argtypes = [I] * 8 + [P] * 13
+        so.log_partition_batch_z_cpp.argtypes = [I] * 10 + [D] + [P] * 15
         so.log_degree_2d_forward_cpp.argtypes = [I] * 4 + [P] * 5
         so.log_degree_2d_backward_cpp.argtypes = [I] * 4 + [P] * 5
-        for f in (so.sample_slots_cpp, so.gibbs_sweeps_cpp,
+        for f in (so.sample_slots_cpp, so.gibbs_sweeps_cpp, so.gibbs_stages_cpp,
+                  so.gibbs_four_chains_cpp, so.log_partition_cpp, so.log_partition_batch_z_cpp,
                   so.log_degree_2d_forward_cpp, so.log_degree_2d_backward_cpp):
             f.restype = ctypes.c_int
         _sampler = so
@@ -106,6 +111,25 @@ class RowESP(torch.autograd.Function):
         weights, lengths, boundary = ctx.saved_tensors
         return (exact_dp().esp_blocked_log_backward(grad.contiguous(), weights, lengths, boundary,
                                                     ctx.R, ctx.block_size), None, None, None)
+
+
+class RowESPRagged(torch.autograd.Function):
+    """log e_0..e_R of each ragged row of log weights [T] given row_start [n_rows+1] and row_size [n_rows]."""
+
+    @staticmethod
+    def forward(ctx, log_weights, row_start, row_size, R):
+        value, weights = exact_dp().esp_ragged_log_forward(
+            log_weights.contiguous(), row_start.contiguous(), row_size.contiguous(), int(R))
+        ctx.save_for_backward(weights, row_start, row_size)
+        ctx.R = int(R)
+        return value
+
+    @staticmethod
+    @torch.autograd.function.once_differentiable
+    def backward(ctx, grad):
+        weights, row_start, row_size = ctx.saved_tensors
+        return (exact_dp().esp_ragged_log_backward(grad.contiguous(), weights, row_start, row_size,
+                                                   ctx.R), None, None, None)
 
 
 class CategoryProduct(torch.autograd.Function):

@@ -11,7 +11,8 @@ competition and history stay at the checkpoint.  Every --every steps:
     moment matching  one damped step of lam, rho_0, rho_c along their averaged gradient divided by the
                      data rate (the rule of scripts/fit_interactions.py)
     whitening        parameter-expanded EM: rescale phi, psi by the square root of the pooled posterior
-                     second moment of z (mixture.whiten_)
+                     second moment of z (mixture.whiten_), estimated with --whiten-K draws on
+                     --whiten-trips fixed training trips (the K training draws overstate it)
 
 Each trip's posterior peak is kept and starts its search on the next epoch.  Validation (every
 --val-every steps and at the end): the mixture log-likelihood of the first --val-eval held-out trips
@@ -62,6 +63,9 @@ def parse_args():
     p.add_argument("--val-K", type=int, default=256)
     p.add_argument("--val-gen", type=int, default=1024, help="held-out trips for the generated-size check")
     p.add_argument("--val-every", type=int, default=120, help="steps between validations")
+    p.add_argument("--whiten-trips", type=int, default=256, help="fixed training trips for the whitening moment")
+    p.add_argument("--whiten-K", type=int, default=256,
+                   help="draws per trip for the whitening moment (K=8 overstates it by ~6%%, so the scale creeps up)")
     p.add_argument("--lr-phi", type=float, default=0.003)
     p.add_argument("--lr-rho0", type=float, default=0.05)
     p.add_argument("--lr-rho", type=float, default=0.03)
@@ -129,6 +133,14 @@ def main():
 
     ev = batcher.make(np.sort(val[:args.val_eval]))
     gb = batcher.make(np.sort(val[:args.val_gen]))
+    wb = batcher.make(train[np.sort(np.random.default_rng(args.seed + 11).choice(N, args.whiten_trips, replace=False))])
+
+    def second_moment():
+        """Pooled posterior E[z z^T] on the fixed whitening trips, with many draws: the self-normalised
+        weights of the K training draws lean toward the (wider) proposal and overstate it."""
+        wb.bind(model)
+        _, _, info = mixture.log_lik(model, wb, torch.Generator().manual_seed(args.seed + 12), K=args.whiten_K)
+        return torch.einsum("kb,kbi,kbj->ij", info["w"], info["zs"], info["zs"]) / wb.ix.B
     best = -float("inf")
 
     def save(path, stage):
@@ -210,12 +222,14 @@ def main():
                 model.rho_c.sub_(0.5 * (rc / rate_pairs).clamp(-0.5, 0.5))
                 model.lam.sub_(0.35 * (la / rate_item).clamp(-0.35, 0.35))
             project(model, capacities, opt)
-            eig = mixture.whiten_(model, zz / zz_n)               # parameter-expanded EM
+            train_trace = float(torch.trace(zz / zz_n)) / r
+            eig = mixture.whiten_(model, second_moment())        # parameter-expanded EM
             for prm in (model.phi, model.psi_cat):
                 opt.state.pop(prm, None)
             emit({"step": step, "lam_rel_err_mean": round(float((la / rate_item).abs().mean()), 4),
                   "whiten_eigs_top3": [round(float(v), 3) for v in eig[:3]],
                   "whiten_trace_over_rank": round(float(eig.sum() / r), 3),
+                  "train_draws_trace_over_rank": round(train_trace, 3),
                   "steps_seconds": round(time.time() - t_block, 1)})
             g_sums, g_count, zz, zz_n, t_block = None, 0, torch.zeros(r, r), 0, time.time()
         if step % 10 == 0:

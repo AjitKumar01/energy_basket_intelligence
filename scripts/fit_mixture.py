@@ -72,6 +72,8 @@ def parse_args():
     p.add_argument("--rho-c-prec", type=float, default=0.2)
     p.add_argument("--f-extra-prec", type=float, default=2.0)
     p.add_argument("--seed", type=int, default=41001)
+    p.add_argument("--start-step", type=int, default=0,
+                   help="resume a stopped fit: --init its _best.pt saved at this step, same seed and epochs")
     p.add_argument("--threads", type=int, default=4)
     return p.parse_args()
 
@@ -157,7 +159,9 @@ def main():
             row["best"] = True
         emit(row)
 
-    validate(0)
+    for _ in range(args.start_step // len(batches)):           # replay the batch orders already used
+        rng.shuffle(batches)
+    validate(args.start_step)
     for n in TRAINED:
         getattr(model, n).requires_grad_(True)
     opt = torch.optim.Adam([{"params": [model.psi_cat, model.phi], "lr": args.lr_phi},
@@ -172,7 +176,7 @@ def main():
     g_sums, g_count = None, 0
     zz, zz_n = torch.zeros(r, r), 0
     t_block = time.time()
-    for step in range(1, steps + 1):
+    for step in range(args.start_step + 1, steps + 1):
         if step > 1 and (step - 1) % len(batches) == 0:          # a new epoch: new batch order
             rng.shuffle(batches)
         pos = batches[(step - 1) % len(batches)]

@@ -27,7 +27,7 @@ probability. Training never visited it and validation mostly missed it: the repo
 log-likelihood was $-38.8$ per trip, the value found when the region is included about $-53.8$. In the mixture
 form a taste is weighted by the prior alone. Each basket's posterior over tastes is then strongly
 log-concave, baskets are drawn exactly, and the likelihood estimate is a lower bound with bounded
-weights. On 64 held-out real trips the mixture form scores $-35.98$ against $-36.78$ for the old fit;
+weights. On 64 held-out real trips the mixture form scores $-35.83$ against $-36.78$ for the old fit;
 on synthetic data $-27.38$ against $-27.90$.
 \end{abstract}
 
@@ -251,11 +251,15 @@ Real (187 categories, 5{,}455 products, cap 120) & log-lik. & min.\ ESS & size m
 Data & & & 7.26 & 42.8\\
 Old fit, current form (mode-covering estimate) & $-36.78$ & 0.007 & & \\
 Old fit's parameters as a mixture & $-36.44$ & 0.42 & 3.81 & 18\\
-Mixture, 60 steps, no corrections & $\mathbf{-35.98}$ & 0.35 & 5.25 & 26.8\\\bottomrule
+Mixture, 60 steps, no corrections & $-35.98$ & 0.35 & 5.25 & 26.8\\
+\quad + 120 steps, moment matching and whitening & $\mathbf{-35.83}$ & 0.28 & 6.71 & 35\\\bottomrule
 \end{tabular}
 \end{table}
 
-A real run with moment matching and whitening every 30 steps was in progress when this was written.
+The last run applied moment matching and whitening every 30 steps. In total the mixture saw 180 batches
+of 256 trips, about 29\% of one epoch (622 batches). Whitening found the pooled tastes 15\%, 11\%, 9\%
+and 9\% too spread at its four rounds, the same convergence as on synthetic data. No generated basket
+reached the cap.
 
 \paragraph{Cost.} One real step on 256 baskets takes 35 to 55\,s: about 1.6\,s per exact gradient call,
 8 to 15 of them in the peak search and 8 in the objective. A damped Newton peak search was not faster
@@ -266,8 +270,8 @@ A real run with moment matching and whitening every 30 steps was in progress whe
 \begin{itemize}
 \item Shared tastes express products bought together, not cross-category substitution; within a
   category $\rho_c$ and the competition shift still do. No loss against the current model.
-\item Generated baskets on real data were 28\% too small after 60 steps without corrections; the run
-  with moment matching and whitening is the check.
+\item Generated baskets on real data are 8\% too small on average (6.71 against 7.26) and the 99th
+  percentile is 35 against 42.8, after under a third of an epoch.
 \item The prior is one Gaussian. Real trip types may want a few Gaussian components; Proposition 2 holds
   within each.
 \item Whitening leaves one term uncompensated, so it is not an exact EM step.
@@ -278,7 +282,7 @@ A real run with moment matching and whitening every 30 steps was in progress whe
 \item Price and promotion checks must be re-run on the mixture form.
 \end{itemize}
 
-{\sloppy\noindent Next: finish the real run; move the code into \texttt{v4/} with the enumeration test in
+{\sloppy\noindent Next: move the code into \texttt{v4/} with the enumeration test in
 \texttt{tests/test\_law.py}; one full real fit with the mode check and the size-by-period check before any
 test-week evaluation.\par}
 

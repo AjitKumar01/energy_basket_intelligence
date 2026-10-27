@@ -34,6 +34,7 @@ only on an otherwise idle machine.
 | `$PY -u bench/law_checks.py --world W --check draws` | exact draws given z against the exact incidence, at z near the observed basket and at z from 200-sweep chains |
 | `$PY -u bench/law_checks.py --world W --check logz --save F.npz` | exact log Z at fixed (trip, z) pairs |
 | `$PY -u bench/law_checks.py --world W --check ll --trips 256 --save F.npz` | held-out log-likelihood at 1,024 draws, per basket |
+| `$PY -u bench/modes.py --world W [--trips 64]` | chains from the observed basket, from the model without interactions and from two far starts: basket size, share at the cap, and the z-marginal weight of where each ends (a heavy region the data's chain does not reach) |
 | `$PY bench/compare.py OLD.npz NEW.npz` | per-trip NEW − OLD: min, max, mean, standard error |
 
 ## Checking a change

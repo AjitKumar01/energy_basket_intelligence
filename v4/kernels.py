@@ -74,10 +74,10 @@ def sampler():
         so.log_partition_cpp.argtypes = [I] * 8 + [P] * 13
         so.log_partition_batch_z_cpp.argtypes = [I] * 10 + [D] + [P] * 15
         so.log_degree_2d_forward_cpp.argtypes = [I] * 4 + [P] * 7
-        so.log_degree_2d_backward_cpp.argtypes = [I] * 4 + [P] * 7
+        so.log_degree_2d_grad_cpp.argtypes = [I] * 4 + [P] * 5
         for f in (so.sample_slots_cpp, so.gibbs_sweeps_cpp, so.gibbs_stages_cpp,
                   so.gibbs_four_chains_cpp, so.log_partition_cpp, so.log_partition_batch_z_cpp,
-                  so.log_degree_2d_forward_cpp, so.log_degree_2d_backward_cpp):
+                  so.log_degree_2d_forward_cpp, so.log_degree_2d_grad_cpp):
             f.restype = ctypes.c_int
         _sampler = so
     return _sampler
@@ -158,10 +158,11 @@ class CategoryProduct2D(torch.autograd.Function):
 
     The backward pass needs the DP's intermediate tables, B x (Cpad+1) x (nmax+1)^2 numbers
     (about 9 GB for 256 Dunnhumby trips).  So the forward pass keeps only its inputs, and the
-    backward pass recomputes the tables for ``CHUNK`` trips at a time.  Trips are independent,
-    so the result is the same as keeping every table."""
+    backward pass (log_degree_2d_grad_cpp) recomputes them per trip from a table kept every
+    sqrt(Cpad) categories, one segment at a time, and only for the sizes the incoming gradient
+    weighs (all but TAIL of its weight)."""
 
-    CHUNK = 16
+    TAIL = 1e-13
 
     @staticmethod
     def forward(ctx, log_polys, degree, nmax):
@@ -179,22 +180,14 @@ class CategoryProduct2D(torch.autograd.Function):
     def backward(ctx, grad):
         lp, deg = ctx.saved_tensors
         B, Cpad, stride = lp.shape
-        n = ctx.nmax + 1
         g = grad.contiguous()
+        # Per trip, the largest size n whose rows n.. still carry more than TAIL of the gradient's
+        # total weight; the backward runs on sizes <= that cap (exact there; what is dropped is at
+        # most TAIL of the gradient).
+        rows = g.abs().sum(2)
+        tail = rows.flip(1).cumsum(1).flip(1)
+        caps = ((tail > CategoryProduct2D.TAIL * rows.sum(1, keepdim=True)).sum(1) - 1).clamp(0, ctx.nmax).contiguous()
         grad_in = torch.empty_like(lp)
-        step = CategoryProduct2D.CHUNK
-        states = torch.empty((min(step, B), Cpad + 1, n, n))
-        state_exp = torch.empty((min(step, B), Cpad + 1, n))      # power-of-two exponent per row
-        for s in range(0, B, step):
-            e = min(s + step, B)
-            lp_c, deg_c, g_c = lp[s:e], deg[s:e], g[s:e]
-            q_c, out_c, grad_c = torch.empty_like(lp_c), torch.empty((e - s, n, n)), torch.empty_like(lp_c)
-            qx_c = torch.empty_like(lp_c)
-            check(sampler().log_degree_2d_forward_cpp(e - s, Cpad, stride, ctx.nmax, ptr(lp_c), ptr(deg_c),
-                                                      ptr(out_c), ptr(q_c), ptr(states), ptr(qx_c),
-                                                      ptr(state_exp)), "2-D DP")
-            check(sampler().log_degree_2d_backward_cpp(e - s, Cpad, stride, ctx.nmax, ptr(g_c), ptr(q_c),
-                                                       ptr(deg_c), ptr(states), ptr(grad_c), ptr(qx_c),
-                                                       ptr(state_exp)), "2-D DP backward")
-            grad_in[s:e] = grad_c
+        check(sampler().log_degree_2d_grad_cpp(B, Cpad, stride, ctx.nmax, ptr(lp), ptr(deg), ptr(g), ptr(caps),
+                                               ptr(grad_in)), "2-D DP backward")
         return grad_in, None, None

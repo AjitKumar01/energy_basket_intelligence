@@ -1406,128 +1406,243 @@ extern "C" int log_degree_2d_forward_cpp(
     return err.load(std::memory_order_relaxed);
 }
 
-// Gradient of the 2-D product with respect to the log coefficients, from the tables kept by
-// log_degree_2d_forward_cpp: each term's share of the entry it adds to, with both sides
-// brought to the same row exponent.
-extern "C" int log_degree_2d_backward_cpp(
+// One step of the 2-D product with the table kept: next = previous x (category c's polynomial
+// sum_k qm[k] 2^qe[k] t^k y^[k>0], k = 0..d_eff), both row-scaled.  E holds previous's row
+// exponents on entry and next's on exit; NB is scratch.  The same arithmetic as the stored-table
+// branch of log_degree_2d_forward_cpp.
+static inline void kept_category_step(const double* previous, double* next, int64_t* E, int64_t* NB,
+                                      int64_t& deg_cur, int64_t& cat_cur, const double* qm,
+                                      const int64_t* qe, int64_t d, int64_t d_eff, int64_t c,
+                                      int64_t nmax, int64_t N1) {
+    const int64_t next_deg = std::min(nmax, deg_cur + d);
+    const int64_t next_cat = std::min(nmax, cat_cur + (d > 0 ? 1 : 0));
+    const int64_t m_clear = std::min(nmax, c + 2);
+    for (int64_t n = 0; n <= nmax; ++n) {
+        int64_t m_hi = std::min(n, m_clear);
+        std::fill(&next[n * N1], &next[n * N1 + m_hi + 1], 0.0);
+    }
+    target_exponents(E, NB, deg_cur, next_deg, qm, qe, d_eff, nmax);
+    if (qm[0] > 0.0) {
+        for (int64_t n = 0; n <= deg_cur; ++n) {
+            if (E[n] == ROW_EMPTY) continue;
+            double f0 = qm[0] * pow2i(E[n] + qe[0] - NB[n]);
+            int64_t m_hi = std::min(n, cat_cur);
+            for (int64_t m = 0; m <= m_hi; ++m) next[n * N1 + m] = previous[n * N1 + m] * f0;
+        }
+    }
+    for (int64_t k = 1; k <= d_eff; ++k) {
+        if (qm[k] == 0.0) continue;
+        int64_t max_n = std::min(nmax - k, deg_cur);
+        for (int64_t n = 0; n <= max_n; ++n) {
+            if (E[n] == ROW_EMPTY) continue;
+            double f = qm[k] * pow2i(E[n] + qe[k] - NB[n + k]);
+            if (f == 0.0) continue;
+            int64_t m_hi = std::min(n, cat_cur);
+            const double* prev_row = &previous[n * N1];
+            double* next_row = &next[(n + k) * N1 + 1];
+            for (int64_t m = 0; m <= m_hi; ++m) next_row[m] += prev_row[m] * f;
+        }
+    }
+    for (int64_t n = 0; n <= next_deg; ++n) E[n] = NB[n];
+    for (int64_t n = next_deg + 1; n <= nmax; ++n) E[n] = ROW_EMPTY;
+    renorm_rows(next, E, next_deg, next_cat, N1);
+    deg_cur = next_deg;
+    cat_cur = next_cat;
+}
+
+// Backward through one such step: given the gradient hnext on next, add each term's share
+// hnext * term / next to its source entry (hprevious) and to its coefficient (hq[k]).  Returns
+// false when the step only rescales rows (d = 0): then hprevious = hnext and the caller keeps
+// hnext.  The loops run in the forward's order (source row, degree, contiguous m).
+static inline bool kept_category_backward(const double* previous, const double* next, const int64_t* Ep,
+                                          const int64_t* En, const double* q, const int64_t* qe,
+                                          int64_t d, int64_t n_prev_hi, int64_t m_prev_cap,
+                                          int64_t n_cur_hi, int64_t m_cur_cap, const double* hnext,
+                                          double* hprevious, double* hq, int64_t N1) {
+    if (d == 0) {
+        double hq0 = 0.0;
+        for (int64_t n = 0; n <= n_cur_hi; ++n) {
+            if (Ep[n] == ROW_EMPTY || En[n] == ROW_EMPTY) continue;
+            double f0 = q[0] * pow2i(Ep[n] + qe[0] - En[n]);
+            int64_t m_hi = std::min(n, m_cur_cap);
+            for (int64_t m = 0; m <= m_hi; ++m) {
+                if (next[n * N1 + m] > 0.0 && hnext[n * N1 + m] != 0.0 && previous[n * N1 + m] * f0 > 0.0) {
+                    hq0 += hnext[n * N1 + m];
+                }
+            }
+        }
+        hq[0] = hq0;
+        return false;
+    }
+    for (int64_t n = 0; n <= n_prev_hi; ++n) {
+        int64_t m_hi = std::min(n, m_prev_cap);
+        std::fill(&hprevious[n * N1], &hprevious[n * N1 + m_hi + 1], 0.0);
+    }
+    double hq0 = 0.0;
+    for (int64_t n = 0; n <= std::min(n_prev_hi, n_cur_hi); ++n) {             // c absent
+        if (Ep[n] == ROW_EMPTY || En[n] == ROW_EMPTY || q[0] == 0.0) continue;
+        const double f0 = q[0] * pow2i(Ep[n] + qe[0] - En[n]);
+        const int64_t m_hi = std::min(std::min(n, m_prev_cap), m_cur_cap);
+        const double* pr = &previous[n * N1];
+        const double* nr = &next[n * N1];
+        const double* hr = &hnext[n * N1];
+        double* hp = &hprevious[n * N1];
+        double acc = 0.0;
+        for (int64_t m = 0; m <= m_hi; ++m) {
+            const double term = pr[m] * f0;
+            const double c0 = (term > 0.0 && nr[m] > 0.0 && hr[m] != 0.0) ? hr[m] * (term / nr[m]) : 0.0;
+            hp[m] += c0;
+            acc += c0;
+        }
+        hq0 += acc;
+    }
+    hq[0] = hq0;
+    for (int64_t k = 1; k <= d; ++k) {                                        // k products of c
+        if (q[k] == 0.0) continue;
+        double hqk = 0.0;
+        const int64_t n_hi = std::min(n_prev_hi, n_cur_hi - k);
+        for (int64_t n = 0; n <= n_hi; ++n) {
+            if (Ep[n] == ROW_EMPTY || En[n + k] == ROW_EMPTY) continue;
+            const double f = q[k] * pow2i(Ep[n] + qe[k] - En[n + k]);
+            const int64_t m_hi = std::min(std::min(n, m_prev_cap), std::min(n + k, m_cur_cap) - 1);
+            const double* pr = &previous[n * N1];
+            const double* nr = &next[(n + k) * N1 + 1];
+            const double* hr = &hnext[(n + k) * N1 + 1];
+            double* hp = &hprevious[n * N1];
+            double acc = 0.0;
+            for (int64_t m = 0; m <= m_hi; ++m) {
+                const double term = pr[m] * f;
+                const double ck = (term > 0.0 && nr[m] > 0.0 && hr[m] != 0.0) ? hr[m] * (term / nr[m]) : 0.0;
+                hp[m] += ck;
+                acc += ck;
+            }
+            hqk += acc;
+        }
+        hq[k] = hqk;
+    }
+    return true;
+}
+
+// Gradient of the 2-D product (log_degree_2d_forward_cpp) with respect to the log coefficients.
+// Keeping every intermediate table costs B x (Cpad+1) x (nmax+1)^2 doubles (about 9 GB for 256
+// Dunnhumby trips), so each trip keeps a table every S = ceil(sqrt(Cpad)) categories and
+// recomputes the S tables of a segment just before stepping back through it: about one extra
+// forward pass, and a working set of 2 sqrt(Cpad) tables per thread.  caps[b] <= nmax: trip b's
+// tables are built for sizes n <= caps[b] only (rows n depend on rows <= n alone, so they are
+// exact); the caller sets it where grad_log_out has no weight left above.
+extern "C" int log_degree_2d_grad_cpp(
     int64_t B,
     int64_t Cpad,
     int64_t stride,
     int64_t nmax,
-    const double* grad_log_out,
-    const double* q_all,
+    const double* log_coeffs,
     const int64_t* degrees,
-    const double* states,
-    double* grad_log_coeffs,
-    const double* q_exp,
-    const double* state_exp
+    const double* grad_log_out,
+    const int64_t* caps,
+    double* grad_log_coeffs
 ) {
     const int64_t N1 = nmax + 1;
     const int64_t stride2d = N1 * N1;
+    const int64_t S = std::max<int64_t>(1, static_cast<int64_t>(std::ceil(std::sqrt(static_cast<double>(Cpad)))));
+    const int64_t n_ck = Cpad / S + 1;                       // kept tables at c = 0, S, 2S, ...
+    std::atomic<int> err{0};
     int64_t n_threads = std::min<int64_t>(B, MAX_THREADS);
     if (n_threads < 1) n_threads = 1;
 
     auto worker = [&](int64_t tid) {
         int64_t b_start = (B * tid) / n_threads;
         int64_t b_end = (B * (tid + 1)) / n_threads;
-        std::vector<double> hnext(stride2d, 0.0), hprevious(stride2d, 0.0);
-        std::vector<int64_t> deg_hist(Cpad + 1, 0), cat_hist(Cpad + 1, 0), Ep(N1), En(N1), qe(stride);
+        std::vector<double> ck(n_ck * stride2d), seg((S + 1) * stride2d);
+        std::vector<int64_t> ckE(n_ck * N1), segE((S + 1) * N1), ck_deg(n_ck), ck_cat(n_ck);
+        std::vector<double> hnext(stride2d), hprevious(stride2d);
+        std::vector<int64_t> deg_hist(Cpad + 1), cat_hist(Cpad + 1), dd(Cpad), E(N1), NB(N1);
+        std::vector<double> qm(stride * Cpad);
+        std::vector<int64_t> qe(stride * Cpad), d_eff(Cpad);
 
-        for (int64_t b = b_start; b < b_end; ++b) {
+        for (int64_t b = b_start; b < b_end && err.load(std::memory_order_relaxed) == 0; ++b) {
+            const int64_t cap = std::clamp<int64_t>(caps[b], 0, nmax);
             int64_t dc = 0, cc = 0;
             for (int64_t c = 0; c < Cpad; ++c) {
                 deg_hist[c] = dc;
                 cat_hist[c] = cc;
-                int64_t d = std::clamp<int64_t>(degrees[b * Cpad + c], 0, nmax);
-                dc = std::min(nmax, dc + d);
-                cc = std::min(nmax, cc + (d > 0 ? 1 : 0));
+                dd[c] = std::clamp<int64_t>(degrees[b * Cpad + c], 0, cap);
+                dc = std::min(cap, dc + dd[c]);
+                cc = std::min(cap, cc + (dd[c] > 0 ? 1 : 0));
+                const double* lp = log_coeffs + (b * Cpad + c) * stride;
+                bool any = false;
+                d_eff[c] = 0;
+                for (int64_t k = 0; k <= dd[c]; ++k) {
+                    split_log(lp[k], qm[c * stride + k], qe[c * stride + k]);
+                    if (qm[c * stride + k] > 0.0) {
+                        any = true;
+                        if (k >= 1) d_eff[c] = k;
+                    }
+                }
+                if (!any) {
+                    err.store(-1, std::memory_order_relaxed);
+                    return;
+                }
             }
             deg_hist[Cpad] = dc;
             cat_hist[Cpad] = cc;
 
+            // Forward, keeping the table every S categories (rolling pair of tables).
+            double* cur = seg.data();
+            double* nxt = seg.data() + stride2d;
+            std::fill(E.begin(), E.end(), ROW_EMPTY);
+            E[0] = 0;
+            for (int64_t n = 0; n <= cap; ++n) {
+                cur[n * N1 + 0] = 0.0;
+                if (n >= 1) cur[n * N1 + 1] = 0.0;
+            }
+            cur[0] = 1.0;
+            std::copy(cur, cur + stride2d, ck.begin());
+            std::copy(E.begin(), E.end(), ckE.begin());
+            ck_deg[0] = 0;
+            ck_cat[0] = 0;
+            int64_t deg_cur = 0, cat_cur = 0;
+            for (int64_t c = 0; c < Cpad; ++c) {
+                kept_category_step(cur, nxt, E.data(), NB.data(), deg_cur, cat_cur, &qm[c * stride],
+                                   &qe[c * stride], dd[c], d_eff[c], c, cap, N1);
+                std::swap(cur, nxt);
+                const int64_t j = (c + 1) / S;
+                if ((c + 1) % S == 0 && j < n_ck) {
+                    std::copy(cur, cur + stride2d, &ck[j * stride2d]);
+                    std::copy(E.begin(), E.end(), &ckE[j * N1]);
+                    ck_deg[j] = deg_cur;
+                    ck_cat[j] = cat_cur;
+                }
+            }
+
+            // Backward, one segment at a time from the last.
             std::copy(grad_log_out + b * stride2d, grad_log_out + (b + 1) * stride2d, hnext.begin());
-            const double* first = states + b * (Cpad + 1) * stride2d;
-            const double* first_exp = state_exp + b * (Cpad + 1) * N1;
-            for (int64_t c = Cpad - 1; c >= 0; --c) {
-                const int64_t d = std::clamp<int64_t>(degrees[b * Cpad + c], 0, nmax);
-                double* hq = grad_log_coeffs + (b * Cpad + c) * stride;
-                std::fill(hq, hq + stride, 0.0);
-                const double* previous = first + c * stride2d;
-                const double* next = previous + stride2d;
-                const double* q = q_all + (b * Cpad + c) * stride;
-                const double* qx = q_exp + (b * Cpad + c) * stride;
-                for (int64_t n = 0; n <= nmax; ++n) {
-                    Ep[n] = static_cast<int64_t>(first_exp[c * N1 + n]);
-                    En[n] = static_cast<int64_t>(first_exp[(c + 1) * N1 + n]);
+            for (int64_t j = (Cpad - 1) / S; j >= 0; --j) {
+                int64_t c0 = j * S, c1 = std::min(Cpad, c0 + S);
+                std::copy(&ck[j * stride2d], &ck[(j + 1) * stride2d], seg.begin());
+                std::copy(&ckE[j * N1], &ckE[(j + 1) * N1], E.begin());
+                std::copy(E.begin(), E.end(), segE.begin());
+                int64_t dg = ck_deg[j], ct = ck_cat[j];
+                for (int64_t c = c0; c < c1; ++c) {
+                    kept_category_step(&seg[(c - c0) * stride2d], &seg[(c - c0 + 1) * stride2d], E.data(),
+                                       NB.data(), dg, ct, &qm[c * stride], &qe[c * stride], dd[c], d_eff[c],
+                                       c, cap, N1);
+                    std::copy(E.begin(), E.end(), &segE[(c - c0 + 1) * N1]);
                 }
-                for (int64_t k = 0; k <= d; ++k) qe[k] = static_cast<int64_t>(qx[k]);
-                if (d == 0) {
-                    int64_t n_hi = deg_hist[c + 1];
-                    int64_t m_cap = cat_hist[c + 1];
-                    double hq0 = 0.0;
-                    for (int64_t n = 0; n <= n_hi; ++n) {
-                        if (Ep[n] == ROW_EMPTY || En[n] == ROW_EMPTY) continue;
-                        double f0 = q[0] * pow2i(Ep[n] + qe[0] - En[n]);
-                        int64_t m_hi = std::min(n, m_cap);
-                        for (int64_t m = 0; m <= m_hi; ++m) {
-                            double nxt = next[n * N1 + m];
-                            double hn = hnext[n * N1 + m];
-                            if (nxt > 0.0 && hn != 0.0 && previous[n * N1 + m] * f0 > 0.0) {
-                                hq0 += hn;
-                            }
-                        }
-                    }
-                    hq[0] = hq0;
-                    continue;
+                for (int64_t c = c1 - 1; c >= c0; --c) {
+                    double* hq = grad_log_coeffs + (b * Cpad + c) * stride;
+                    std::fill(hq, hq + stride, 0.0);
+                    bool moved = kept_category_backward(
+                        &seg[(c - c0) * stride2d], &seg[(c - c0 + 1) * stride2d], &segE[(c - c0) * N1],
+                        &segE[(c - c0 + 1) * N1], &qm[c * stride], &qe[c * stride], dd[c], deg_hist[c],
+                        cat_hist[c], deg_hist[c + 1], cat_hist[c + 1], hnext.data(), hprevious.data(), hq, N1);
+                    if (moved) hnext.swap(hprevious);
                 }
-                int64_t n_prev_hi = deg_hist[c];
-                int64_t m_prev_cap = cat_hist[c];
-                for (int64_t n = 0; n <= n_prev_hi; ++n) {
-                    int64_t m_hi = std::min(n, m_prev_cap);
-                    std::fill(&hprevious[n * N1], &hprevious[n * N1 + m_hi + 1], 0.0);
-                }
-                int64_t n_cur_hi = deg_hist[c + 1];
-                int64_t m_cur_cap = cat_hist[c + 1];
-                for (int64_t n = 0; n <= n_cur_hi; ++n) {
-                    if (En[n] == ROW_EMPTY) continue;
-                    int64_t m_hi = std::min(n, m_cur_cap);
-                    double f0 = (n <= n_prev_hi && Ep[n] != ROW_EMPTY) ? q[0] * pow2i(Ep[n] + qe[0] - En[n]) : 0.0;
-                    int64_t k_lo = std::max<int64_t>(1, n - n_prev_hi);
-                    for (int64_t m = 0; m <= m_hi; ++m) {
-                        double nxt = next[n * N1 + m];
-                        double hn = hnext[n * N1 + m];
-                        if (nxt <= 0.0 || hn == 0.0) continue;
-                        double inv = 1.0 / nxt;
-                        bool ord = std::isfinite(inv);
-                        if (n <= n_prev_hi && m <= m_prev_cap) {
-                            double term0 = previous[n * N1 + m] * f0;
-                            if (term0 > 0.0) {
-                                double c0 = hn * (ord ? term0 * inv : term0 / nxt);
-                                hprevious[n * N1 + m] += c0;
-                                hq[0] += c0;
-                            }
-                        }
-                        if (m >= 1 && m - 1 <= m_prev_cap) {
-                            int64_t upper = std::min(d, n - (m - 1));
-                            for (int64_t k = k_lo; k <= upper; ++k) {
-                                if (Ep[n - k] == ROW_EMPTY || q[k] == 0.0) continue;
-                                double term = previous[(n - k) * N1 + (m - 1)] * q[k] * pow2i(Ep[n - k] + qe[k] - En[n]);
-                                if (term > 0.0) {
-                                    double ck = hn * (ord ? term * inv : term / nxt);
-                                    hprevious[(n - k) * N1 + (m - 1)] += ck;
-                                    hq[k] += ck;
-                                }
-                            }
-                        }
-                    }
-                }
-                hnext.swap(hprevious);
             }
         }
     };
 
     pool().run(n_threads, worker);
-    return 0;
+    return err.load(std::memory_order_relaxed);
 }
 
 extern "C" int log_partition_cpp(

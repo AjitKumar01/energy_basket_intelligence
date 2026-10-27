@@ -1,12 +1,13 @@
 """Exact checks of the basket law against enumeration of every basket (tests/tiny.py)."""
 import math
 
+import numpy as np
 import pytest
 import torch
 
 from tiny import (NMAX, RANK, baskets_of, energy_given_z, full_energy, log_sum_exp, make_batch,
                   make_model)
-from v4 import exact, sampling
+from v4 import exact, mixture, sampling
 from v4.competition_iv import competition_moments, estimate_competition_iv, jackknife_se
 from v4.price import changed_price_context, own_price_tilt
 from v4.training import Priors, penalties, pseudo_loglik
@@ -546,3 +547,68 @@ def test_log_partition_with_categories_far_below_the_trip(name):
         for s in (s for s in range(len(ix.item)) if int(ix.item_trip[s]) == t):
             prob = sum(math.exp(e - lz_t) for S, e in energies.items() if s in S)
             assert abs(float(p[s]) - prob) < 1e-10
+
+
+def _mixture_log_lik_by_quadrature(model, ix, iv, obs, t, transform=None, nodes=48):
+    """log p(S_t) of the mixture form: enumeration of every basket given z, Gauss-Hermite quadrature
+    over z ~ N(0, I) (z = transform @ x with x ~ N(0, I) when given)."""
+    x, w = np.polynomial.hermite.hermgauss(nodes)
+    terms = []
+    for xi, wi in zip(x, w):
+        for xj, wj in zip(x, w):
+            zt = torch.tensor([math.sqrt(2) * xi, math.sqrt(2) * xj])
+            if transform is not None:
+                zt = transform @ zt
+            z = zt[None].expand(ix.B, RANK).clone()
+            u = model.slot_utilities_given_z(ix, z).detach()
+            en = [energy_given_z(model, ix, u, z, iv, S) for S in baskets_of(ix, t)]
+            terms.append(math.log(wi * wj / math.pi) + energy_given_z(model, ix, u, z, iv, obs[t]) - log_sum_exp(en))
+    return log_sum_exp(terms)
+
+
+@pytest.mark.parametrize("name", BLOCKS)
+def test_mixture_form_against_enumeration(name):
+    """log p(S | z) of mixture.log_cond against enumeration; the importance estimate of the mixture
+    log p(S) against enumeration + quadrature over z (docs/mixture_theory.pdf)."""
+    model = make_model(**BLOCKS[name])
+    with torch.no_grad():
+        model.phi[:, :RANK] *= 1.5                      # stronger interactions than the default
+    batch = make_batch()
+    batch.bind(model)
+    ix = batch.ix
+    b, iv = model.slot_utilities(ix).detach(), model.iv_shift(ix)
+    iv = None if iv is None else iv.detach()
+    e, s = model.energy(batch, iv=iv).detach(), model.basket_field(ix, batch.observed).detach()
+    obs = [tuple(j for j in range(len(ix.item)) if batch.observed[j] and int(ix.item_trip[j]) == t)
+           for t in range(ix.B)]
+    z = torch.randn(ix.B, RANK, generator=torch.Generator().manual_seed(5))
+    u = model.slot_utilities_given_z(ix, z).detach()
+    lc = mixture.log_cond(model, ix, iv, b, e, s, z)
+    for t in range(ix.B):
+        en = [energy_given_z(model, ix, u, z, iv, S) for S in baskets_of(ix, t)]
+        assert abs(float(lc[t]) - (energy_given_z(model, ix, u, z, iv, obs[t]) - log_sum_exp(en))) < 1e-9
+    ll, ess, _ = mixture.log_lik(model, batch, torch.Generator().manual_seed(0), K=4000)
+    for t in range(ix.B):
+        assert abs(float(ll[t]) - _mixture_log_lik_by_quadrature(model, ix, iv, obs, t)) < 0.01
+        assert float(ess[t]) > 0.5
+
+
+def test_mixture_whitening_keeps_the_law():
+    """Without psi, whiten_ is an exact reparameterisation: the old vectors with z ~ N(0, Sigma) and
+    the new ones with z ~ N(0, I) give the same p(S)."""
+    model = make_model(f_extra=True, categories=True)
+    batch = make_batch()
+    batch.bind(model)
+    ix = batch.ix
+    iv = model.iv_shift(ix)
+    obs = [tuple(j for j in range(len(ix.item)) if batch.observed[j] and int(ix.item_trip[j]) == t)
+           for t in range(ix.B)]
+    sigma = torch.tensor([[1.6, 0.3], [0.3, 0.8]])
+    ev, V = torch.linalg.eigh(sigma)
+    A = V @ torch.diag(ev.sqrt()) @ V.T
+    before = [_mixture_log_lik_by_quadrature(model, ix, iv, obs, t, transform=A) for t in range(ix.B)]
+    mixture.whiten_(model, sigma)
+    batch.bind(model)
+    after = [_mixture_log_lik_by_quadrature(model, ix, iv, obs, t) for t in range(ix.B)]
+    for t in range(ix.B):
+        assert abs(before[t] - after[t]) < 1e-9

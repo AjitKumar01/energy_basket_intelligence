@@ -7,11 +7,16 @@
 \setlist{nosep}
 
 \newtheorem{proposition}{Proposition}
+\newtheorem{definition}{Definition}
+\theoremstyle{remark}
+\newtheorem{remark}{Remark}
 \newcommand{\N}{\mathcal N}
 \newcommand{\E}{\mathbb E}
+\newcommand{\R}{\mathbb R}
 \newcommand{\Cov}{\operatorname{Cov}}
+\newcommand{\pos}[1]{(#1)_+}
 
-\title{The mixture form of the Version-4 basket model}
+\title{The mixture form of the Version-4 basket model:\\ model, likelihood, sampling and training}
 \author{Ajit}
 \date{27 October 2026}
 
@@ -19,271 +24,553 @@
 \maketitle
 
 \begin{abstract}
-We replace the Version-4 basket law by its mixture form: each trip draws a taste
-$z\sim\N(0,I)$ of dimension 16, then a basket from the existing exact law given $z$. In the current
-form a taste is weighted by the prior times $Z_z$, the total weight of all baskets that taste allows.
-On the Dunnhumby refit this weighting hid a region of 120-product baskets that held most of the
-probability. Training never visited it and validation mostly missed it: the reported held-out
-log-likelihood was $-38.8$ per trip, the value found when the region is included about $-53.8$. In the mixture
-form a taste is weighted by the prior alone. Each basket's posterior over tastes is then strongly
-log-concave, baskets are drawn exactly, and the likelihood estimate is a lower bound with bounded
-weights. On 64 held-out real trips the mixture form scores $-35.83$ against $-36.78$ for the old fit;
-on synthetic data $-27.38$ against $-27.90$.
+This document states the model completely and derives everything that is computed from it. Section~1
+fixes notation. Section~2 defines the model: a prior over a latent taste $z$, an exact law of the basket
+given $z$, the marginal law of the basket, and the posterior of $z$ given a basket. Section~3 shows how
+the law given $z$ is normalised exactly, and Section~4 how a basket is drawn from it exactly, as a chain of
+three conditional draws. Section~5 explains how the likelihood of an observed basket is estimated, and
+Section~6 how the parameters are trained. Section~7 covers generation and counterfactuals, Section~8
+compares with the earlier form of the model, and Section~9 gives the evidence so far.
 \end{abstract}
 
-\section{The current form and why it hides modes}
+\tableofcontents
 
-A basket $S$ has $n_c$ products in category $c$ and $m$ categories present. The current law is
-\begin{equation}
-p(S)=\frac{e^{E(S)}}{Z},\qquad E(S)=E_0(S)+\tfrac12\lVert s(S)\rVert^2,
-\end{equation}
-where $E_0$ holds the product utilities, within-category terms, size term and competition shift, and
-$s(S)=\sum_{j\in S}\phi_j-\sum_c (n_c-1)_+\psi_c$ is the basket's taste vector (rank 16). The Gaussian
-identity $e^{\frac12\lVert s\rVert^2}=\int\N(z;0,I)e^{z\cdot s}\,dz$ gives
-\begin{equation}
-p(S)=\int \underbrace{\frac{\N(z;0,I)\,Z_z}{Z}}_{w(z)}\;\underbrace{\frac{e^{E_z(S)}}{Z_z}}_{p(S\mid z)}\,dz,
-\qquad E_z(S)=E_0(S)+z\cdot s(S).
-\end{equation}
-Given $z$ the law $p(S\mid z)$ is exact: $Z_z$ comes from the category-by-size dynamic program and
-baskets are drawn by backward sampling. The difficulty is the weight $w(z)$.
-
-\paragraph{The tilt.} $w(z)$ is the prior multiplied by $Z_z$. A taste that makes many large baskets
-attractive has an astronomically large $Z_z$. On the refit, regions where 120-product baskets dominate
-had $\log w$ about 50 to 90 nats above the region near the data.
-
-\paragraph{Several peaks.} $\log w(z)=\log\N(z;0,I)+\log Z_z$ is concave plus convex, so it can have
-several local maxima. A fixed-point search found a giant-basket peak on 63 of 64 held-out trips.
-
-\paragraph{Training cannot see them.} The likelihood gradient is
-\begin{equation}
-\nabla\log p(S)=\nabla E(S)-\E_{w(z)}\big[\nabla\log Z_z\big].
-\end{equation}
-Stochastic maximum likelihood estimated the second term with persistent Gibbs chains started at the
-observed baskets, about four sweeps per epoch. They never reached the far peak, so its weight was never
-pushed down.
-
-\paragraph{Validation cannot see them.} The held-out estimate of $\log Z$ built its proposal from chains
-annealed from $\beta=0.25$. The far chains began in the giant region and left it during annealing. A
-missed region makes $\hat Z$ too small and the reported log-likelihood too high.
-
-\begin{table}[htb]\centering
-\begin{tabular}{lrrr}\toprule
-64 held-out real trips & production estimator & mode-covering estimate & overstatement\\\midrule
-Refit, epoch 1 & $-38.80$ & $-53.84$ & 15.0\\
-Old fit & $-35.92$ & $-36.78$ & 0.86\\\bottomrule
-\end{tabular}
-\caption{The mode-covering estimate places a Laplace Gaussian at every peak found from eight starts.}
-\end{table}
-
-\section{The mixture form}
-
-A trip produces a basket in two steps: draw $z\sim\N(0,I)$, then draw $S$ from $p(S\mid z)$:
-\begin{equation}
-p(S)=\int\N(z;0,I)\,p(S\mid z)\,dz,\qquad p(S\mid z)=\frac{e^{E_z(S)}}{Z_z}.
-\end{equation}
-The law given $z$ is the one already implemented:
-\begin{align}
-E_z(S)&=\sum_{j\in S}u_j(z)-\sum_c\Big[\rho_c\tbinom{n_c}{2}+f_c(n_c)+(n_c-1)_+\big(z\cdot\psi_c-\tfrac12\lVert\psi_c\rVert^2\big)\Big]\nonumber\\
-&\quad-\rho_0(m)+\sum_{c:\,n_c>0}\iota_c,\\
-u_j(z)&=b_j-\tfrac12\lVert\phi_j\rVert^2+z\cdot\phi_j,
-\end{align}
-where $b_j$ carries price, display, mailer, discount, season, history and household taste, and $\iota_c$
-is the within-category competition shift. For an observed basket,
-$E_z(S)=E(S)-\tfrac12\lVert s(S)\rVert^2+z\cdot s(S)$.
-
-The form is a mixture: one basket law per taste, weighted by how common that taste is. Products bought
-together come from shared tastes. There is one component for every $z$, but all share one formula, so
-the parameters do not grow with the number of components; the one choice is the dimension of $z$.
-
-\begin{table}[htb]\centering\small
-\begin{tabular}{lp{5.2cm}p{3.6cm}}\toprule
- & current form & mixture form\\\midrule
-weight of taste $z$ & $\N(z;0,I)\,Z_z/Z$ & $\N(z;0,I)$\\
-law given $z$ & $p(S\mid z)$, exact & the same\\
-parameters & $b,\phi,\psi,\rho_c,f_c,\rho_0$, price, promotion, competition, history & the same\\
-normaliser to estimate & $Z$, a 16-dimensional integral & none\\
-drawing a basket & Gibbs chain & exact, two steps\\\bottomrule
-\end{tabular}
-\end{table}
-
-The forms share every parameter, so a current-form fit can start a mixture fit, but they are different
-laws.
-
-\section{Properties}
-
-All four follow from one fact: $E_z(S)=a(S)+z\cdot s(S)$ with $a(S)$ free of $z$.
-
-\begin{proposition}[convexity]
-$\log Z_z$ is convex in $z$, with $\nabla_z\log Z_z=\E[s\mid z]$ and $\nabla_z^2\log Z_z=\Cov[s\mid z]\succeq0$.
-\end{proposition}
-\begin{proof}
-$\log Z_z=\log\sum_S e^{a(S)+z\cdot s(S)}$ is a log-sum-exp of affine functions of $z$; differentiate twice.
-\end{proof}
-
-\begin{proposition}[one peak]
-For an observed basket $S$, $\log p(z\mid S)$ is 1-strongly concave. It has a unique maximiser $m$,
-which solves $m=s(S)-\E[s\mid m]$, and for every $z$
-\begin{equation}
-\log p(z\mid S)\le\log p(m\mid S)-\tfrac12\lVert z-m\rVert^2.
-\end{equation}
-\end{proposition}
-\begin{proof}
-$\log p(z\mid S)=-\tfrac12\lVert z\rVert^2+z\cdot s(S)-\log Z_z+\text{const}$, whose Hessian is
-$-(I+\Cov[s\mid z])\preceq-I$ by Proposition 1. Strong concavity gives uniqueness and the quadratic
-bound around the maximiser, where the gradient $s(S)-z-\E[s\mid z]$ vanishes.
-\end{proof}
-The current form's weight $\log w(z)$ is concave plus convex; the mixture posterior is concave plus
-linear minus convex, which is concave.
-
-\begin{proposition}[exact draws]
-Drawing $z\sim\N(0,I)$ and then $S\sim p(S\mid z)$ by backward sampling gives an exact draw from $p(S)$.
-\end{proposition}
-
-\begin{proposition}[lower bound, bounded weights]
-With $z_1,\dots,z_K$ drawn from a proposal $r$ covering the posterior,
-\begin{gather}
-\hat p(S)=\frac1K\sum_{k=1}^K\frac{\N(z_k;0,I)\,p(S\mid z_k)}{r(z_k)},\\
-\E\,\hat p(S)=p(S),\qquad \E\log\hat p(S)\le\log p(S).
-\end{gather}
-If $r\ge\varepsilon\,\N(\cdot\,;m,I)$ with $m$ the maximiser of Proposition 2, then every weight is
-bounded:
-\[
-\frac{\N(z;0,I)\,p(S\mid z)}{r(z)}\le\frac{(2\pi)^{d/2}\,p(S)\,p(m\mid S)}{\varepsilon},\qquad d=\dim z.
-\]
-\end{proposition}
-\begin{proof}
-Unbiasedness is the importance identity; the inequality is Jensen's. For the bound,
-$\N(z;0,I)p(S\mid z)=p(S)\,p(z\mid S)\le p(S)\,p(m\mid S)e^{-\frac12\lVert z-m\rVert^2}$ by Proposition 2,
-and $r(z)\ge\varepsilon(2\pi)^{-d/2}e^{-\frac12\lVert z-m\rVert^2}$.
-\end{proof}
-So the estimate can understate the fit but on average never overstate it, the opposite of the failure in
-Section 1. A peak found only approximately loosens the bound but keeps the estimate valid.
-
-\section{Training}
-
-Training maximises the importance-sampled lower bound plus the production priors, with Adam, and every
-$N$ steps applies moment matching and whitening. No Markov chain is used.
-
-\paragraph{Objective and gradient.} For a batch of $B$ baskets and $K$ draws each ($K=8$ in the tests),
-\begin{align}
-\mathcal L&=\frac1B\sum_{t=1}^B\log\frac1K\sum_{k=1}^K\frac{\N(z_{tk};0,I)\,p(S_t\mid z_{tk})}{r_t(z_{tk})}-\text{priors},\\
-\nabla\mathcal L_t&=\sum_k\bar w_{tk}\big(\nabla E_{z_{tk}}(S_t)-\E_{S'\mid z_{tk}}[\nabla E_{z_{tk}}(S')]\big),
-\end{align}
-with normalised weights $\bar w$. The expectation is exact: it is the gradient of $\log Z_z$ through the
-dynamic program.
-
-\paragraph{Per batch.}
-\begin{enumerate}
-\item Find each basket's peak $m_t$ by gradient ascent on $\log p(z\mid S_t)$ with backtracking (8
-  iterations on real data, 15 on synthetic).
-\item Estimate $\Sigma_t=(I+\Cov[s\mid m_t])^{-1}$ with $\Cov$ from 32 exact draws of $S\mid m_t$.
-\item Draw $K$ tastes from $r_t=0.8\,\N(m_t,1.2^2\Sigma_t)+0.2\,\N(m_t,I)$; the second part gives
-  Proposition 4's bound.
-\item Compute the $K$ terms $\log p(S_t\mid z_{tk})$ with gradients and take an Adam step.
-\end{enumerate}
-
-\paragraph{Moment matching.} As in \texttt{scripts/fit\_interactions.py}: every $N$ steps the
-product intercepts $\lambda$, the size term $\rho_0$ and the within-category terms $\rho_c$ each take one
-damped step of their averaged gradient divided by the data rate (product purchase rate, frequency of each
-category count, mean $\binom{n_c}{2}$), clamped at $\pm0.35$, $\pm0.5$, $\pm0.5$.
-
-\paragraph{Whitening (parameter-expanded EM).} At a maximum of the likelihood the tastes pooled over
-the baskets' posteriors have second moment $I$. Every $N$ steps we estimate
-\begin{equation}
-\Sigma=\frac1{N_b}\sum_t\sum_k\bar w_{tk}\,z_{tk}z_{tk}^\top,\qquad A=\Sigma^{1/2},
-\end{equation}
-over the $N_b$ baskets since the last step, and set $\phi_j\leftarrow A\phi_j$, $\psi_c\leftarrow A\psi_c$,
-$\lambda_j\leftarrow\lambda_j+\tfrac12(\lVert A\phi_j\rVert^2-\lVert\phi_j\rVert^2)$. A model with prior $\N(0,\Sigma)$ equals
-the rescaled model with prior $\N(0,I)$, and fitting $\Sigma$ to the pooled posterior is the EM update for
-the prior's spread, so the step does not lower the likelihood. One term is not compensated: the
-$\tfrac12\lVert\psi_c\rVert^2$ per extra product of a category becomes $\tfrac12\lVert A\psi_c\rVert^2$. Adam's state for
-$\phi$ and $\psi$ is reset after each rescale.
-
-\section{Generation and counterfactuals}
-
-\paragraph{Generation.} Build $b_j$ from the trip's context, draw $z\sim\N(0,I)$, then $S\mid z$.
-Repeating gives the trip's basket distribution; averages give incidence, size and category shares with
-ordinary Monte Carlo error.
-
-\paragraph{Counterfactuals.} Change the context (price, display, discount), which changes $b_j$ and
-$\iota_c$, and redraw $S$ with the same $z$. Each draw is one shopper with a fixed taste seen before and
-after the change, a paired comparison.
-
-In the current form a price change also changes $Z_z$ and hence which tastes are common. In the mixture
-form the taste mix is fixed by the prior and a price change only changes what each taste buys. This is a
-modelling assumption suited to short-run price and promotion questions; effects on store traffic are
-outside the model in both forms.
-
-\paragraph{Recommendation.} Rank products for a trip by $P(j\in S)$, an average over $z$ of the exact
-incidence given $z$. Conditioning on a partly observed basket $T$ uses $p(z\mid T\subseteq S)$. This is not
-guaranteed log-concave: $\log P(T\subseteq S\mid z)$ is a difference of two convex functions. It needs a
-peak check.
-
-\section{Evidence}
-
-All numbers are on the first 64 held-out trips of each world's validation split. The test weeks were not
-opened.
-
-\paragraph{Exactness.} In the test suite's tiny world (6 products, 3 categories, rank 2) and all 11 model
-variants, $\log p(S\mid z)$ agrees with enumeration of every basket to $10^{-9}$, and the importance
-estimate of $\log p(S)$ (4{,}000 draws) agrees with enumeration and $48\times48$ Gauss--Hermite
-quadrature to $0.007$ nats, with effective sample size about $0.91$.
-
-\begin{table}[htb]\centering\small
-\begin{tabular}{lrrrr}\toprule
-Synthetic (48 categories, 522 products, cap 80) & log-lik. & size mean & size 99\% & at cap\\\midrule
-Data & & 8.69 & 22.8 & \\
-Current form, fully trained & $-27.90$ & & & \\
-Mixture, current-form parameters & $-29.78$ & 4.32 & 10 & 0\%\\
-Mixture, 278 steps, no corrections & $-27.82$ & 7.00 & 19 & 0\%\\
-\quad + 4 epochs moment matching & $-27.74$ & 6.93 & 19.8 & 0\%\\
-\quad + 8 epochs whitening ($K=8$) & $\mathbf{-27.38}$ & 7.92 & 22 & 0\%\\\bottomrule
-\end{tabular}
-\end{table}
-
-Scaling all taste vectors of the last model by $c$ (intercepts compensated) puts the likelihood peak at
-$c=1.0$ ($-27.42$, $-27.38$, $-27.44$ at $c=0.95,1.0,1.05$): training has converged on taste strength.
-Matching the mean size exactly ($c\approx1.04$) would cost about 0.03 nats per trip.
-
-\begin{table}[htb]\centering\small
-\begin{tabular}{lrrrr}\toprule
-Real (187 categories, 5{,}455 products, cap 120) & log-lik. & min.\ ESS & size mean & size 99\%\\\midrule
-Data & & & 7.26 & 42.8\\
-Old fit, current form (mode-covering estimate) & $-36.78$ & 0.007 & & \\
-Old fit's parameters as a mixture & $-36.44$ & 0.42 & 3.81 & 18\\
-Mixture, 60 steps, no corrections & $-35.98$ & 0.35 & 5.25 & 26.8\\
-\quad + 120 steps, moment matching and whitening & $\mathbf{-35.83}$ & 0.28 & 6.71 & 35\\\bottomrule
-\end{tabular}
-\end{table}
-
-The last run applied moment matching and whitening every 30 steps. In total the mixture saw 180 batches
-of 256 trips, about 29\% of one epoch (622 batches). Whitening found the pooled tastes 15\%, 11\%, 9\%
-and 9\% too spread at its four rounds, the same convergence as on synthetic data. No generated basket
-reached the cap.
-
-\paragraph{Cost.} One real step on 256 baskets takes 35 to 55\,s: about 1.6\,s per exact gradient call,
-8 to 15 of them in the peak search and 8 in the objective. A damped Newton peak search was not faster
-(25\,s against 30\,s) because its curvature came from 16 noisy draws.
-
-\section{Limits and next steps}
+%======================================================================
+\section{Notation}
 
 \begin{itemize}
-\item Shared tastes express products bought together, not cross-category substitution; within a
-  category $\rho_c$ and the competition shift still do. No loss against the current model.
-\item Generated baskets on real data are 8\% too small on average (6.71 against 7.26) and the 99th
-  percentile is 35 against 42.8, after under a third of an epoch.
-\item The prior is one Gaussian. Real trip types may want a few Gaussian components; Proposition 2 holds
-  within each.
-\item Whitening leaves one term uncompensated, so it is not an exact EM step.
-\item With few draws the training objective favours weaker tastes. On synthetic data $K=16$ reduced the
-  excess spread at whitening (1.11 to 1.07) without changing the held-out result.
-\item Cost: about 35--55\,s per real step against about 6\,s for the current step; a full epoch would take
-  6--9 hours. Warm-starting each basket's peak applies from the second epoch.
-\item Price and promotion checks must be re-run on the mixture form.
+\item A \emph{trip} $t$ is one store visit by household $h=h(t)$ at store $s(t)$ in week $w(t)$. Its context
+  $x_t$ holds prices, discounts, display and mailer flags, the week, the store and the household's purchase
+  history before the trip.
+\item $\mathcal J_t$ is the set of products offered on trip $t$. Every product $j$ belongs to one category
+  $c(j)\in\{1,\dots,C\}$; $\mathcal J_{tc}=\{j\in\mathcal J_t: c(j)=c\}$. On the Dunnhumby commodity data
+  $C=187$ and there are 5{,}455 products.
+\item A \emph{basket} is a non-empty set $S\subseteq\mathcal J_t$. We write
+  \[
+  n_c(S)=|S\cap\mathcal J_{tc}|,\qquad n(S)=\sum_c n_c(S),\qquad m(S)=\#\{c: n_c(S)>0\}
+  \]
+  for the number of products in category $c$, the basket size and the number of categories present.
+\item Support: $\mathcal S_t=\{S\subseteq\mathcal J_t:\ 1\le n(S)\le n_{\max},\ n_c(S)\le R\ \forall c\}$
+  with $n_{\max}=120$ and $R=40$. All laws below are on $\mathcal S_t$.
+\item $r$ is the taste dimension ($r=16$). $\N(z;\mu,\Sigma)$ is the Gaussian density on $\R^r$.
+  $\pos{a}=\max(a,0)$, $\binom{k}{2}=k(k-1)/2$.
 \end{itemize}
+The trip index $t$ is dropped when only one trip is involved.
 
-{\sloppy\noindent Next: move the code into \texttt{v4/} with the enumeration test in
-\texttt{tests/test\_law.py}; one full real fit with the mode check and the size-by-period check before any
-test-week evaluation.\par}
+%======================================================================
+\section{The model}
+
+\subsection{Parameters}
+
+\begin{center}\small
+\begin{tabular}{lp{2cm}p{7.2cm}l}\toprule
+symbol & per & meaning & trained?\\\midrule
+$\lambda_j$ & product & popularity intercept & yes\\
+$\phi_j\in\R^r$ & product & taste loading of product $j$ & yes\\
+$\psi_c\in\R^r$ & category & taste loading of an \emph{extra} product of category $c$ & yes\\
+$\rho_c$ & category & penalty per pair of products within $c$ & yes\\
+$f_c(2),f_c(3),f_c(\ge4)$ & category & free penalty on holding 2, 3, $\ge4$ products of $c$ & yes\\
+$\rho_0(1..n_{\max})$ & count & size potential on $m$, the number of categories present & yes\\
+rest of $b_{tj}$ & & context utility, \eqref{eq:b} & no\\\bottomrule
+\end{tabular}
+\end{center}
+Parameters that are not trained keep the values of the Version-4 checkpoint the fit starts from,
+\texttt{runs/commodity/\allowbreak v4\_comp\_promo.pt}.
+
+\subsection{Context utility}
+
+For product $j$ on trip $t$,
+\begin{align}
+b_{tj}=\lambda_j &+\theta_h\!\cdot\!\alpha_j+\theta_h\!\cdot\!u_{c(j)}
+ -g_{hj}\big[\bar p_t+\kappa(p_{tj}-\bar p_t)\big]-g_{hj}(\kappa_d-\kappa)\,d_{tj}-\gamma_d\,d_{tj}\nonumber\\
+&+w^{\rm dsp}_j D_{tj}+w^{\rm mlr}_j M_{tj}+\mu_j\!\cdot\!\delta_{w(t)}+\zeta_j\!\cdot\!\xi_{s(t)}
+ +\eta_t(j)-o_t+\iota_{t,c(j)} .
+\label{eq:b}
+\end{align}
+$\theta_h\cdot\alpha_j$ and $\theta_h\cdot u_c$ are household tastes (product and category);
+$p_{tj}$ is the log price deviation, $\bar p_t$ its mean over the trip's assortment, $d_{tj}$ the discount
+depth, $g_{hj}\ge0$ the household-by-product price sensitivity, $\kappa,\kappa_d>0$ the relative-price and
+discount multipliers, $\gamma_d$ a common discount slope; $D,M$ are display and mailer flags;
+$\mu_j\cdot\delta_w$ and $\zeta_j\cdot\xi_s$ are season and store terms; $\eta_t(j)$ is the purchase-history
+term; $o_t$ is a trip-level offset (the mean of $\eta_t$ over the assortment plus a history-size term), the
+same for every product of the trip; and
+\[
+\iota_{tc}=(\ell_c-1)\big[\mathrm{IV}_{tc}-\mathrm{IV}^{\rm reg}_{tc}\big],\qquad
+\mathrm{IV}_{tc}=\log\!\!\sum_{j\in\mathcal J_{tc}}\!\! e^{b^{\circ}_{tj}},\quad \ell_c\in(0,1),
+\]
+is the within-category competition shift ($b^\circ$ is \eqref{eq:b} without $\iota$ and $o_t$, and ``reg'' the same with
+price deviation, discount, display and mailer set to zero). With $\ell_c$ near 0 a price or promotion change
+in $c$ moves purchases between products of $c$ rather than raising the category's purchase rate. In
+this document $b_{tj}$ is simply a known number per (trip, product): it does not depend on $z$ or on the
+basket.
+
+\subsection{Prior}
+
+Each trip has a latent taste
+\begin{equation}
+z_t\sim\N(0,I_r),\qquad\text{independently across trips.}
+\label{eq:prior}
+\end{equation}
+$z_t$ describes what the shopper is in the mood for on this trip (for example ``baking'' or ``baby
+products''). It is not tied to the household: two trips of the same household draw independent tastes;
+persistent household preferences are in $\theta_h$ inside $b_{tj}$.
+
+\subsection{The law of the basket given the taste}
+
+\begin{definition}[conditional law]
+Given $z$, the probability of basket $S\in\mathcal S_t$ is
+\begin{equation}
+p(S\mid z)=\frac{\exp E_z(S)}{Z_z},\qquad Z_z=\sum_{S'\in\mathcal S_t}\exp E_z(S'),
+\label{eq:cond}
+\end{equation}
+with
+\begin{align}
+E_z(S)=\sum_{j\in S}u_j(z)
+-\sum_{c}h_c\big(n_c(S),z\big)-\rho_0\big(m(S)\big),
+\label{eq:Ez}
+\end{align}
+\begin{align}
+u_j(z)&=b_j-\tfrac12\lVert\phi_j\rVert^2+z\cdot\phi_j, \label{eq:u}\\
+h_c(k,z)&=\rho_c\tbinom{k}{2}+f_c(k)+\pos{k-1}\big(z\cdot\psi_c-\tfrac12\lVert\psi_c\rVert^2\big),
+\qquad h_c(0,z)=0. \label{eq:h}
+\end{align}
+Here $f_c(0)=f_c(1)=0$, $f_c(k)=f_c(\ge4)$ for $k\ge4$, and $\rho_0(1)=0$ fixes the free constant.
+\end{definition}
+
+Reading \eqref{eq:Ez}: each product contributes its utility $u_j(z)$; a taste $z$ raises the products whose
+loading $\phi_j$ points the same way. Within a category, every additional product beyond the first pays
+$\rho_c$ per pair and $f_c$, and its taste contribution is corrected by $\psi_c$ (a category that is liked
+need not be bought many times). The size term charges the number of categories present.
+
+\paragraph{The basket field.} Collect the $z$-dependence of $E_z(S)$:
+\begin{equation}
+E_z(S)=a(S)+z\cdot s(S),\qquad
+s(S)=\sum_{j\in S}\phi_j-\sum_c\pos{n_c(S)-1}\,\psi_c\in\R^r,
+\label{eq:affine}
+\end{equation}
+\[
+a(S)=\sum_{j\in S}\big(b_j-\tfrac12\lVert\phi_j\rVert^2\big)-\sum_c\Big[\rho_c\tbinom{n_c}{2}+f_c(n_c)
+-\tfrac12\pos{n_c-1}\lVert\psi_c\rVert^2\Big]-\rho_0(m).
+\]
+$a(S)$ does not involve $z$. Equation~\eqref{eq:affine}, \emph{the energy is affine in $z$}, is the one fact
+every property below uses. $s(S)$ is called the basket field: the taste direction the basket points in.
+
+\paragraph{Why $-\tfrac12\lVert\phi_j\rVert^2$?} It makes the expected boost of product $j$ under the prior
+zero on the multiplicative scale: $\E_{z\sim\N(0,I)}e^{z\cdot\phi_j-\frac12\lVert\phi_j\rVert^2}=1$. It is a
+choice of parameterisation (it could be absorbed into $\lambda_j$), kept so that the earlier form and the
+mixture form share their parameters.
+
+\subsection{The marginal law: the model}
+
+\begin{definition}[mixture form]
+The probability that trip $t$ produces basket $S$ is
+\begin{equation}
+p(S)=\int_{\R^r}\N(z;0,I)\,p(S\mid z)\,dz .
+\label{eq:marginal}
+\end{equation}
+\end{definition}
+This is a continuous mixture: one basket law $p(\cdot\mid z)$ for every taste $z$, weighted by the prior
+density of that taste. Equivalently, the data are generated hierarchically:
+\[
+z_t\sim\N(0,I),\qquad S_t\mid z_t\sim p(\cdot\mid z_t).
+\]
+Products bought together are explained by a shared taste. The number of components is not a choice:
+there is one per $z$, they all share the formula \eqref{eq:cond}, and the parameter count does not depend
+on it. The modelling choice is the dimension $r$ and the Gaussian shape of the prior. $p(S)$ is a proper
+probability: $\sum_S p(S)=\int\N(z)\sum_S p(S\mid z)\,dz=1$.
+
+\subsection{The joint law and the posterior}
+
+The joint density of taste and basket is $p(z,S)=\N(z;0,I)\,p(S\mid z)$. By Bayes' rule the posterior of
+the taste given an observed basket is
+\begin{equation}
+p(z\mid S)=\frac{\N(z;0,I)\,p(S\mid z)}{p(S)},\qquad
+\log p(z\mid S)=-\tfrac12\lVert z\rVert^2+z\cdot s(S)-\log Z_z+\text{const}(S),
+\label{eq:post}
+\end{equation}
+where the second form uses \eqref{eq:affine}; the constant collects $a(S)$, $\log p(S)$ and the Gaussian
+constant. The posterior is the main computational object: the likelihood $p(S)$ is its normaliser, and
+training averages over it.
+
+%======================================================================
+\section{Computing the conditional law exactly}
+\label{sec:dp}
+
+$Z_z$ is a sum over all baskets, astronomically many. It is computed exactly because, given $z$, the
+weight $e^{E_z(S)}$ factorises over categories except for the size term, which depends on one integer.
+
+\paragraph{Elementary symmetric polynomials.} Write $w_j=e^{u_j(z)}$. For category $c$ and $k\ge0$,
+\[
+e_{c,k}=\sum_{A\subseteq\mathcal J_c,\ |A|=k}\ \prod_{j\in A}w_j ,
+\]
+the total product weight of all ways to choose $k$ products from $c$. These follow from the recursion
+over the products of $c$ in a fixed order: $e^{(p)}_k=e^{(p-1)}_k+w_p\,e^{(p-1)}_{k-1}$, $e^{(0)}_0=1$.
+
+\paragraph{Category polynomials.} The total weight of category $c$ holding exactly $k$ products is
+\begin{equation}
+G_c(k)=e_{c,k}\,e^{-h_c(k,z)},\qquad G_c(0)=1 .
+\label{eq:G}
+\end{equation}
+
+\paragraph{The size table.} Let $F_c(n,m)$ be the total weight of all choices in categories $1,\dots,c$
+that hold $n$ products in $m$ present categories:
+\begin{equation}
+F_0(n,m)=[n=0,m=0],\qquad
+F_c(n,m)=F_{c-1}(n,m)+\sum_{k=1}^{\min(R,n)}F_{c-1}(n-k,m-1)\,G_c(k).
+\label{eq:F}
+\end{equation}
+Equivalently $F_C(n,m)$ is the coefficient of $t^n y^m$ in $\prod_c\big(1+y\sum_{k\ge1}G_c(k)t^k\big)$.
+
+\begin{proposition}[exact normaliser]
+\begin{equation}
+Z_z=\sum_{n=1}^{n_{\max}}\sum_{m=1}^{n}F_C(n,m)\,e^{-\rho_0(m)} .
+\label{eq:Z}
+\end{equation}
+\end{proposition}
+\begin{proof}
+A basket is a choice, for each category, of a subset of size $n_c\le R$. Its weight $e^{E_z(S)}$ is
+$e^{-\rho_0(m)}\prod_c\big(\prod_{j\in S_c}w_j\big)e^{-h_c(n_c,z)}$. Summing over the subsets with the counts
+$(n_c)$ fixed gives $e^{-\rho_0(m)}\prod_c G_c(n_c)$; \eqref{eq:F} sums $\prod_cG_c(n_c)$ over all count
+vectors with total $n$ and $m$ non-zero entries.
+\end{proof}
+
+The cost is $O(\sum_c|\mathcal J_c|R)$ for the polynomials and $O(C\,n_{\max}^2R)$ for the table, per trip
+and per $z$. Numerically every row $n$ of the table carries its own power-of-two exponent, because weights
+of different sizes differ by far more than a double can hold. The gradients follow by differentiating
+\eqref{eq:Z}:
+\begin{equation}
+\nabla_z\log Z_z=\E[s(S)\mid z],\qquad \nabla^2_z\log Z_z=\Cov[s(S)\mid z],\qquad
+\frac{\partial\log Z_z}{\partial u_j}=P(j\in S\mid z),
+\label{eq:grads}
+\end{equation}
+the first two because $\log Z_z=\log\sum_Se^{a(S)+z\cdot s(S)}$. All three are exact, computed by
+reverse-mode differentiation through \eqref{eq:G}--\eqref{eq:Z}. Likewise, for any model parameter
+$\vartheta$, $\nabla_\vartheta\log Z_z=\E_{S\sim p(\cdot\mid z)}[\nabla_\vartheta E_z(S)]$.
+
+%======================================================================
+\section{Sampling}
+\label{sec:sampling}
+
+\subsection{A basket given a taste: three conditional draws}
+
+Given $z$, a basket is drawn exactly from \eqref{eq:cond} by the following chain of conditional draws,
+using the tables of Section~\ref{sec:dp}.
+
+\begin{enumerate}[label=\textbf{Step \Alph*.},leftmargin=*]
+\item \textbf{Size and number of categories.} Draw $(n,m)$ with
+  \begin{equation}
+  P(n,m\mid z)=\frac{F_C(n,m)\,e^{-\rho_0(m)}}{Z_z}.
+  \label{eq:stepA}
+  \end{equation}
+\item \textbf{Count per category}, going backwards $c=C,C-1,\dots,1$. Let $(n',m')$ be the products and
+  categories still to place in categories $1..c$ (initially $(n,m)$). Draw $n_c=k$ with
+  \begin{equation}
+  P(n_c=k\mid n',m',z)=\frac{F_{c-1}\big(n'-k,\ m'-[k>0]\big)\,G_c(k)}{F_c(n',m')},\qquad 0\le k\le\min(R,n'),
+  \label{eq:stepB}
+  \end{equation}
+  then set $n'\leftarrow n'-k$, $m'\leftarrow m'-[k>0]$. The probabilities sum to one by \eqref{eq:F}, and at the
+  end $n'=m'=0$.
+\item \textbf{Products within each category.} For every category with $n_c=k>0$, draw a subset $A$ of
+  $\mathcal J_c$ of size $k$ with
+  \begin{equation}
+  P(A\mid n_c=k,z)=\frac{\prod_{j\in A}w_j}{e_{c,k}}.
+  \label{eq:stepC}
+  \end{equation}
+  This is done sequentially: go through the products $p=L,L-1,\dots,1$ of the category with $q$ still to
+  choose, and include $p$ with probability $w_p\,e^{(p-1)}_{q-1}/e^{(p)}_q$ (after which $q\leftarrow q-1$).
+\end{enumerate}
+
+\begin{proposition}[exactness]
+The basket produced by Steps A--C has law $p(S\mid z)$.
+\end{proposition}
+\begin{proof}
+Multiply the probabilities. In Step B the denominators telescope against the numerators of the next
+category, and Step A's numerator cancels the first denominator, so
+\[
+P(n,m)\prod_{c}P(n_c\mid\cdot)=\frac{e^{-\rho_0(m)}}{Z_z}\,F_0(0,0)\prod_cG_c(n_c)
+=\frac{e^{-\rho_0(m)}}{Z_z}\prod_c e_{c,n_c}e^{-h_c(n_c,z)} .
+\]
+In Step C the inclusion probabilities telescope in the same way, because $e^{(p)}_q=e^{(p-1)}_q+w_pe^{(p-1)}_{q-1}$,
+and their product is \eqref{eq:stepC}. Multiplying by $\prod_c\prod_{j\in A_c}w_j/e_{c,n_c}$ gives
+\[
+\frac{e^{-\rho_0(m)}}{Z_z}\prod_c e^{-h_c(n_c,z)}\prod_{j\in S}w_j=\frac{e^{E_z(S)}}{Z_z}.
+\]
+\end{proof}
+
+Sampling is therefore hierarchical: size and categories first, then the count in each category given what
+is left, then the products given the count. Each conditional is the exact conditional of $p(S\mid z)$.
+
+\subsection{A basket from the model}
+
+\begin{proposition}[exact draws from the model]
+Draw $z\sim\N(0,I)$, then $S$ by Steps A--C given $z$. Then $S\sim p(S)$ of \eqref{eq:marginal}.
+\end{proposition}
+\begin{proof}
+The pair $(z,S)$ has density $\N(z;0,I)\,p(S\mid z)$; its $S$-marginal is \eqref{eq:marginal}.
+\end{proof}
+No Markov chain is involved, so there is no burn-in, no mixing question and no correlation between draws.
+The full hierarchy of a generated basket is therefore
+\[
+z\ \to\ (n,m)\ \to\ (n_1,\dots,n_C)\ \to\ \text{products}.
+\]
+
+\paragraph{Truncation for speed.} The sampler first builds the table only up to a per-trip cap
+$K<n_{\max}$ chosen so that baskets larger than $K$ carry at most $10^{-8}$ of $Z_z$ (a proven bound); if
+the bound is not met the table is rebuilt to $n_{\max}$. The draw is exact up to that $10^{-8}$.
+
+%======================================================================
+\section{The likelihood of an observed basket}
+\label{sec:lik}
+
+$p(S)$ in \eqref{eq:marginal} is an $r=16$-dimensional integral with no closed form. It is estimated by
+importance sampling over $z$, which works well because the integrand has one peak.
+
+\subsection{The posterior has one peak}
+
+\begin{proposition}[strong log-concavity]\label{prop:concave}
+For every basket $S$, $\log p(z\mid S)$ is 1-strongly concave in $z$:
+\[
+\nabla_z\log p(z\mid S)=s(S)-z-\E[s\mid z],\qquad \nabla^2_z\log p(z\mid S)=-\big(I+\Cov[s\mid z]\big)\preceq-I .
+\]
+Hence it has exactly one maximiser $\hat z(S)$, the solution of $\hat z=s(S)-\E[s\mid\hat z]$, and
+$\log p(z\mid S)\le\log p(\hat z\mid S)-\tfrac12\lVert z-\hat z\rVert^2$ for all $z$.
+\end{proposition}
+\begin{proof}
+Differentiate \eqref{eq:post} using \eqref{eq:grads}. A covariance is positive semi-definite, so the
+Hessian is at most $-I$. A strongly concave function has a unique maximiser, and the quadratic bound is
+Taylor's theorem with the Hessian bound.
+\end{proof}
+
+\paragraph{Finding the peak.} Gradient ascent $z\leftarrow z+\eta\,\nabla_z\log p(z\mid S)$, with the step
+$\eta\le1$ halved until $\log p(z\mid S)$ rises by at least $\tfrac14\eta\lVert\nabla\rVert^2$ (Armijo), so every
+iteration increases it. Each iteration needs $\E[s\mid z]$, one exact gradient of $\log Z_z$. Validation
+runs 30 iterations from $z=0$; training runs 8 starting from the trip's peak at its previous visit.
+
+\subsection{The proposal}
+
+Around the peak the posterior is close to the Gaussian with covariance equal to the inverse negative Hessian
+(Laplace approximation),
+\[
+\Sigma(S)=\big(I+\Cov[s\mid\hat z]\big)^{-1},
+\]
+where $\Cov[s\mid\hat z]$ is the sample covariance of $s(S')$ over 32 exact draws $S'\sim p(\cdot\mid\hat z)$
+(Section~\ref{sec:sampling}). The proposal is
+\begin{equation}
+q(z\mid S)=0.8\,\N\big(z;\hat z,\ 1.2^2\Sigma(S)\big)+0.2\,\N\big(z;\hat z,\ I\big).
+\label{eq:q}
+\end{equation}
+The first part follows the posterior's shape, slightly widened; the second has unit covariance, which by
+Proposition~\ref{prop:concave} is at least as wide as the posterior in every direction.
+
+\subsection{The estimator}
+
+Draw $z_1,\dots,z_K\sim q(\cdot\mid S)$ independently and set
+\begin{equation}
+\omega_k=\frac{\N(z_k;0,I)\,p(S\mid z_k)}{q(z_k\mid S)},\qquad
+\hat p_K(S)=\frac1K\sum_{k=1}^K\omega_k .
+\label{eq:is}
+\end{equation}
+Each $p(S\mid z_k)$ is exact by \eqref{eq:cond} and \eqref{eq:Z}.
+
+\begin{proposition}[properties of the estimate]\label{prop:is}
+\begin{enumerate}
+\item $\E\,\hat p_K(S)=p(S)$ (unbiased).
+\item $\E\log\hat p_K(S)\le\E\log\hat p_{K+1}(S)\le\log p(S)$, and $\E\log\hat p_K(S)\to\log p(S)$ as $K\to\infty$.
+\item Every weight is bounded: $\omega_k\le(2\pi)^{r/2}\,p(S)\,p(\hat z\mid S)/0.2$.
+\end{enumerate}
+\end{proposition}
+\begin{proof}
+(1) $\E_q[\N p(S\mid z)/q]=\int\N(z)p(S\mid z)\,dz$. (2) The upper bound is Jensen's inequality; monotonicity
+in $K$ and convergence are the importance-weighted bound of Burda, Grosse and Salakhutdinov (2016).
+(3) $\N(z;0,I)p(S\mid z)=p(S)p(z\mid S)\le p(S)p(\hat z\mid S)e^{-\frac12\lVert z-\hat z\rVert^2}$ by Proposition~\ref{prop:concave}, and
+$q(z)\ge0.2\,(2\pi)^{-r/2}e^{-\frac12\lVert z-\hat z\rVert^2}$.
+\end{proof}
+So the reported log-likelihood can understate the model but on average never overstates it, and no single
+draw can dominate without bound. The effective sample size
+\[
+\mathrm{ESS}=\frac{(\sum_k\omega_k)^2}{K\sum_k\omega_k^2}\in(0,1]
+\]
+is reported as a quality check. Validation uses $K=256$.
+
+\paragraph{Posterior averages.} The normalised weights $\bar\omega_k=\omega_k/\sum_l\omega_l$ estimate
+averages over the posterior, $\E[g(z)\mid S]\approx\sum_k\bar\omega_kg(z_k)$. This estimate is consistent as
+$K\to\infty$ but biased for small $K$: it leans towards the proposal. Section~\ref{sec:whiten} shows where
+this matters.
+
+%======================================================================
+\section{Training}
+\label{sec:train}
+
+\subsection{Objective}
+
+Let $\vartheta$ be the trained parameters (Section~2.1) and $t=1,\dots,N$ the training trips
+($N=158{,}983$). The target is the penalised log-likelihood
+\[
+\frac1N\sum_{t=1}^N\log p_\vartheta(S_t)\ -\ \frac{1}{N}\Pi(\vartheta),\qquad
+\Pi=\tfrac12\Big[20\sum_c\lVert\psi_c\rVert^2+200\sum_j\lVert\phi_j-\psi_{c(j)}\rVert^2+0.2\sum_c\rho_c^2+2\sum_{c,i}f_{c,i}^2\Big],
+\]
+a Gaussian prior that keeps each product's loading near its category's. Since $\log p_\vartheta(S_t)$ is not
+available, training maximises the $K$-sample bound of Proposition~\ref{prop:is},
+\begin{equation}
+\mathcal L_K(\vartheta)=\frac1N\sum_t\E_{z_{t,1..K}\sim q_t}\Big[\log\frac1K\sum_{k=1}^K
+\frac{\N(z_{tk};0,I)\,p_\vartheta(S_t\mid z_{tk})}{q_t(z_{tk})}\Big]-\frac{\Pi(\vartheta)}N ,
+\label{eq:obj}
+\end{equation}
+with $K=8$. The proposal $q_t$ is built from the current parameters but treated as fixed when
+differentiating: the bound holds for any proposal, so this is legitimate.
+
+\subsection{Gradient}
+
+For fixed draws, $\nabla_\vartheta\log\hat p_K(S)=\sum_k\bar\omega_k\nabla_\vartheta\log p_\vartheta(S\mid z_k)$, and
+\begin{equation}
+\nabla_\vartheta\log p_\vartheta(S\mid z)=\nabla_\vartheta E_z(S)-\E_{S'\sim p(\cdot\mid z)}\big[\nabla_\vartheta E_z(S')\big].
+\label{eq:grad}
+\end{equation}
+The first term is the observed basket's; the second is the model's expectation given the same taste, exact
+by reverse-mode differentiation through the dynamic program of Section~\ref{sec:dp}. No Markov chain and no
+model samples enter the gradient. The gradient is the posterior-weighted average of ``observed minus
+expected given the taste''.
+
+\subsection{One training step}
+
+For a batch of 256 trips:
+\begin{enumerate}
+\item Find each trip's posterior peak $\hat z_t$ (8 Armijo iterations, warm-started).
+\item Draw 32 baskets $S'\sim p(\cdot\mid\hat z_t)$ exactly and form $\Sigma(S_t)$ and the proposal \eqref{eq:q}.
+\item Draw $z_{t1},\dots,z_{t8}\sim q_t$.
+\item Compute $\log\hat p_8(S_t)$ with gradients, add the penalty, and take one Adam step (gradient norm
+  clipped at 10). Learning rates: $3\times10^{-3}$ for $\phi,\psi$; $0.05$, $0.03$, $0.006$, $0.008$ for
+  $\rho_0$, $\rho_c$, $f$, $\lambda$.
+\item Apply the bounds: $\rho_c\ge-1.5$ and the floors on $f_c$ and the category reward.
+\end{enumerate}
+Every 30 steps two extra updates follow (Sections~\ref{sec:mm} and \ref{sec:whiten}). An epoch is 622 steps;
+the fit runs 2 epochs.
+
+\subsection{Moment matching}
+\label{sec:mm}
+
+At a maximum of the likelihood the gradient in $\lambda_j$ vanishes, and by \eqref{eq:grad} that gradient
+is ``observed rate of $j$ minus model rate of $j$'' (posterior-weighted). The same holds for $\rho_0(m)$
+(frequency of $m$ categories present) and $\rho_c$ (mean $\binom{n_c}{2}$). Adam approaches this slowly for
+rarely bought products, so every 30 steps each of these parameters takes the step
+\[
+\lambda_j\leftarrow\lambda_j+0.35\,\mathrm{clip}\Big(\frac{\text{data rate}_j-\text{model rate}_j}{\text{data rate}_j},\pm1\Big),
+\]
+with the rates averaged over the last 30 steps (and factors $0.5$ for $\rho_0,\rho_c$). For small errors
+$(\text{data}-\text{model})/\text{data}\approx\log(\text{data}/\text{model})$, which is the change in $\lambda_j$
+that makes a Poisson rate match. This changes the speed of convergence, not its target.
+
+\subsection{Whitening (parameter-expanded EM)}
+\label{sec:whiten}
+
+\paragraph{The idea.} Suppose the prior were $\N(0,\Sigma_0)$ with $\Sigma_0$ a free parameter. The EM update
+of $\Sigma_0$ is the average posterior second moment
+\begin{equation}
+\Sigma_0^{\rm new}=\frac1N\sum_t\E\big[z z^\top\mid S_t\big].
+\label{eq:em}
+\end{equation}
+A model with prior $\N(0,\Sigma_0)$ is the same law as one with prior $\N(0,I)$ and loadings rescaled: put
+$z=A\tilde z$ with $A=\Sigma_0^{1/2}$ (symmetric), $\tilde z\sim\N(0,I)$. Then $z\cdot\phi_j=\tilde z\cdot A\phi_j$ and
+$z\cdot\psi_c=\tilde z\cdot A\psi_c$. So each whitening step sets
+\[
+\phi_j\leftarrow A\phi_j,\qquad\psi_c\leftarrow A\psi_c,\qquad
+\lambda_j\leftarrow\lambda_j+\tfrac12\big(\lVert A\phi_j\rVert^2-\lVert\phi_j\rVert^2\big),
+\]
+the last so that $u_j$ in \eqref{eq:u} is unchanged. This is an EM step for the scale and orientation of the
+tastes, which gradient steps on $\phi$ alone find slowly. If the model is right, $\Sigma_0^{\rm new}=I$ and the step
+does nothing.
+
+\paragraph{Not exactly the same law.} The term $\tfrac12\pos{n_c-1}\lVert\psi_c\rVert^2$ in \eqref{eq:h} becomes
+$\tfrac12\pos{n_c-1}\lVert A\psi_c\rVert^2$ and is not compensated, so the step is an approximate EM step.
+
+\paragraph{Estimating \eqref{eq:em}.} The posterior second moments are estimated with normalised importance
+weights (Section~5.3) on 256 fixed training trips with $K=256$. An earlier version reused the training
+draws ($K=8$); that estimate is biased upward, because with few draws the normalised weights lean toward the
+proposal, which is wider than the posterior. Measured on the same 1{,}024 trips and the same model:
+\begin{center}\small
+\begin{tabular}{lcc}\toprule
+estimate of $\frac1{rN}\operatorname{tr}\sum_t\E[zz^\top\mid S_t]$ & $K=8$ & $K=256$\\\midrule
+value (1 = model correctly scaled) & 1.056 & 0.990\\\bottomrule
+\end{tabular}
+\end{center}
+With $K=8$ every whitening enlarged the tastes by about 3\% that the data did not ask for; over many rounds
+generated baskets grew from 7.66 to 8.23 products (data 7.26). With $K=256$ this stops.
+
+\subsection{Validation}
+
+Every 120 steps: $\log\hat p_{256}$ on 64 held-out trips (the fit's validation split; test weeks are not
+used), and the size distribution of exact draws (Section~4.2) for 1{,}024 held-out trips against the data.
+The checkpoint with the best validation log-likelihood is kept.
+
+%======================================================================
+\section{Generation and counterfactuals}
+
+\paragraph{Generation.} For trip $t$: build $b_{tj}$ from the context, draw $z\sim\N(0,I)$, then Steps A--C.
+Repeating gives the distribution of baskets for that trip. Incidence has an exact inner part:
+\[
+P(j\in S)=\E_{z\sim\N(0,I)}\big[P(j\in S\mid z)\big],\qquad P(j\in S\mid z)=\partial\log Z_z/\partial u_j\ \text{from \eqref{eq:grads}},
+\]
+so only the outer average over $z$ is Monte Carlo.
+
+\paragraph{Counterfactuals.} A price or promotion change alters $b_{tj}$ (and $\iota_{tc}$) only. Draw $z$ once,
+then draw $S$ under the old and the new context with the same $z$: the same shopper's taste before and after
+the change. In this form the distribution of tastes is fixed by the prior and does not respond to prices;
+prices change what each taste buys. Effects on whether a trip happens at all are outside the model.
+
+\paragraph{Conditioning on part of a basket.} For recommendations given a partly observed basket $T$,
+average over $p(z\mid T\subseteq S)\propto\N(z)P(T\subseteq S\mid z)$. Unlike Proposition~\ref{prop:concave} this posterior is
+not guaranteed to have one peak, because $\log P(T\subseteq S\mid z)$ is a difference of two convex functions.
+
+%======================================================================
+\section{Relation to the earlier form}
+
+The earlier Version-4 law was $p_{\rm old}(S)=e^{a(S)+\frac12\lVert s(S)\rVert^2}/Z$ with the same $a$ and $s$. Using
+$e^{\frac12\lVert s\rVert^2}=\int\N(z;0,I)e^{z\cdot s}dz$,
+\[
+p_{\rm old}(S)=\int\underbrace{\frac{\N(z;0,I)\,Z_z}{Z}}_{\text{weight of taste }z}\ p(S\mid z)\,dz .
+\]
+Both forms use the same $p(S\mid z)$; they differ in the weight of a taste. In the earlier form a taste is
+weighted by $\N(z)Z_z$, and $Z_z$ grows enormously for tastes that make large baskets attractive. Its logarithm
+$-\frac12\lVert z\rVert^2+\log Z_z$ is concave plus convex and can have several peaks. On the Dunnhumby refit
+one peak, far from the data, made 120-product baskets carry most of the probability. Training (Gibbs chains
+started at the data) and validation (annealed chains) both missed it: the reported held-out log-likelihood was
+$-38.8$ per trip, and $-53.8$ once that peak was included. In the mixture form the weight is $\N(z)$ alone, the
+posterior has one peak (Proposition~\ref{prop:concave}), draws are exact, and the likelihood estimate is a lower bound. The two
+forms are different laws with the same parameters, so one can start the fit of the other.
+
+%======================================================================
+\section{Evidence so far}
+
+\paragraph{Exactness.} In the test world (6 products, 3 categories, $r=2$) and all 11 model variants,
+$\log p(S\mid z)$ from \eqref{eq:cond}--\eqref{eq:Z} equals enumeration of every basket to $10^{-9}$, and the
+estimate \eqref{eq:is} with 4{,}000 draws equals enumeration plus $48\times48$ Gauss--Hermite quadrature of
+\eqref{eq:marginal} to within 0.01 nats (\texttt{tests/test\_law.py}).
+
+\paragraph{Synthetic data} (48 categories, 522 products). Held-out log-likelihood $-27.38$ against $-27.90$ for the
+earlier form fully trained; mean generated size 7.92 against 8.69 in the data.
+
+\paragraph{Real data} (64 held-out trips). The earlier form's old fit scores $-36.78$ with a peak-covering
+estimate. The mixture form, in the full fit started from it:
+\begin{center}\small
+\begin{tabular}{lrrrr}\toprule
+step & log-lik. & mean ESS & size, mean & size, 99\%\\\midrule
+data & & & 7.26 & 42.8\\
+240 & $-35.777$ & 0.35 & 7.66 & 41\\
+360 & $\mathbf{-35.744}$ & 0.31 & 7.86 & 44.8\\
+480 (whitening, $K=8$) & $-35.895$ & 0.27 & 8.23 & 46\\\bottomrule
+\end{tabular}
+\end{center}
+The run was restarted from step 360 with the whitening estimate of Section~\ref{sec:whiten}; no generated basket
+has reached the 120 cap at any point.
+
+\section{Open points}
+\begin{itemize}
+\item The whitening step is approximate (Section~\ref{sec:whiten}).
+\item The trained bound \eqref{eq:obj} with $K=8$ is below $\log p$; how much it biases the fitted parameters
+  is measured only indirectly (validation at $K=256$).
+\item Only $\lambda,\phi,\psi,\rho_0,\rho_c,f$ are trained; price, promotion, competition and history terms keep the
+  earlier fit's values, and the price and promotion checks have to be re-run on this form.
+\item The prior is one Gaussian. A mixture of a few Gaussians would keep Proposition~\ref{prop:concave} within each component.
+\end{itemize}
 
 \end{document}

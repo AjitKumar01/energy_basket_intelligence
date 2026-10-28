@@ -15,303 +15,330 @@
 \newcommand{\Cov}{\operatorname{Cov}}
 \newcommand{\pos}[1]{(#1)_+}
 
-\title{Hidden hills in the old basket model,\\ and why the mixture form has none}
+\title{The old basket model, where it fails,\\ and the mixture model that replaces it}
 \author{Ajit}
 \date{28 October 2026}
 
 \begin{document}
 \maketitle
 
-\begin{abstract}
-Both the old Version-4 basket model and its mixture form are built from the same exact law of a basket
-given a latent taste $z$. They differ only in the weight each taste receives. In the old model that weight
-is the Gaussian density times $Z_z$, the total score of all baskets the taste allows. Because $Z_z$ grows
-fastest for tastes that make large baskets attractive, the weight can have several hills, one of them far
-from every real basket; training and evaluation that look only near the data never see it. In the mixture
-form the weight is the Gaussian density alone, and the posterior of the taste given any basket has exactly
-one hill. A worked example with 20 products shows both effects with numbers that can be checked by hand.
-\end{abstract}
+\noindent Part~\ref{part:old} states the old model and how it is used. Part~\ref{part:problem} locates its
+failure. Part~\ref{part:mix} builds the mixture model step by step and compares the two.
 
 %======================================================================
-\section{Notation}
+\section{The old model}\label{part:old}
+
+\subsection{What is modelled}
+
+One shopping trip is fixed throughout. $\mathcal J$ is the set of products offered on that trip, and each
+product $j\in\mathcal J$ belongs to one category $c(j)$.
+
+A \emph{basket} is the set $S\subseteq\mathcal J$ of products bought on the trip. For a basket we write
+$n(S)=|S|$ for its size, $n_c(S)$ for the number of its products in category $c$, and $m(S)$ for the number
+of categories with $n_c(S)>0$. The allowed baskets form the set
+\[
+\mathcal S=\{S\subseteq\mathcal J:\ 1\le n(S)\le 120,\ n_c(S)\le 40\text{ for every }c\}.
+\]
+A model is a probability $p(S)$ for every $S\in\mathcal S$, with $\sum_{S\in\mathcal S}p(S)=1$.
+
+\subsection{The parameters}
 
 \begin{itemize}
-\item One trip is fixed throughout. $\mathcal J$ is the set of products offered on it. Each product
-  $j\in\mathcal J$ belongs to one category $c(j)$, and $\mathcal J_c=\{j: c(j)=c\}$.
-\item A \emph{basket} is a non-empty set $S\subseteq\mathcal J$. For a basket,
-  $n(S)=|S|$ is its size, $n_c(S)=|S\cap\mathcal J_c|$ the number of its products in category $c$, and
-  $m(S)=\#\{c:n_c(S)>0\}$ the number of categories present.
-\item $\mathcal S$ is the set of allowed baskets: $1\le n(S)\le 120$ and $n_c(S)\le40$ for every $c$.
-  Every sum over baskets below runs over $\mathcal S$.
-\item The taste is a vector $z\in\R^r$ ($r=16$ on the real data, $r=1$ in the examples).
-  $\N(z;0,I)=(2\pi)^{-r/2}e^{-\lVert z\rVert^2/2}$ is the standard Gaussian density, the ``bell curve''.
-\item $\pos{a}=\max(a,0)$ and $\binom{k}{2}=k(k-1)/2$.
+\item $b_j\in\R$: the utility of product $j$ on this trip, built from its popularity, price, promotions,
+  season, store and the household's tastes and history. On a given trip it is a fixed number.
+\item $\phi_j\in\R^r$: the \emph{loading} of product $j$, a vector of dimension $r$ ($r=16$ on the real data).
+  Products with similar loadings tend to be bought together.
+\item $\psi_c\in\R^r$: a loading for each product of category $c$ beyond the first.
+\item $\rho_c$, $f_c(k)$, $\rho_0(m)$: penalties on pairs within category $c$, on holding $k$ products of $c$, and
+  on having $m$ categories in the basket. $\pos{a}=\max(a,0)$ and $\binom{k}{2}=k(k-1)/2$.
 \end{itemize}
 
-\paragraph{Parameters.} Each product has a context utility $b_j\in\R$ (price, promotion, season, household
-taste, history; a fixed number for this trip) and a taste loading $\phi_j\in\R^r$. Each category has a
-taste loading $\psi_c\in\R^r$ for its extra products, a pair penalty $\rho_c$ and count penalties $f_c(k)$
-(with $f_c(0)=f_c(1)=0$). $\rho_0(m)$ is the size penalty on the number of categories present.
+\subsection{The definition}
 
-%======================================================================
-\section{The common building block: the basket law given a taste}
-
-\begin{definition}[score and total score]
-For a taste $z$ and a basket $S$, the \emph{score} of $S$ is $e^{E_z(S)}$ with
-\begin{align}
-E_z(S)&=\sum_{j\in S}u_j(z)-\sum_c h_c\big(n_c(S),z\big)-\rho_0\big(m(S)\big),\label{eq:E}\\
-u_j(z)&=b_j-\tfrac12\lVert\phi_j\rVert^2+z\cdot\phi_j,\nonumber\\
-h_c(k,z)&=\rho_c\tbinom{k}{2}+f_c(k)+\pos{k-1}\big(z\cdot\psi_c-\tfrac12\lVert\psi_c\rVert^2\big).\nonumber
-\end{align}
-The \emph{total score} of taste $z$ is the sum of the scores of all allowed baskets,
-\begin{equation}
-Z_z=\sum_{S\in\mathcal S}e^{E_z(S)} .
-\label{eq:Z}
-\end{equation}
-\end{definition}
-
-\begin{definition}[basket law given a taste]
-\begin{equation}
-p(S\mid z)=\frac{e^{E_z(S)}}{Z_z}.
-\label{eq:cond}
-\end{equation}
-\end{definition}
-A basket's probability is its share of the total score; dividing by $Z_z$ makes the probabilities of all
-baskets add up to one. Both models below use exactly this law.
-
-\paragraph{The basket field.} Collecting the terms of \eqref{eq:E} that contain $z$ gives
-\begin{equation}
-E_z(S)=a(S)+z\cdot s(S),\qquad s(S)=\sum_{j\in S}\phi_j-\sum_c\pos{n_c(S)-1}\,\psi_c ,
-\label{eq:affine}
-\end{equation}
-where $a(S)$ collects every term of \eqref{eq:E} without $z$. The vector $s(S)\in\R^r$, the \emph{basket field},
-is the direction in taste space that basket $S$ points in.
-
-\subsection{Example 1: three products}
-
-Take $\mathcal J=\{A,B,C\}$, no penalties ($\rho_c=f_c=\rho_0=0$, $\psi_c=0$), and a taste $z$ under which
-$u_A(z)=1$, $u_B(z)=0$, $u_C(z)=-1$. Then $e^{E_z(S)}=\exp\sum_{j\in S}u_j(z)$ and
-\begin{center}\small
-\begin{tabular}{lccccccc|c}\toprule
-$S$ & $\{A\}$ & $\{B\}$ & $\{C\}$ & $\{A,B\}$ & $\{A,C\}$ & $\{B,C\}$ & $\{A,B,C\}$ & $Z_z$\\\midrule
-$e^{E_z(S)}$ & 2.72 & 1.00 & 0.37 & 2.72 & 1.00 & 0.37 & 1.00 & 9.17\\\bottomrule
-\end{tabular}
-\end{center}
-so $p(\{A\}\mid z)=2.72/9.17=0.30$ and $p(\{A,B,C\}\mid z)=1.00/9.17=0.11$.
-
-Now take a taste $z'$ that raises every utility by 2, so $u_A=3$, $u_B=2$, $u_C=1$:
-\begin{center}\small
-\begin{tabular}{lccccccc|c}\toprule
-$S$ & $\{A\}$ & $\{B\}$ & $\{C\}$ & $\{A,B\}$ & $\{A,C\}$ & $\{B,C\}$ & $\{A,B,C\}$ & $Z_{z'}$\\\midrule
-$e^{E_{z'}(S)}$ & 20.1 & 7.4 & 2.7 & 148.4 & 54.6 & 20.1 & 403.4 & 656.7\\\bottomrule
-\end{tabular}
-\end{center}
-Raising each utility by 2 multiplies the score of a basket of $n$ products by $e^{2n}$. The total score grows
-about 72-fold, almost all of it from the largest basket, whose probability rises to $403.4/656.7=0.61$.
-With thousands of products and baskets of up to 120, a taste that raises many utilities makes $Z_z$
-astronomically large, and nearly all of it comes from huge baskets.
-
-\subsection{How $Z_z$ is computed and how it changes with $z$}
-
-$\mathcal S$ is far too large to list, but $Z_z$ is computed exactly. For each category $c$ and each count
-$k$, the total score of choosing $k$ of its products is $G_c(k)=e^{-h_c(k,z)}\sum_{A\subseteq\mathcal J_c,|A|=k}\prod_{j\in A}e^{u_j(z)}$,
-by a recursion over the products of $c$. The categories are then combined in a table indexed by the
-basket size $n$ and the number of categories $m$, and $Z_z=\sum_{n,m}(\text{table entry})\,e^{-\rho_0(m)}$.
-
-For the conditional mean and covariance of the basket field, write
-$\E[s\mid z]=\sum_S p(S\mid z)\,s(S)$ and $\Cov[s\mid z]=\sum_S p(S\mid z)\,(s(S)-\E[s\mid z])(s(S)-\E[s\mid z])^\top$.
-
-\begin{lemma}\label{lem:grad}
-$\nabla_z\log Z_z=\E[s\mid z]$ and $\nabla_z^2\log Z_z=\Cov[s\mid z]$. In particular $\log Z_z$ is convex in $z$.
-\end{lemma}
-\begin{proof}
-By \eqref{eq:affine}, $\log Z_z=\log\sum_Se^{a(S)+z\cdot s(S)}$. Differentiating once gives
-$\sum_S e^{a(S)+z\cdot s(S)}s(S)/Z_z=\E[s\mid z]$; differentiating again gives the covariance, which is positive
-semi-definite.
-\end{proof}
-In words: moving the taste in a direction $v$ raises $\log Z_z$ at the rate $v\cdot\E[s\mid z]$, the expected
-basket field along $v$, and that rate itself only increases as $z$ moves further along $v$.
-
-%======================================================================
-\section{The old model and its taste weight}
+Each basket gets two numbers. The first is the sum of its product utilities and penalties,
+\[
+a(S)=\sum_{j\in S}\big(b_j-\tfrac12\lVert\phi_j\rVert^2\big)
+-\sum_c\Big[\rho_c\tbinom{n_c(S)}{2}+f_c\big(n_c(S)\big)-\tfrac12\pos{n_c(S)-1}\lVert\psi_c\rVert^2\Big]-\rho_0\big(m(S)\big).
+\]
+The second is the basket's direction in loading space,
+\[
+s(S)=\sum_{j\in S}\phi_j-\sum_c\pos{n_c(S)-1}\,\psi_c\ \in\R^r .
+\]
 
 \begin{definition}[old model]
 \begin{equation}
-p_{\rm old}(S)=\frac{e^{a(S)+\frac12\lVert s(S)\rVert^2}}{Z_{\rm old}},\qquad
-Z_{\rm old}=\sum_{S\in\mathcal S}e^{a(S)+\frac12\lVert s(S)\rVert^2}.
+p_{\rm old}(S)=\frac{e^{F(S)}}{Z_{\rm old}},\qquad F(S)=a(S)+\tfrac12\lVert s(S)\rVert^2,\qquad
+Z_{\rm old}=\sum_{S\in\mathcal S}e^{F(S)} .
 \label{eq:old}
 \end{equation}
 \end{definition}
-The term $\tfrac12\lVert s(S)\rVert^2$ is the ``goes-together'' bonus: expanding it, it contains
-$\phi_i\cdot\phi_j$ for every pair of products in $S$, so products whose loadings point the same way reward
-each other. For a basket of $n$ products with similar loadings it grows like $n^2$, while the penalties in
-$a(S)$ grow like $n$.
+
+$e^{F(S)}$ is the \emph{score} of basket $S$. $Z_{\rm old}$, the \emph{normalising constant}, is the sum of the
+scores of all allowed baskets; dividing by it makes the probabilities add up to one. A basket's probability is
+its share of the total score.
+
+The term $\tfrac12\lVert s(S)\rVert^2$ is what makes products go together. Ignoring $\psi$, it equals
+$\tfrac12\sum_{j\in S}\lVert\phi_j\rVert^2+\sum_{\{i,j\}\subseteq S}\phi_i\cdot\phi_j$: every pair of products in the
+basket adds the dot product of their loadings, so products with similar loadings raise each other's
+probability. The old model has no prior and no hidden variable: \eqref{eq:old} scores baskets directly.
+
+\subsection{How the model is used}
+
+\paragraph{Training} maximises the log-likelihood $\sum_t\log p_{\rm old}(S_t)$ over the observed baskets $S_t$ of
+the training trips. For any parameter $\vartheta$,
+\begin{equation}
+\nabla_\vartheta\log p_{\rm old}(S)=\nabla_\vartheta F(S)-\E_{S'\sim p_{\rm old}}\big[\nabla_\vartheta F(S')\big],
+\label{eq:grad}
+\end{equation}
+``observed minus what the model expects''. \emph{Scoring} a held-out basket needs $\log Z_{\rm old}$, and
+\emph{generating} baskets needs draws from $p_{\rm old}$. All three need sums over the whole of $\mathcal S$, which is
+far too large to list.
+
+\paragraph{The taste variable.} The pair term couples every product with every other, so these sums cannot be
+done directly. They become tractable after one identity.
 
 \begin{lemma}[Gaussian identity]\label{lem:gauss}
-For every $s\in\R^r$, $\;e^{\frac12\lVert s\rVert^2}=\int_{\R^r}\N(z;0,I)\,e^{z\cdot s}\,dz$.
+Let $\N(z;0,I)=(2\pi)^{-r/2}e^{-\lVert z\rVert^2/2}$ be the standard Gaussian density on $\R^r$. For every $s\in\R^r$,
+\[
+e^{\frac12\lVert s\rVert^2}=\int_{\R^r}\N(z;0,I)\,e^{z\cdot s}\,dz .
+\]
 \end{lemma}
 \begin{proof}
-$-\tfrac12\lVert z\rVert^2+z\cdot s=-\tfrac12\lVert z-s\rVert^2+\tfrac12\lVert s\rVert^2$, and $\N(\cdot\,;s,I)$ integrates to one.
+$-\tfrac12\lVert z\rVert^2+z\cdot s=-\tfrac12\lVert z-s\rVert^2+\tfrac12\lVert s\rVert^2$, and $\N(z;s,I)$ integrates to one.
 \end{proof}
 
-\begin{proposition}[the old model as a weighted mixture]
+Apply it to the score: $e^{F(S)}=\int\N(z;0,I)\,e^{a(S)+z\cdot s(S)}\,dz$. Inside the integral the pair term has
+gone; for a fixed vector $z$, called the \emph{taste}, the exponent $a(S)+z\cdot s(S)$ is a sum over products and
+categories. This suggests looking at baskets one taste at a time.
+
+\begin{definition}[basket law given a taste]
+For $z\in\R^r$,
+\begin{equation}
+p(S\mid z)=\frac{e^{E_z(S)}}{Z(z)},\qquad E_z(S)=a(S)+z\cdot s(S),\qquad Z(z)=\sum_{S\in\mathcal S}e^{E_z(S)} .
+\label{eq:cond}
+\end{equation}
+\end{definition}
+$Z(z)$ is the normalising constant of this law: the total score of all allowed baskets when the taste is $z$.
+Writing out $E_z(S)$, each product contributes $b_j-\tfrac12\lVert\phi_j\rVert^2+z\cdot\phi_j$: the taste raises the
+products whose loadings point its way. Because $E_z$ has no pair term, $Z(z)$ and draws from $p(S\mid z)$ are
+computed \emph{exactly} by a dynamic program (category by category, tracking the basket size and the number of
+categories).
+
+\begin{proposition}[the old model through tastes]\label{prop:oldmix}
 \begin{equation}
 p_{\rm old}(S)=\int_{\R^r}\pi_{\rm old}(z)\,p(S\mid z)\,dz,\qquad
-\pi_{\rm old}(z)=\frac{\N(z;0,I)\,Z_z}{Z_{\rm old}} .
+\pi_{\rm old}(z)=\frac{\N(z;0,I)\,Z(z)}{Z_{\rm old}} .
 \label{eq:oldmix}
 \end{equation}
+$\pi_{\rm old}$ is a probability density on $\R^r$.
 \end{proposition}
 \begin{proof}
-By Lemma~\ref{lem:gauss} and \eqref{eq:affine},
-$e^{a(S)+\frac12\lVert s(S)\rVert^2}=\int\N(z;0,I)\,e^{E_z(S)}\,dz=\int\N(z;0,I)\,Z_z\,p(S\mid z)\,dz$.
-Dividing by $Z_{\rm old}$ gives \eqref{eq:oldmix}. Summing over $S$ shows that $\pi_{\rm old}$ integrates to one.
+$e^{F(S)}=\int\N(z;0,I)\,e^{E_z(S)}dz=\int\N(z;0,I)\,Z(z)\,p(S\mid z)\,dz$; divide by $Z_{\rm old}$. Summing over $S$,
+$\int\pi_{\rm old}(z)\,dz=\sum_Sp_{\rm old}(S)=1$.
 \end{proof}
 
-So the old model also picks a taste and then a basket, but a taste is weighted by the bell curve
-\emph{multiplied by its total score} $Z_z$. A taste that makes many high-scoring baskets possible gains weight.
-
-\begin{proposition}[slope and curvature of the old weight]\label{prop:old}
-\[
-\nabla_z\log\pi_{\rm old}(z)=-z+\E[s\mid z],\qquad
-\nabla_z^2\log\pi_{\rm old}(z)=-I+\Cov[s\mid z].
-\]
-\end{proposition}
-\begin{proof}
-$\log\pi_{\rm old}(z)=-\tfrac12\lVert z\rVert^2+\log Z_z+\text{const}$; apply Lemma~\ref{lem:grad}.
-\end{proof}
-Two forces act on the slope: $-z$ pulls back towards zero, and $\E[s\mid z]$ pushes outward, harder the
-further out $z$ is (Lemma~\ref{lem:grad}). Where $\Cov[s\mid z]$ exceeds $I$ the curvature is positive, so
-$\log\pi_{\rm old}$ is not concave and can have several local maxima, the \emph{hills}. Each hill satisfies
-$z=\E[s\mid z]$.
-
-\subsection{Example 2: twenty products and a hidden hill}
-
-Take one taste dimension ($r=1$), 20 products in 20 different categories, all with $b_j=-4$ and $\phi_j=1$,
-and no penalties or $\psi$. Then $u_j(z)=-4.5+z$ for every product, $s(S)=n(S)$, and
-\[
-Z_z=\big(1+e^{-4.5+z}\big)^{20}-1,\qquad
-\E[n\mid z]=\frac{20\,\sigma(-4.5+z)\,(1+e^{-4.5+z})^{20}}{Z_z},\qquad\sigma(x)=\frac1{1+e^{-x}},
-\]
-where the $-1$ removes the empty basket. The slope of Proposition~\ref{prop:old} is $-z+\E[n\mid z]$. Its zeros,
-computed numerically:
-\begin{center}\small
-\begin{tabular}{rrrl}\toprule
-$z$ & $\E[n\mid z]$ & $\log\N(z;0,1)Z_z+\tfrac12\log2\pi$ & \\\midrule
-1.56 & 1.56 & $-0.63$ & hill 1: near the data\\
-2.36 & 2.36 & $-0.68$ & valley\\
-20.0 & 20.0 & $+110.0$ & hill 2: all 20 products bought\\\bottomrule
-\end{tabular}
-\end{center}
-Hill 2 is about $e^{110.6}$ times higher than hill 1. Integrating \eqref{eq:oldmix} numerically, the region
-$z<5$ holds a fraction $10^{-46}$ of the old model's probability, so under $p_{\rm old}$ essentially every
-basket contains all 20 products.
-
-The same follows directly from \eqref{eq:old}. The full basket has $a(S)=20\times(-4.5)=-90$ and bonus
-$\tfrac12\cdot20^2=200$, energy $110$; a single product has energy $-4.5+\tfrac12=-4$. The pair bonus wins.
-
-\paragraph{Why fitting and evaluation miss hill 2.} The gradient of the old log-likelihood in any parameter
-$\vartheta$ is ``observed minus expected'':
-\[
-\nabla_\vartheta\log p_{\rm old}(S)=\nabla_\vartheta\big[a(S)+\tfrac12\lVert s(S)\rVert^2\big]-\E_{S'\sim p_{\rm old}}\nabla_\vartheta\big[a(S')+\tfrac12\lVert s(S')\rVert^2\big].
-\]
-The expectation is over $p_{\rm old}$, and by \eqref{eq:oldmix} over $\pi_{\rm old}$. If real baskets hold one or
-two products, chains started from them stay around hill 1, and so does any proposal built from them. The
-estimate of the expectation then covers hill 1 only, nothing pushes hill 2 down, and an estimate of
-$Z_{\rm old}$ that misses hill 2 makes the reported likelihood too high. On the Dunnhumby refit this hill was
-the region of 120-product baskets.
+So every computation with the old model is an average over tastes $z$ drawn from $\pi_{\rm old}$, with an exact
+inner part for each $z$. In particular the expectation in \eqref{eq:grad} is
+$\int\pi_{\rm old}(z)\,\E_{S'\sim p(\cdot\mid z)}[\cdots]\,dz$. In practice the average over $z$ was taken with Gibbs
+chains that alternate $z\sim\N(s(S),I)$ and $S\sim p(\cdot\mid z)$, started from the observed baskets.
 
 %======================================================================
-\section{The mixture model}
+\section{Where exactly the problem is}\label{part:problem}
 
-\begin{definition}[mixture model]
+The problem is the taste density $\pi_{\rm old}(z)\propto\N(z;0,I)\,Z(z)$: the Gaussian density multiplied by the
+total score $Z(z)$. This section shows that $Z(z)$ grows fastest for tastes that make large baskets attractive,
+that this can give $\pi_{\rm old}$ several separate peaks, and that the procedures above see only one of them.
+
+\subsection{$Z(z)$ grows fastest for large baskets}
+
+\paragraph{Example 1.} Three products $A,B,C$, one taste dimension ($r=1$), loadings $\phi_A=\phi_B=\phi_C=1$,
+utilities $b_A=1.5$, $b_B=0.5$, $b_C=-0.5$, no penalties. A product's contribution is $b_j-\tfrac12+z$, so at $z=0$ the
+three contributions are $1,0,-1$ and at $z=2$ they are $3,2,1$. The scores $e^{E_z(S)}$:
+\begin{center}\small
+\begin{tabular}{lccccccc|c}\toprule
+$S$ & $\{A\}$ & $\{B\}$ & $\{C\}$ & $\{A,B\}$ & $\{A,C\}$ & $\{B,C\}$ & $\{A,B,C\}$ & $Z(z)$\\\midrule
+$z=0$ & 2.72 & 1.00 & 0.37 & 2.72 & 1.00 & 0.37 & 1.00 & 9.17\\
+$z=2$ & 20.1 & 7.4 & 2.7 & 148.4 & 54.6 & 20.1 & 403.4 & 656.7\\\bottomrule
+\end{tabular}
+\end{center}
+Moving the taste from 0 to 2 multiplies the score of every basket of $n$ products by $e^{2n}$. $Z$ grows 72-fold,
+mostly through the largest basket, whose probability $p(\{A,B,C\}\mid z)$ rises from $1.00/9.17=0.11$ to
+$403.4/656.7=0.61$.
+
+\paragraph{In general.} Write $\E[s\mid z]=\sum_Sp(S\mid z)\,s(S)$ and
+$\Cov[s\mid z]=\sum_Sp(S\mid z)\,(s(S)-\E[s\mid z])(s(S)-\E[s\mid z])^\top$ for the mean and covariance of the basket's
+direction under $p(\cdot\mid z)$.
+
+\begin{lemma}\label{lem:grad}
+$\nabla_z\log Z(z)=\E[s\mid z]$ and $\nabla_z^2\log Z(z)=\Cov[s\mid z]$.
+\end{lemma}
+\begin{proof}
+$\log Z(z)=\log\sum_Se^{a(S)+z\cdot s(S)}$; differentiate once and twice.
+\end{proof}
+Moving $z$ in a direction raises $\log Z$ at the rate of the expected basket direction along it, and that rate
+itself grows as $z$ moves on. With many products whose loadings point the same way, $\E[s\mid z]$ keeps growing
+until the baskets hold all of them.
+
+\subsection{$\pi_{\rm old}$ can have several peaks}
+
+\begin{proposition}\label{prop:old}
+\[
+\nabla_z\log\pi_{\rm old}(z)=-z+\E[s\mid z],\qquad \nabla_z^2\log\pi_{\rm old}(z)=-I+\Cov[s\mid z].
+\]
+\end{proposition}
+\begin{proof}
+$\log\pi_{\rm old}(z)=-\tfrac12\lVert z\rVert^2+\log Z(z)+\text{const}$; apply Lemma~\ref{lem:grad}.
+\end{proof}
+Two forces set the slope: $-z$ from the Gaussian pulls the taste back towards zero, and $\E[s\mid z]$ from $Z(z)$
+pushes it outward, harder the further out it is. Wherever $\Cov[s\mid z]$ exceeds $I$ the curvature is positive,
+so $\log\pi_{\rm old}$ need not be concave and can have several local maxima (peaks). Every peak solves
+$z=\E[s\mid z]$.
+
+\paragraph{Example 2.} Twenty products in twenty categories, $r=1$, all with $b_j=-4$ and $\phi_j=1$, no penalties.
+Each product contributes $-4.5+z$, the basket's direction is its size $n(S)$, and
+\[
+Z(z)=\big(1+e^{-4.5+z}\big)^{20}-1,
+\]
+the $-1$ removing the empty basket. The zeros of the slope $-z+\E[n\mid z]$, computed numerically:
+\begin{center}\small
+\begin{tabular}{rrrl}\toprule
+$z$ & $\E[n\mid z]$ & $\log\pi_{\rm old}(z)+\text{const}$ & \\\midrule
+1.56 & 1.56 & $-0.63$ & peak 1: one or two products per basket\\
+2.36 & 2.36 & $-0.68$ & valley\\
+20.0 & 20.0 & $+110.0$ & peak 2: all 20 products\\\bottomrule
+\end{tabular}
+\end{center}
+Peak 2 is $e^{110.6}$ times higher. Integrating \eqref{eq:oldmix} numerically, tastes $z<5$ carry a fraction
+$10^{-46}$ of the probability: under $p_{\rm old}$ essentially every basket holds all 20 products. The same is visible
+in \eqref{eq:old} directly: the full basket has $a=20\times(-4.5)=-90$ and pair bonus $\tfrac12\cdot20^2=200$, so
+$F=110$, against $F=-4$ for a single product. The pair bonus grows like $n^2$, the penalties only like $n$.
+
+\subsection{Why training and scoring did not see it}
+
+Suppose the real baskets hold one or two products. The Gibbs chains start at the observed baskets, so their
+tastes start near peak 1. To reach peak 2 a chain must cross the valley, which is improbable at every step, and
+the chains ran a few sweeps. So:
+\begin{itemize}
+\item the expectation in \eqref{eq:grad} is computed over peak 1 only; nothing in training sees, or lowers, the
+  probability at peak 2;
+\item the estimate of $Z_{\rm old}$, built from the same chains, leaves out peak 2, so $\log p_{\rm old}$ of held-out
+  baskets is reported too high.
+\end{itemize}
+On the Dunnhumby refit peak 2 was the region of 120-product baskets: the reported held-out log-likelihood was
+$-38.8$ per trip and $-53.8$ once the far peak was included.
+
+The fault is therefore not in $p(S\mid z)$, which is exact, but in the taste density $\pi_{\rm old}\propto\N(z;0,I)\,Z(z)$:
+a taste gains weight in proportion to the total score of the baskets it allows.
+
+%======================================================================
+\section{The mixture model}\label{part:mix}
+
+The mixture model keeps the exact basket law given a taste and changes only how tastes are weighted.
+
+\subsection{What is modelled}
+
+As before, the basket $S\in\mathcal S$ bought on one trip. In addition, every trip has an unobserved taste
+$z\in\R^r$: what the shopper is in the mood for on that trip. The model describes how $z$ arises and how $S$
+arises given $z$.
+
+\subsection{The prior on the taste}
+
+\begin{equation}
+z\sim\N(0,I),\qquad\text{independently on every trip.}
+\label{eq:prior}
+\end{equation}
+Most tastes are mild (near zero); strong ones are rare. Lasting preferences of a household are not in $z$ but in
+the utilities $b_j$.
+
+\subsection{The basket given the taste}
+
+Given $z$, the basket follows the law \eqref{eq:cond} of Part~\ref{part:old}:
+\[
+p(S\mid z)=\frac{e^{E_z(S)}}{Z(z)},\qquad E_z(S)=a(S)+z\cdot s(S),
+\]
+where the normalising constant
+\[
+Z(z)=\sum_{S\in\mathcal S}e^{E_z(S)}
+\]
+is the total score of all allowed baskets under taste $z$, so that $\sum_Sp(S\mid z)=1$ for every $z$. $Z(z)$ and
+draws from $p(\cdot\mid z)$ are computed exactly by the dynamic program.
+
+\subsection{The probability of a basket}
+
+Averaging the basket law over the prior:
 \begin{equation}
 p(S)=\int_{\R^r}\N(z;0,I)\,p(S\mid z)\,dz .
 \label{eq:mix}
 \end{equation}
-\end{definition}
-The law given $z$ is the same \eqref{eq:cond}; the taste weight is $\N(z;0,I)$ alone. $Z_z$ appears only as the
-divisor inside $p(S\mid z)$, which makes each taste's probabilities add up to one. A taste that allows many
-high-scoring baskets gains no weight; it shares its fixed weight among more baskets. $p(S)$ sums to one
-because $\sum_Sp(S\mid z)=1$ for every $z$.
+It sums to one because each $p(\cdot\mid z)$ does. To generate a basket, draw $z$ from \eqref{eq:prior} and then $S$
+from $p(\cdot\mid z)$; both steps are exact, with no Markov chain.
 
-\paragraph{Generation.} Draw $z\sim\N(0,I)$, then $S\sim p(\cdot\mid z)$ exactly by the dynamic program of
-Section~2.2 (size and categories first, then the count in each category, then the products). No search is
-involved, so nothing can be missed.
+\paragraph{Example 2 under the mixture model.} The taste $z=20$ has prior density proportional to $e^{-200}$ and
+is never drawn. Typical tastes lie in $[-2,2]$, where each product is bought with probability between $0.0015$
+and $0.076$. The mean basket size is $\int\N(z;0,1)\,\E[n\mid z]\,dz=1.19$, and the full 20-product basket has
+probability $2.3\times10^{-10}$.
 
-\paragraph{Example 2 again.} Under \eqref{eq:mix} the taste $z=20$ has density $\propto e^{-200}$. Typical tastes
-lie in $[-2,2]$, where each product is bought with probability $\sigma(-4.5+z)\in[0.0015,0.076]$ and
-$\E[n\mid z]\in[1.01,1.91]$. The model's mean basket size is $\int\N(z;0,1)\E[n\mid z]\,dz=1.19$, and the
-probability of the full 20-product basket is $2.3\times10^{-10}\approx e^{-22.2}$.
+\subsection{The posterior of the taste}
 
-\subsection{The posterior of the taste has one hill}
-
-Scoring an observed basket $S$ requires the tastes that explain it. By Bayes' rule their weight is the
-posterior
+Scoring an observed basket $S$, and training on it, needs the tastes that could have produced it. By Bayes' rule
+their density is
 \begin{equation}
 p(z\mid S)=\frac{\N(z;0,I)\,p(S\mid z)}{p(S)},\qquad
-\log p(z\mid S)=-\tfrac12\lVert z\rVert^2+z\cdot s(S)-\log Z_z+\text{const},
+\log p(z\mid S)=-\tfrac12\lVert z\rVert^2+z\cdot s(S)-\log Z(z)+\text{const},
 \label{eq:post}
 \end{equation}
-using \eqref{eq:affine}; the constant does not depend on $z$.
+where the constant collects $a(S)$ and $\log p(S)$ and does not depend on $z$.
 
-\begin{proposition}[one hill]\label{prop:mix}
+\begin{proposition}[one peak]\label{prop:mix}
 \[
 \nabla_z\log p(z\mid S)=-z+s(S)-\E[s\mid z],\qquad
 \nabla_z^2\log p(z\mid S)=-I-\Cov[s\mid z]\preceq-I .
 \]
-Hence $\log p(z\mid S)$ is strictly concave, has exactly one maximum $\hat z$, and
+Hence $\log p(z\mid S)$ is strictly concave and has exactly one maximum $\hat z$; moreover
 $\log p(z\mid S)\le\log p(\hat z\mid S)-\tfrac12\lVert z-\hat z\rVert^2$ for every $z$.
 \end{proposition}
 \begin{proof}
-Differentiate \eqref{eq:post} with Lemma~\ref{lem:grad}. A covariance is positive semi-definite, so the
-Hessian is at most $-I$ in every direction. A function whose Hessian is at most $-I$ everywhere has a unique
-maximum, and the quadratic bound follows from Taylor's theorem.
+Differentiate \eqref{eq:post} using Lemma~\ref{lem:grad}. A covariance is positive semi-definite, so the Hessian is at
+most $-I$ in every direction; a function with this property has exactly one maximum and the stated quadratic bound.
 \end{proof}
 
-Compare with Proposition~\ref{prop:old}. The term $\E[s\mid z]$ that pushed the old weight outward appears here
-with a minus sign: it now works with the bell curve instead of against it. The basket enters only through
-the constant vector $s(S)$, which shifts the hill but cannot create a second one. This holds for every basket,
-every parameter value and every dimension $r$.
+Compare with Proposition~\ref{prop:old}. The term $\E[s\mid z]$ that pushed $\pi_{\rm old}$ outward enters here with a minus
+sign, so it pulls in the same direction as the prior instead of against it. The observed basket contributes only
+the fixed vector $s(S)$, which moves the peak but cannot create a second one. This holds for every basket, every
+value of the parameters and every dimension $r$. In Example 2, for a basket of one product the slope is
+$-z+1-\E[n\mid z]$; both terms decrease in $z$, and the single peak is at $\hat z=-0.10$.
 
-\paragraph{Example 2 again.} For $S=\{\text{one product}\}$ the slope is $-z+1-\E[n\mid z]$. Both $-z$ and
-$-\E[n\mid z]$ decrease in $z$, so the slope crosses zero once, at $\hat z=-0.10$.
-
-\subsection{Consequences}
-
+\paragraph{Consequences.}
 \begin{itemize}
-\item \emph{Scoring.} $p(S)$ is estimated by importance sampling around the single hill $\hat z$, found by
-  gradient ascent, which always reaches it. There is no second hill to miss.
-\item \emph{Training.} The gradient is $\sum_k\bar w_k\big(\nabla E_{z_k}(S)-\E_{S'\sim p(\cdot\mid z_k)}\nabla E_{z_k}(S')\big)$,
-  with tastes $z_k$ drawn around $\hat z$ and normalised importance weights $\bar w_k$. The inner expectation is
-  exact for each $z_k$ (it is the gradient of $\log Z_{z_k}$), so no region of baskets is left unvisited.
-\item \emph{Generation} is exact (above).
+\item \emph{Scoring:} $p(S)$ is estimated by importance sampling around $\hat z$, which gradient ascent always finds.
+\item \emph{Training:} the gradient is a weighted average, over tastes drawn around $\hat z$, of ``observed minus
+  expected given that taste''. The expectation given a taste is exact, so no region of baskets is left unvisited.
+\item \emph{Generation} is exact, as above.
 \end{itemize}
 
+\subsection{The two models side by side}
+
+The old model implies the taste density $\pi_{\rm old}(z)=\N(z;0,I)\,Z(z)/Z_{\rm old}$ (Proposition~\ref{prop:oldmix}). It is not a
+prior chosen in advance: it depends on all the parameters and on the trip, and it favours tastes with a large total
+score. The mixture model uses the prior $\N(0,I)$ itself.
 \begin{center}\small
 \begin{tabular}{lll}\toprule
  & old model & mixture model\\\midrule
-law given $z$ & $p(S\mid z)$, \eqref{eq:cond} & the same\\
-weight of taste $z$ & $\N(z;0,I)\,Z_z/Z_{\rm old}$ & $\N(z;0,I)$\\
-slope of the log weight that matters & $-z+\E[s\mid z]$ & $-z+s(S)-\E[s\mid z]$\\
-curvature & $-I+\Cov[s\mid z]$ & $-I-\Cov[s\mid z]$\\
-number of hills & one or more & exactly one\\
-drawing a basket & Markov chain & exact, $z$ then $S\mid z$\\\bottomrule
+basket law given a taste & $p(S\mid z)$, exact & the same\\
+weight of taste $z$ & $\N(z;0,I)\,Z(z)/Z_{\rm old}$ & $\N(z;0,I)$\\
+density searched when scoring & $\pi_{\rm old}(z)$: several peaks possible & $p(z\mid S)$: exactly one peak\\
+generating a basket & Markov chain & exact: $z$, then $S\mid z$\\\bottomrule
 \end{tabular}
 \end{center}
 
-%======================================================================
-\section{What changes and what does not}
-
+\paragraph{What changes, and what does not.}
 \begin{itemize}
-\item \emph{It is a different model.} The two forms share every parameter but define different laws, so a fit
-  of one is not a fit of the other.
-\item \emph{Prices and tastes.} In the old model a price change alters $Z_z$ and so shifts which tastes are
-  common. In the mixture the taste distribution is fixed by $\N(0,I)$; prices change only what each taste
-  buys. This is an assumption, suited to short-run price and promotion questions.
-\item \emph{What it does not fix.} The mixture removes hidden hills; it does not by itself make training
-  correct. In the full real fit the held-out log-likelihood on all 1{,}024 validation trips fell from
-  $-38.10$ at step 240 to $-38.76$ at the end (paired difference $-0.66\pm0.08$), and the drop is real at
-  $2{,}048$ importance draws. That is a training problem, to be analysed separately.
+\item The two are different models with the same parameters; a fit of one is not a fit of the other.
+\item In the old model a price change alters $Z(z)$ and so shifts which tastes are common. In the mixture model the
+  distribution of tastes is fixed by the prior, and prices change only what each taste buys.
+\item The mixture model removes the hidden peaks; it does not by itself make training correct. In the full real fit
+  the held-out log-likelihood on all 1{,}024 validation trips fell from $-38.10$ at step 240 to $-38.76$ at the end
+  (paired difference $-0.66\pm0.08$). That is a training problem, to be analysed separately.
 \end{itemize}
 
 \end{document}

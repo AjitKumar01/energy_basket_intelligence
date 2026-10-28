@@ -503,3 +503,21 @@ def test_add_blocks_starts_the_mixture_fit():
         g = getattr(model, name).grad
         assert g is not None and bool(torch.isfinite(g).all()) and float(g.abs().max()) > 0.0, name
 
+
+
+def test_hier_prior_em_update_and_penalty():
+    """HierPrior: the penalty is the Gaussian -log prior over N trips; the EM step sets m to the row mean
+    and s2 to the mean of (x - m)^2 plus the posterior variance 1 / (A + 1 / s2) (v4/hier_prior.py)."""
+    from v4.hier_prior import HierPrior
+    model = make_model()
+    hp = HierPrior(model, names=("beta",))
+    b = hp.blocks["beta"]
+    x = model.beta.detach()
+    s2 = b["s2"].clone()
+    assert abs(float(hp.penalty(10.0)) - float(0.5 * ((x - x.mean(0)).square() / s2).sum() / 10.0)) < 1e-12
+    A = torch.rand(x.shape, generator=torch.Generator().manual_seed(1)) * 5.0
+    b["A"].copy_(A)
+    hp.update()
+    expected = ((x - x.mean(0)).square() + 1.0 / (A + 1.0 / s2)).mean(0)
+    assert torch.allclose(b["s2"], expected, atol=1e-12) and torch.allclose(b["m"], x.mean(0))
+    assert float(b["A"].abs().max()) == 0.0

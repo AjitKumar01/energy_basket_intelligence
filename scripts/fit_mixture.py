@@ -18,6 +18,9 @@ centred at the base model's values.  Every --every steps:
                      second moment of z (mixture.whiten_), estimated with --whiten-K draws on
                      --whiten-trips fixed training trips (the K training draws overstate it)
 
+--hier-prior (docs/overfitting_theory.pdf, Section 4): every household and product-context row gets
+the prior N(m, diag s2) of its block, and m, s2 are re-estimated by EM every --em-every steps.
+
 Each trip's posterior peak is kept and starts its search on the next epoch.  Validation (every
 --val-every steps and at the end): the mixture log-likelihood of the first --val-eval held-out trips
 (K = --val-K draws; a lower bound in expectation) and the size of exact draws for --val-gen trips.
@@ -51,6 +54,7 @@ from v4.bundle import data_root, load_bundle, supported_trips  # noqa: E402
 from v4.checkpoints import batcher_for, load_additive, load_model  # noqa: E402
 from v4.competition_iv import estimate_competition_iv  # noqa: E402
 from v4.constraints import category_capacities  # noqa: E402
+from v4.hier_prior import HierPrior  # noqa: E402
 from v4.training import CONTEXT_NAMES, Priors, add_blocks, penalties, project  # noqa: E402
 
 
@@ -111,6 +115,10 @@ def parse_args():
     p.add_argument("--u-cat-prec", type=float, default=2.0)
     p.add_argument("--rec-prec", type=float, default=2.0)
     p.add_argument("--promo-dev-prec", type=float, default=4.0, help="--promo-common: prior on the deviations")
+    p.add_argument("--hier-prior", action="store_true",
+                   help="EXPERIMENTAL, did not fix the overfitting (docs/BRIEF_mixture_overfitting.md): Gaussian priors with estimated scales on the household (theta, gamma) and product-context "
+                        "(alpha, beta, mu, zeta) blocks (v4/hier_prior.py); gamma, beta leave the price prior")
+    p.add_argument("--em-every", type=int, default=0, help="--hier-prior: steps between scale updates (0: one epoch)")
     p.add_argument("--seed", type=int, default=41001)
     p.add_argument("--start-step", type=int, default=0,
                    help="with --init: the step its checkpoint was saved at (same seed and epochs)")
@@ -234,6 +242,18 @@ def main():
             emit({"event": "comp_iv", "step": 0, **estimate_competition_iv(model, iv_batches, batcher),
                   "iv_trips": int(sum(len(b) for b in iv_batches)), "iv_seconds": round(time.time() - t_iv, 1)})
     price_init = blob["price_init"]
+    hier = None
+    if args.hier_prior or "hier_prior" in blob:
+        if fresh or "hier_prior" in blob:
+            hier = HierPrior(model)
+            if "hier_prior" in blob:
+                hier.load(blob["hier_prior"])
+        else:
+            raise SystemExit("--hier-prior cannot be switched on when continuing a fit without it")
+        price_init = {k: v for k, v in price_init.items() if k not in hier.blocks}
+        emit({"event": "hier_prior_init", **{n: {"s2_mean": round(float(b["s2"].mean()), 5)}
+                                            for n, b in hier.blocks.items()}})
+    em_every = args.em_every or len(batches)
     priors = Priors(args.pool_prod, args.phi_prec, args.delta_prec, args.rho_c_prec, args.f_extra_prec,
                     args.price_prec, args.u_cat_prec, args.rec_prec, args.promo_dev_prec if promo_common else 0.0)
     rec_params = ([model.psi, model.psi_item] if recency else []) + (
@@ -257,6 +277,8 @@ def main():
         out["model"] = {k: v.detach().clone() for k, v in model.state_dict().items()}
         out.update(form="mixture", stage=stage, seconds=time.time() - started,
                    mixture_args={k: str(v) for k, v in vars(args).items()})
+        if hier is not None:
+            out["hier_prior"] = hier.state()
         torch.save(out, path)
 
     def validate(step):
@@ -313,9 +335,14 @@ def main():
         zz += torch.einsum("kb,kbi,kbj->ij", info["w"], info["zs"], info["zs"])
         zz_n += len(pos)
         delta = model.phi[:, :r] - model.psi_cat[cat]
-        loss = -ll.mean() + penalties(model, priors, N, model.psi_cat, delta, price_init, recency)
         opt.zero_grad(set_to_none=True)
-        loss.backward()
+        (-ll.mean()).backward()                                  # the likelihood alone first, so that
+        if hier is not None:                                     # its gradients give the curvature
+            hier.accumulate(len(pos))
+        prior = penalties(model, priors, N, model.psi_cat, delta, price_init, recency)
+        if hier is not None:
+            prior = prior + hier.penalty(N)
+        prior.backward()
         grads = [model.rho_0_free.grad.detach().clone(), model.rho_c.grad.detach().clone(),
                  model.lam.grad.detach().clone()]
         g_sums = grads if g_sums is None else [a + b for a, b in zip(g_sums, grads)]
@@ -340,6 +367,8 @@ def main():
                   "train_draws_trace_over_rank": round(train_trace, 3),
                   "steps_seconds": round(time.time() - t_block, 1)})
             g_sums, g_count, zz, zz_n, t_block = None, 0, torch.zeros(r, r), 0, time.time()
+        if hier is not None and step % em_every == 0:
+            emit({"event": "hier_prior", "step": step, **hier.update()})
         if competition and step % comp_every == 0:
             t_iv = time.time()
             emit({"event": "comp_iv", "step": step, **estimate_competition_iv(model, iv_batches, batcher),

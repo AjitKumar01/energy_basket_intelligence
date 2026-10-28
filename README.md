@@ -66,5 +66,27 @@ tail -f runs/commodity/mixture.log                       # one JSON row per vali
 tail -f runs/commodity/4_mixture.out                     # everything, including errors
 ```
 
+## 4. Synthetic world
+
+A synthetic world with a known true law is fitted the same way: point `ENERGY_MODEL_DATA_ROOT`
+at its bundle and give its initialization and base model. The generator is not on this branch;
+the world used so far is `disc_c48_s3` (48 categories, 522 products, true within-category
+competition 0.05), built on branch `v4-scale`, with its base model fitted for baskets of up to
+80 products in `runs/syn_giant/`:
+
+```bash
+mkdir -p runs/syn_mixture
+ENERGY_MODEL_DATA_ROOT=/path/to/disc_c48_s3/world/model_input_category \
+OMP_NUM_THREADS=4 nohup python3 -u scripts/fit_mixture.py \
+  --initialization runs/syn_giant/init_nmax80.pt --additive runs/syn_giant/additive_nmax80.pt \
+  --out runs/syn_mixture/mixture --recency --centre-history mean --within-competition --promo-common \
+  --max-per-category 40 --batch 64 --epochs 2 --val-every 30 --threads 4 \
+  > runs/syn_mixture/fit.out 2>&1 &
+```
+
+Settings are those of the real-data recipe except `--batch 64` (7,695 training trips) and
+`--val-every 30`. About 2 seconds per step, 242 steps. Read `mixture.log` as in §3; the
+`comp_iv` rows can be compared with the true competition weight.
+
 The earlier energy form, its checks and its history are on the branches `v4-final` and
 `v4-giant-mode`.

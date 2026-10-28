@@ -1,22 +1,18 @@
-"""Objectives and projections for training the full Version-4 model.
+"""Building and constraining the full model for training (scripts/fit_mixture.py).
 
-The model trained here has every Version-4 block: count potentials f_c (M1), tied
-interactions phi_j = psi_c(j) + delta_j with presence coupling (M2), the size potential on
-categories present (M3), household taste per category (M4a); optionally purchase history
-and M4c.  Two objectives:
-
-  pseudo-likelihood   sum over slots of log P(x_j | the rest of the basket): exact and
-                      cheap, used to warm up phi.
-  SML                 stochastic maximum likelihood: log p(S) = E(S) - log Z, with the
-                      gradient of log Z estimated by one exact DP per trip at a z drawn
-                      from a persistent Gibbs chain (see scripts/fit_interactions.py).
+``add_blocks`` puts every Version-4 block on the exact base model: count potentials f_c
+(M1), tied interactions phi_j = psi_c(j) + delta_j with presence coupling (M2), the size
+potential on categories present (M3), household taste per category (M4a); optionally
+purchase history, its centring, within-category competition and common promotion slopes.
+``penalties`` is the Gaussian prior on these blocks, ``project`` the gauges and bounds
+applied after every update.  The objective itself, the mixture log-likelihood, is in
+v4/mixture.py.
 """
 from __future__ import annotations
 
 from dataclasses import dataclass
 
 import torch
-import torch.nn.functional as F
 
 from .constraints import project_category_reward_
 
@@ -24,66 +20,6 @@ from .constraints import project_category_reward_
 BASE_NAMES = ("lam", "alpha", "theta", "rho_c", "rho_0_free", "w_dsp", "w_mlr", "mu", "delta",
               "zeta", "xi")
 CONTEXT_NAMES = ("alpha", "theta", "w_dsp", "w_mlr", "mu", "delta", "zeta", "xi")
-
-
-def require_full_model(model):
-    if model.f_extra is None or model.psi_cat is None or not model.size_on_categories:
-        raise ValueError("training expects the full Version-4 model (M1, M2 and M3)")
-
-
-def conditional_log_odds(model, ix, X):
-    """For every slot j, d_j = E(S with j) - E(S without j), S = the basket X, so that
-    P(j in S | the rest) = sigmoid(d_j).  Exact: the normaliser cancels.  Also returns the
-    size of the basket without j at every slot.
-
-        d_j = b_j + pair_j - category_j - size_j (+ M4c term if j opens its category)
-
-    where pair_j is the change in the M2 pair term, category_j the change in
-    rho_c C(n_c, 2) + f_c(n_c), and size_j the change in rho_0 of the number of categories."""
-    require_full_model(model)
-    x = X.double()
-    ph = model.phi_r()[ix.item]
-    n_row = torch.zeros(ix.n_rows).index_add(0, ix.row_of, x)
-    others = n_row[ix.row_of] - x                       # same-category products besides j
-    cat = ix.row_cat[ix.row_of]
-
-    # M2 pair term: with other products of the category present, j contributes delta_j
-    # (phi_j - psi_c); as the first of its category it contributes phi_j.
-    s = model.basket_field(ix, X)
-    psi = model.psi_cat[cat]
-    dev = ph - psi
-    has_other = (others >= 1.0).double()
-    vec = torch.where(has_other[:, None] > 0.5, dev, ph)
-    s_without = s[ix.item_trip] - x[:, None] * vec
-    pair = (vec * s_without).sum(-1) - has_other * (psi * dev).sum(-1)
-
-    f = model.f_extra[cat]
-    category = (model.rho_c[cat] * (model.pair_feature(others + 1) - model.pair_feature(others))
-                + ((others == 1).double() * f[:, 0]
-                   + (others == 2).double() * (f[:, 1] - f[:, 0])
-                   + (others == 3).double() * (f[:, 2] - f[:, 1])))
-
-    n_without = (torch.zeros(ix.B).index_add(0, ix.item_trip, x)[ix.item_trip] - x).long()
-    opens = others == 0                                 # j would be its category's first
-    k_trip = torch.zeros(ix.B, dtype=torch.long).index_add(0, ix.row_trip, (n_row > 0).long())
-    k_without = (k_trip[ix.item_trip] - X.long() * opens.long()).clamp(min=0)
-    rho0 = model.rho_0()
-    size = opens.double() * (rho0[(k_without + 1).clamp(max=model.nmax)] - rho0[k_without])
-
-    b = model.slot_utilities(ix)
-    d = b + pair - category - size
-    iv = model.iv_shift(ix, b_slot=b)
-    if iv is not None:
-        d = d + opens.double() * iv[ix.row_of]
-    return d, n_without
-
-
-def pseudo_loglik(model, ix, X):
-    """Mean over trips of sum_j log P(x_j | rest), exact, for slots of trips whose basket
-    without j has size in 1..nmax-1 (see conditional_log_odds)."""
-    d, n_without = conditional_log_odds(model, ix, X)
-    valid = (n_without > 0) & (n_without < model.nmax)
-    return (F.logsigmoid(torch.where(X, d, -d)) * valid).sum() / ix.B
 
 
 @dataclass
@@ -144,3 +80,39 @@ def project(model, capacities, optimizer):
         # Keep each count potential from undoing the rho_c floor.
         mult = torch.tensor([1.0, 3.0, 6.0], dtype=model.rho_c.dtype)
         model.f_extra.copy_(torch.maximum(model.f_extra, -1.5 - model.rho_c[:, None] * mult[None, :]))
+
+
+def add_blocks(model, rank, *, phi_init=0.05, recency=False, centre_history=None,
+               within_competition=False, comp_init=0.0, gen=None):
+    """Create the Version-4 parameters on the base model (phi = 0), in place; returns
+    (psi_cat, category of each product).  Every new block starts at zero except psi_cat,
+    which starts at phi_init * N(0, 1) so the taste directions are not all equal."""
+    P = torch.nn.Parameter
+    C = model.C
+    model.f_extra = P(torch.zeros(C, 3))
+    model.u_cat = P(torch.zeros(C, model.theta.shape[1]))
+    if within_competition:
+        model.comp_raw = P(torch.full((C,), float(comp_init)))
+    if recency:
+        model.psi_item = P(torch.zeros(C, 3))
+        with torch.no_grad():
+            model.psi.zero_()
+    if centre_history:
+        model.hist_size = P(torch.zeros(()))
+        model.centre_history = centre_history
+    # M3: move the linear part of rho_0 (its slope over sizes 1..10, or 1..nmax if smaller)
+    # into lam, then let rho_0 act on the number of categories present.
+    model.size_on_categories = True
+    with torch.no_grad():
+        top = min(10, model.rho_0_free.numel()) - 1
+        slope = (model.rho_0_free[top] - model.rho_0_free[0]) / top
+        model.lam.sub_(slope)
+        model.rho_0_free.sub_(slope * torch.arange(1, model.rho_0_free.numel() + 1))
+        model.rho_0_free.sub_(model.rho_0_free[0].clone())
+    model.rank = rank
+    category = model.cat_of.long()
+    model.psi_cat = P(phi_init * torch.randn(C, rank, generator=gen))
+    with torch.no_grad():
+        model.phi.zero_()
+        model.phi[:, :rank] = model.psi_cat[category]
+    return model.psi_cat, category

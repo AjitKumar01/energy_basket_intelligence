@@ -2,7 +2,7 @@
 
     exact_dp    PyTorch C++ extension: per-row elementary symmetric polynomials and the
                 product of category polynomials over sizes, with backward passes
-    sampler     plain C library (ctypes): exact sampling, Gibbs sweeps, the 2-D size DP
+    sampler     plain C library (ctypes): exact sampling given z, log Z_z, the 2-D size DP
 
 Both are written to build/native/ in the repository and rebuilt when their source changes.
 The compiler is $CXX if set, else clang++, else g++.
@@ -68,16 +68,11 @@ def sampler():
         so = ctypes.CDLL(str(lib))
         I, U, D, P = ctypes.c_int64, ctypes.c_uint64, ctypes.c_double, ctypes.c_void_p
         so.sample_slots_cpp.argtypes = [I] * 8 + [U] + [P] * 12
-        so.gibbs_sweeps_cpp.argtypes = [I] * 10 + [D, U] + [P] * 15
-        so.gibbs_stages_cpp.argtypes = [I] * 11 + [P] * 21
-        so.gibbs_four_chains_cpp.argtypes = [I] * 11 + [P] * 4 + [I] + [P] * 25
         so.log_partition_cpp.argtypes = [I] * 8 + [P] * 13
-        so.log_partition_batch_z_cpp.argtypes = [I] * 10 + [D] + [P] * 15
         so.log_degree_2d_forward_cpp.argtypes = [I] * 4 + [P] * 7
         so.log_degree_2d_grad_cpp.argtypes = [I] * 4 + [P] * 5
-        for f in (so.sample_slots_cpp, so.gibbs_sweeps_cpp, so.gibbs_stages_cpp,
-                  so.gibbs_four_chains_cpp, so.log_partition_cpp, so.log_partition_batch_z_cpp,
-                  so.log_degree_2d_forward_cpp, so.log_degree_2d_grad_cpp):
+        for f in (so.sample_slots_cpp, so.log_partition_cpp, so.log_degree_2d_forward_cpp,
+                  so.log_degree_2d_grad_cpp):
             f.restype = ctypes.c_int
         _sampler = so
     return _sampler

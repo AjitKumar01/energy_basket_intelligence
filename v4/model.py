@@ -321,7 +321,7 @@ class BasketModel(torch.nn.Module):
 
     def basket_field(self, ix, X):
         """s(S) = sum_{j in S} phi_j, minus psi_c per extra product of a category with M2.
-        The Gibbs chain draws z ~ N(s(S), I)."""
+        The posterior of the taste z given S is proportional to N(z; 0, I) exp(z . s(S)) / Z_z."""
         x = X.double()
         s = torch.zeros(ix.B, self.rank).index_add_(0, ix.item_trip, self.phi_r()[ix.item] * x[:, None])
         if self.psi_cat is not None:

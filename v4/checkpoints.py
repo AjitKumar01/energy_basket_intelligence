@@ -2,7 +2,7 @@
 
     initialization   untrained starting values and the model's sizes (scripts/initialize.py)
     additive         the exact base model, phi = 0 (scripts/fit_additive.py)
-    version-4        the full model with interactions (scripts/fit_interactions.py)
+    version-4        the full model with interactions, in the mixture form (scripts/fit_mixture.py)
 
 Each later file records the earlier ones it was built from, so loading a Version-4 model
 needs only its own path.  Older checkpoints written by the research code (branch

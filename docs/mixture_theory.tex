@@ -71,11 +71,14 @@ $\psi_c\in\R^r$ & category & taste loading of an \emph{extra} product of categor
 $\rho_c$ & category & penalty per pair of products within $c$ & yes\\
 $f_c(2),f_c(3),f_c(\ge4)$ & category & free penalty on holding 2, 3, $\ge4$ products of $c$ & yes\\
 $\rho_0(1..n_{\max})$ & count & size potential on $m$, the number of categories present & yes\\
-rest of $b_{tj}$ & & context utility, \eqref{eq:b} & no\\\bottomrule
+rest of $b_{tj}$ & & context utility, \eqref{eq:b} & yes${}^{*}$\\\bottomrule
 \end{tabular}
 \end{center}
-Parameters that are not trained keep the values of the Version-4 checkpoint the fit starts from,
-\texttt{runs/commodity/\allowbreak v4\_comp\_promo.pt}.
+The fit (\texttt{scripts/fit\_mixture.py}) starts from the exact additive base model ($\phi=0$) and trains
+every parameter except the within-category competition weights in $b_{tj}$, which the price instrument
+re-estimates once per epoch. ${}^{*}$The real-data fit of Section~\ref{sec:evidence} is older: it started from
+the earlier form's checkpoint \texttt{runs/commodity/\allowbreak v4\_comp\_promo.pt} and kept the rest of
+$b_{tj}$ at its values.
 
 \subsection{Context utility}
 
@@ -409,7 +412,10 @@ Let $\vartheta$ be the trained parameters (Section~2.1) and $t=1,\dots,N$ the tr
 \frac1N\sum_{t=1}^N\log p_\vartheta(S_t)\ -\ \frac{1}{N}\Pi(\vartheta),\qquad
 \Pi=\tfrac12\Big[20\sum_c\lVert\psi_c\rVert^2+200\sum_j\lVert\phi_j-\psi_{c(j)}\rVert^2+0.2\sum_c\rho_c^2+2\sum_{c,i}f_{c,i}^2\Big],
 \]
-a Gaussian prior that keeps each product's loading near its category's. Since $\log p_\vartheta(S_t)$ is not
+a Gaussian prior that keeps each product's loading near its category's, plus the Gaussian priors on the
+rest of $b_{tj}$: price parameters centred at the base model's values, the household taste per category
+and the history terms at zero, and a pooling penalty on the three product-by-context factorisations
+(\texttt{v4/training.py}). Since $\log p_\vartheta(S_t)$ is not
 available, training maximises the $K$-sample bound of Proposition~\ref{prop:is},
 \begin{equation}
 \mathcal L_K(\vartheta)=\frac1N\sum_t\E_{z_{t,1..K}\sim q_t}\Big[\log\frac1K\sum_{k=1}^K
@@ -540,6 +546,7 @@ forms are different laws with the same parameters, so one can start the fit of t
 
 %======================================================================
 \section{Evidence so far}
+\label{sec:evidence}
 
 \paragraph{Exactness.} In the test world (6 products, 3 categories, $r=2$) and all 11 model variants,
 $\log p(S\mid z)$ from \eqref{eq:cond}--\eqref{eq:Z} equals enumeration of every basket to $10^{-9}$, and the
@@ -568,8 +575,10 @@ has reached the 120 cap at any point.
 \item The whitening step is approximate (Section~\ref{sec:whiten}).
 \item The trained bound \eqref{eq:obj} with $K=8$ is below $\log p$; how much it biases the fitted parameters
   is measured only indirectly (validation at $K=256$).
-\item Only $\lambda,\phi,\psi,\rho_0,\rho_c,f$ are trained; price, promotion, competition and history terms keep the
-  earlier fit's values, and the price and promotion checks have to be re-run on this form.
+\item In the real-data fit of Section~\ref{sec:evidence} only $\lambda,\phi,\psi,\rho_0,\rho_c,f$ were trained;
+  price, promotion, competition and history terms kept the earlier fit's values. The fit from the additive
+  base model, which trains them all, has not been run yet, and the price and promotion checks have to be
+  re-run on this form.
 \item The prior is one Gaussian. A mixture of a few Gaussians would keep Proposition~\ref{prop:concave} within each component.
 \end{itemize}
 

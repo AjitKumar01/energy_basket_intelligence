@@ -10,7 +10,7 @@ from tiny import (NMAX, RANK, baskets_of, energy_given_z, full_energy, log_sum_e
 from v4 import exact, mixture, sampling
 from v4.competition_iv import competition_moments, estimate_competition_iv, jackknife_se
 from v4.price import changed_price_context, own_price_tilt
-from v4.training import Priors, penalties, pseudo_loglik
+from v4.training import Priors, add_blocks, penalties
 
 BLOCKS = {
     "additive": {},
@@ -109,62 +109,6 @@ def test_sampler_matches_exact_marginals(cap):
     sizes = torch.zeros(2 * reps).index_add_(0, ix.item_trip, X.double())
     assert int(sizes.min()) >= 1 and int(sizes.max()) <= NMAX
     assert int(torch.zeros(ix.n_rows).index_add_(0, ix.row_of, X.double()).max()) <= cap
-
-
-@pytest.mark.parametrize("name", ["all", "all-competition"])
-def test_gibbs_and_importance_sampling_match_full_law(name):
-    model = make_model(**BLOCKS[name])
-    base = make_batch()
-    base.bind(model)
-    ix0 = base.ix
-    b0, iv0 = model.slot_utilities(ix0).detach(), model.iv_shift(ix0)
-    iv0 = None if iv0 is None else iv0.detach()
-    exact_lz, exact_inc = [], torch.zeros(len(ix0.item))
-    for t in range(2):
-        energies = {S: full_energy(model, ix0, b0, iv0, S) for S in baskets_of(ix0, t)}
-        lz = log_sum_exp(list(energies.values()))
-        exact_lz.append(lz)
-        for S, e in energies.items():
-            for s in S:
-                exact_inc[s] += math.exp(e - lz)
-    est, _, _, _ = sampling.importance_log_z(model, ix0, torch.Generator().manual_seed(6), burn=50,
-                                             components=16, thin=2, draws=512)
-    assert max(abs(float(est[t]) - exact_lz[t]) for t in range(2)) < 0.02
-
-    reps = 4000
-    from v4.batches import RaggedIndex
-    T = len(ix0.item)
-    ix = RaggedIndex(ix0.item.repeat(reps),
-                     (ix0.row_of[None, :] + ix0.n_rows * torch.arange(reps)[:, None]).reshape(-1),
-                     (ix0.row_trip[None, :] + 2 * torch.arange(reps)[:, None]).reshape(-1),
-                     ix0.row_cat.repeat(reps), 2 * reps)
-    base.ix, base.house = ix, torch.tensor([0, 1]).repeat(reps)
-    base.ctx = {k: v.repeat(reps, *[1] * (v.dim() - 1)) for k, v in base.ctx.items()}
-    base.bind(model)
-    X = sampling.draw_from_model(model, ix, torch.Generator().manual_seed(7), burn=60)
-    freq = X.double().view(reps, T).mean(0)
-    assert float((freq - exact_inc).abs().max()) < 0.03
-
-
-@pytest.mark.parametrize("name", ["all", "all-competition"])
-def test_pseudo_likelihood_is_exact_conditionals(name):
-    model = make_model(**BLOCKS[name])
-    batch = make_batch(basket=((0, 1, 3), (0, 5)))
-    batch.bind(model)
-    ix = batch.ix
-    b, iv = model.slot_utilities(ix), model.iv_shift(ix)
-    total = 0.0
-    for t in range(2):
-        S = {s for s in range(len(ix.item)) if batch.observed[s] and int(ix.item_trip[s]) == t}
-        for s in (s for s in range(len(ix.item)) if int(ix.item_trip[s]) == t):
-            without = S - {s}
-            if not 0 < len(without) < NMAX:
-                continue
-            e_in = full_energy(model, ix, b, iv, tuple(sorted(without | {s})))
-            e_out = full_energy(model, ix, b, iv, tuple(sorted(without)))
-            e_obs = e_in if s in S else e_out
-            total += e_obs - log_sum_exp([e_in, e_out])
-    assert abs(float(pseudo_loglik(model, ix, batch.observed)) - total / 2) < 1e-10
 
 
 def test_discount_split_starts_at_one_slope_model():
@@ -280,38 +224,6 @@ def test_competition_moves_purchases_within_the_category():
     assert float((with_block - without).abs().max()) < 1e-12
 
 
-def test_existing_m4c_checkpoint_loads_and_scores_unchanged():
-    """An existing M4c state dict (with iv_slope_raw and no comp_raw) loads into BasketModel
-    and scores identically to the original once-per-category M4c law, including multi-item
-    category baskets where M4c charges iv_shift once per present category."""
-    src = make_model(**BLOCKS["all"])
-    state = {k: v.detach().clone() for k, v in src.state_dict().items()}
-    assert "iv_slope_raw" in state and "comp_raw" not in state
-
-    dst = make_model()                                            # bare model, optional blocks created on load
-    dst.size_on_categories = True
-    dst.centre_history = "inclusive"
-    dst.rank = RANK
-    dst.load_fitted_state(state)
-    assert dst.iv_slope_raw is not None and dst.comp_raw is None
-
-    # Use a basket with 2 items in category 0 ((0, 1, 3)) so once-per-category M4c vs per-item
-    # competition would differ if M4c were altered.
-    batch = make_batch(basket=((0, 1, 3), (0, 5)))
-    batch.bind(dst)
-    ix = batch.ix
-    b, iv = dst.slot_utilities(ix), dst.iv_shift(ix)
-    e = dst.energy(batch)
-    observed = [tuple(s for s in range(len(ix.item)) if batch.observed[s] and int(ix.item_trip[s]) == t)
-                for t in range(2)]
-    for t in range(2):
-        assert abs(float(e[t]) - full_energy(dst, ix, b, iv, observed[t])) < 1e-12
-    pl_dst = float(pseudo_loglik(dst, ix, batch.observed))
-    batch.bind(src)
-    assert abs(pl_dst - float(pseudo_loglik(src, ix, batch.observed))) < 1e-12
-    assert torch.allclose(e, src.energy(batch), atol=1e-12, rtol=0)
-
-
 def test_instrument_estimator_updates_comp_raw():
     """The exogenous price-instrument Wald IV estimator runs on a competition model and sets
     finite comp_raw logits in (0.01, 0.99) without touching M4c."""
@@ -408,9 +320,9 @@ def test_promo_deviation_prior():
 
 
 @pytest.mark.parametrize("name", ["additive", "M3", "all", "all-competition"])
-def test_fast_log_partition_and_batch_z_against_enumeration(name):
-    """Fused C++ log_partition_cpp and log_partition_batch_z_cpp (including dynamic item-axis
-    truncation with trunc_min_cap=1 and fallback at large z) match basket enumeration."""
+def test_fast_log_partition_against_enumeration(name):
+    """The fused C++ log_partition_cpp (including dynamic item-axis truncation with
+    trunc_min_cap=1 and its fallback at large z) matches basket enumeration."""
     model = make_model(**BLOCKS[name])
     model.trunc_min_cap = 1
     batch = make_batch()
@@ -418,71 +330,23 @@ def test_fast_log_partition_and_batch_z_against_enumeration(name):
     ix = batch.ix
     b = model.slot_utilities(ix).detach()
     iv = model.iv_shift(ix, b_slot=b)
-    ph_slot = model.phi_r()[ix.item].detach().contiguous()
-    u0 = (b - 0.5 * ph_slot.square().sum(-1)).contiguous()
 
-    # Check both moderate z (where truncation can trigger if tail is tiny) and extreme z
-    # (where mass near nmax forces fallback to full cap).
+    # Moderate z (where truncation can trigger if the tail is tiny) and extreme z (where mass
+    # near nmax forces the fallback to the full cap).
     g = torch.Generator().manual_seed(42)
     z_draws = torch.cat([
         torch.randn(2, 4, RANK, generator=g) * 0.5,
         torch.randn(2, 4, RANK, generator=g) * 6.0,
         torch.full((2, 2, RANK), -8.0),
-    ], dim=1).contiguous()
-    D = z_draws.shape[1]
-
-    from v4.kernels import check, ptr, sampler
-    a = sampling._arrays(model, iv=iv, psi=model.psi_cat)
-    K_max = sampling._max_count(model, ix)
-    out_batch = torch.empty((2, D), dtype=torch.float64)
+    ], dim=1)
     with torch.no_grad():
-        check(sampler().log_partition_batch_z_cpp(
-            2, D, ix.n_rows, len(ix.item), ix.Cpad, K_max, int(model.nmax), RANK,
-            int(model.size_on_categories), 1, 1.0,
-            ptr(u0), ptr(ph_slot), ptr(z_draws), ptr(ix.row_of), ptr(ix.item_pos),
-            ptr(ix.row_size), ptr(ix.row_cat), ptr(ix.row_trip), ptr(ix.flat_slot),
-            ptr(a["rho_c"]), ptr(a["rho_0"]), ptr(a["f_extra"]), ptr(a["psi"]),
-            ptr(a["iv"]), ptr(out_batch)), "log_partition_batch_z")
-
-        for d in range(D):
+        for d in range(z_draws.shape[1]):
             zd = z_draws[:, d]
             ud = model.slot_utilities_given_z(ix, zd, b=b).detach()
             lz_fast = exact.log_partition(model, ix, ud, z=zd, iv=iv)
             for t in range(2):
                 energies = [energy_given_z(model, ix, ud, zd, iv, S) for S in baskets_of(ix, t)]
-                lz_enum = log_sum_exp(energies)
-                assert abs(float(lz_fast[t]) - lz_enum) <= 1e-8
-                assert abs(float(out_batch[t, d]) - lz_enum) <= 1e-8
-
-
-def test_single_basket_four_chains_and_truncated_sampler_against_enumeration():
-    """Single-basket (B=1) parallel 4-chain importance_log_z and truncated sampler match
-    exact enumeration of the full model."""
-    model = make_model(**BLOCKS["all"])
-    model.trunc_min_cap = 1
-    base = make_batch()
-    base.bind(model)
-    ix0 = base.ix
-    b0, iv0 = model.slot_utilities(ix0).detach(), model.iv_shift(ix0)
-    iv0 = None if iv0 is None else iv0.detach()
-    energies0 = {S: full_energy(model, ix0, b0, iv0, S) for S in baskets_of(ix0, 0)}
-    exact_lz0 = log_sum_exp(list(energies0.values()))
-
-    # Build a single-trip (B=1) Batch for trip 0 to exercise gibbs_four_chains_cpp.
-    from v4.batches import RaggedIndex
-    slot_mask0 = ix0.item_trip == 0
-    row_mask0 = ix0.row_trip == 0
-    ix1 = RaggedIndex(ix0.item[slot_mask0], ix0.row_of[slot_mask0],
-                      ix0.row_trip[row_mask0], ix0.row_cat[row_mask0], 1)
-    base.ix = ix1
-    base.house = base.house[:1]
-    base.ctx = {k: (v[:1] if k == "dlp_bar" else v[slot_mask0]) for k, v in base.ctx.items()}
-    base.bind(model)
-
-    est1, _, _, X_out = sampling.importance_log_z(
-        model, ix1, torch.Generator().manual_seed(19), burn=50, components=16, thin=2, draws=512)
-    assert abs(float(est1[0]) - exact_lz0) < 0.02
-    assert 1 <= int(X_out.sum()) <= NMAX
+                assert abs(float(lz_fast[t]) - log_sum_exp(energies)) <= 1e-8
 
 
 @pytest.mark.parametrize("name", ["additive", "M1", "M2", "M3", "all", "all-competition"])
@@ -612,3 +476,30 @@ def test_mixture_whitening_keeps_the_law():
     after = [_mixture_log_lik_by_quadrature(model, ix, iv, obs, t) for t in range(ix.B)]
     for t in range(ix.B):
         assert abs(before[t] - after[t]) < 1e-9
+
+
+def test_add_blocks_starts_the_mixture_fit():
+    """add_blocks turns the additive model into the full model the mixture fit trains: phi tied to
+    its category's psi, new blocks at zero, M3 gauge rho_0(1) = 0; the importance log-likelihood is
+    then differentiable in every trained block, including context, price and the new ones."""
+    model = make_model(discount=True)
+    with torch.no_grad():
+        model.phi.zero_()
+    psi, cat = add_blocks(model, RANK, phi_init=0.3, recency=True, centre_history="mean",
+                          within_competition=True, gen=torch.Generator().manual_seed(3))
+    assert torch.equal(model.phi[:, :RANK], psi[cat]) and float(model.phi[:, RANK:].abs().max()) == 0.0
+    assert model.size_on_categories and float(model.rho_0_free[0]) == 0.0
+    for name in ("f_extra", "u_cat", "psi_item", "hist_size"):
+        assert float(getattr(model, name).abs().max()) == 0.0
+    trained = ("phi", "psi_cat", "lam", "rho_c", "rho_0_free", "f_extra", "u_cat", "alpha", "theta",
+               "w_dsp", "gamma", "beta", "disc_common", "psi", "psi_item")
+    for name in trained:
+        getattr(model, name).requires_grad_(True)
+    batch = make_batch()
+    batch.bind(model)
+    ll, _, _ = mixture.log_lik(model, batch, torch.Generator().manual_seed(0), K=16, grad=True)
+    ll.sum().backward()
+    for name in trained:
+        g = getattr(model, name).grad
+        assert g is not None and bool(torch.isfinite(g).all()) and float(g.abs().max()) > 0.0, name
+

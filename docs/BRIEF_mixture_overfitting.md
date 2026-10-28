@@ -3,7 +3,10 @@
 Repository: `/Users/ajit/Projects/nf_dunnhumby/ebi_v4_final`, branch **`v4-mixture`**.
 Read first: `docs/why_mixture.pdf` (the model and why it has this form),
 `docs/mixture_theory.pdf` (the full theory: prior, law given z, likelihood estimate, training),
-`docs/overfitting_theory.pdf` (my analysis so far; its Section 4 fix **did not work**, see §2.4).
+`docs/overfitting_theory.pdf` (the analysis so far; its Section 4 fix **did not work**, see §2.4).
+
+This brief is self-contained: everything you need to know about earlier work is in it or in
+those three documents.
 
 ## 1. The question
 
@@ -221,6 +224,16 @@ exactly.
   possible. No hedged averages. Say plainly what was not verified.
 - **Theory first:** for every fit you run, state beforehand which hypothesis it tests and what result
   would refute it.
+- **Writing for the user:**
+  - Use simple words, and keep a strict logical order: what is modelled, then the definitions, then
+    the argument, then the measurement.
+  - Define every symbol before you use it. Say where a quantity comes from, e.g. "Z(z) is the
+    normalising constant of the basket law given z".
+  - Explanations and reports go in TeX with a compiled PDF, not in Markdown or chat.
+- **Long jobs:** whenever you start one, give the exact `tail -f` command for its logs (absolute paths).
+  Report status before waiting on anything long; do not block silently.
+- **Logs:** line-buffered (`python3 -u`, `flush=True`). Never pipe a job's output through `grep` into
+  a file, and never edit a shell script while bash is running it.
 
 ## 6. What to send back
 

@@ -1,0 +1,263 @@
+\documentclass[11pt]{article}
+\usepackage[a4paper,margin=2.3cm]{geometry}
+\usepackage{amsmath,amssymb,amsthm,booktabs,microtype}
+\usepackage[hidelinks]{hyperref}
+\newtheorem{proposition}{Proposition}
+\newtheorem{definition}{Definition}
+\theoremstyle{remark}\newtheorem{remark}{Remark}
+\newcommand{\R}{\mathbb{R}}
+\newcommand{\E}{\mathbb{E}}
+\newcommand{\N}{\mathcal{N}}
+\title{Why the mixture fit overfits, and the fix}
+\author{Version-4 basket model, branch \texttt{v4-mixture}}
+\date{28 October 2026}
+\begin{document}
+\maketitle
+
+\noindent The mixture fit on the synthetic world \texttt{disc\_c48\_s3} gets worse on held-out trips after
+3.5 epochs while it keeps getting better on training trips. This note (1) states what was measured,
+(2) locates the parameters responsible, (3) explains why those parameters overfit and the
+taste $z$ does not, and (4) derives the fix. Nothing in Sections~4--5 has been run yet.
+
+%======================================================================
+\section{Setting and notation}
+
+The data are trips $t=1,\dots,T$. Trip $t$ belongs to household $h(t)$, and $S_t$ is its basket.
+The training trips of household $h$ are $\mathcal T_h$, and $n_h=|\mathcal T_h|$ is their number.
+In this world there are $T=7{,}695$ training trips and $H=928$ households, with $n_h$ of median 7 and mean 8.3.
+
+The model (\texttt{docs/mixture\_theory.pdf}) has three kinds of unknowns.
+\begin{enumerate}
+\item \textbf{The taste of a trip}, $z_t\in\R^r$ ($r=16$). It has the prior $z_t\sim\N(0,I)$ and is
+  \emph{integrated out}:
+  \begin{equation}\label{eq:marg}
+  p(S_t)=\int \N(z;0,I)\,p(S_t\mid z)\,dz .
+  \end{equation}
+\item \textbf{Household parameters}, one vector per household:
+  \[\eta_h=(\theta_h,\gamma_h)\in\R^{d_h},\qquad d_h=32+8=40.\]
+  Here $\theta_h\in\R^{32}$ is the household taste; its last coordinate is the household's size
+  shift. $\gamma_h\in\R^8$ gives the household's price slopes. Both enter the utility $b_{tj}$ of
+  every product $j$ on every trip of $h$.
+\item \textbf{Product and shared parameters}, written together as $\omega$. They include the
+  product context ($\alpha_j,\beta_j,\mu_j,\zeta_j$, display and mailer weights, recency loadings),
+  about 57 numbers per product. A product is bought a median 50 times in training, and 10\% of
+  products 6 times or fewer. They also include $\lambda_j$, $\phi_j$, $\psi_c$ and the size terms
+  $\rho_0,\rho_c,f_c$.
+\end{enumerate}
+The fit maximises over $\eta=(\eta_h)_h$ and $\omega$:
+\begin{equation}\label{eq:fit}
+J(\eta,\omega)=\sum_{t}\log p_{\eta_{h(t)},\omega}(S_t)\;-\;\Pi(\omega)\;-\;\Pi_{\rm pool}(\eta,\omega).
+\end{equation}
+In \eqref{eq:fit}, $\Pi$ is the Gaussian prior on $\phi,\psi,\rho_c,f$, on the price terms (centred at the
+base model) and on $u_c$. The term $\Pi_{\rm pool}$ is a pooling penalty on the products
+$\alpha_j\cdot\theta_h$, with weight $0.5$ in total over all $T$ trips. In practice it does not
+constrain $\theta_h$. So $\theta_h$ has, in effect, a flat prior.
+
+%======================================================================
+\section{What was measured}
+
+All scores below are on the same 1{,}024 held-out trips and the same 1{,}024 training trips, with
+$K=256$ importance draws per trip and the same random numbers for every checkpoint. The
+differences are paired, trip by trip.
+
+\begin{center}\small
+\begin{tabular}{lrrrr}\toprule
+checkpoint & held-out LL & training LL & training $-$ held-out & generated size (data 8.69)\\\midrule
+step 242 (2 epochs) & $-27.29$ & $-26.76$ & 0.54 & 8.57\\
+step 420 (best)     & $-26.84$ & $-25.84$ & 1.00 & 8.68\\
+step 1{,}210 (final)& $-27.02$ & $-24.54$ & 2.48 & 7.92\\\bottomrule
+\end{tabular}
+\end{center}
+From step 420 to 1{,}210, held-out trips lose $0.18\pm0.04$ nats and training trips gain
+$1.31\pm0.04$.
+
+\paragraph{Which parameters.} Take the final checkpoint and put one block back to its step-420
+value. If a block's late changes only memorised the training trips, putting it back should lose
+on training trips and gain on held-out trips.
+\begin{center}\small
+\begin{tabular}{lrrl}\toprule
+block put back to step 420 & held-out & training & reading\\\midrule
+household $\eta_h=(\theta_h,\gamma_h)$ & $+0.43\pm0.02$ & $-0.47\pm0.02$ & memorised\\
+product context ($\alpha,\beta,\mu,\zeta,w,\dots$) & $+0.25\pm0.02$ & $-0.49\pm0.02$ & memorised\\
+interactions ($\phi,\psi,\lambda$) & $-0.87\pm0.05$ & $-0.70\pm0.05$ & learned\\
+size ($\rho_0,\rho_c,f$) & $-0.49\pm0.04$ & $-0.64\pm0.04$ & coupled to the rest\\\bottomrule
+\end{tabular}
+\end{center}
+\begin{itemize}
+\item The late changes of the household and product-context blocks only memorise the training trips.
+\item The interactions keep learning something that also holds on held-out trips.
+\item The size block has adjusted to the other blocks; put back on its own, it generates baskets of 11 products.
+\item The final checkpoint with only the household block put back scores $-26.59$ on held-out trips,
+  better than the best checkpoint ($-26.84$). So the best checkpoint is already partly overfitted.
+\end{itemize}
+Splitting the training gain by household gives the same picture. Households with 0--4 training trips
+gain $+2.46$ per trip; those with 12 or more gain $+1.06$.
+
+%======================================================================
+\section{Why: the taste is integrated, the household parameters are not}
+
+\subsection{\texorpdfstring{The taste $z_t$ cannot overfit}{The taste z cannot overfit}}
+In \eqref{eq:marg}, $z_t$ is averaged over its prior; it is never fitted. A basket that would be
+explained well by some extreme $z$ gets credit only in proportion to $\N(z;0,I)$ times the volume of
+such $z$. There is no free per-trip number for the optimiser to tune. This is why the interaction
+block keeps generalising.
+
+\subsection{The household parameters are incidental parameters}
+\begin{definition}
+A parameter is \emph{incidental} when its number grows with the data, and each copy is informed by
+a bounded number of observations. Here there are $H$ copies of $\eta_h$, and each is informed by $n_h$ trips.
+\end{definition}
+\noindent For a regular model fitted by maximum likelihood, the standard expansion of the fitted
+log-likelihood (the expansion behind AIC and TIC) gives, for the $n_h$ trips of household $h$,
+\begin{equation}\label{eq:optimism}
+\E\Big[\sum_{t\in\mathcal T_h}\log p_{\hat\eta_h}(S_t)\Big]-\E\Big[\sum_{t\in\mathcal T_h}\log p_{\hat\eta_h}(S'_t)\Big]
+\;\approx\;\operatorname{tr}\!\big(\mathcal I_h^{-1}\mathcal J_h\big)\;\approx\;d_h .
+\end{equation}
+Here $\hat\eta_h$ is the maximum-likelihood estimate from $\mathcal T_h$, and $S'_t$ are fresh trips
+of the same household. $\mathcal I_h$ is the Fisher information of the $n_h$ trips and
+$\mathcal J_h$ the variance of their score; the trace equals $d_h$ when the model is correct.
+
+So, at convergence, the training-minus-held-out gap caused by the household block is about
+$d_h/n_h$ nats per trip. With $d_h=40$ and $n_h=7$ that is about $5.7$ nats. It does \emph{not}
+shrink as more households are added: $n_h$ stays at 7. The measured gap ($\approx0.9$ from this
+block after 10 epochs) is on its way there. The bigger gain for households with few trips is the
+$1/n_h$ in this bound. For products the same count gives about 57 numbers per product against a
+median 50 purchases. That gap is smaller, as measured, but not negligible for rare products.
+
+\subsection{Why the base model did not show it: early stopping was its prior}
+The base model (\texttt{fit\_additive.py}) fits the same $\eta_h$ and product context with weight
+decay $10^{-5}$, which is negligible. It stopped at its best validation score, iteration 800 of
+30{,}000. Early stopping acts as a prior.
+\begin{proposition}\label{prop:es}
+Take a quadratic loss $\tfrac12(\eta-\hat\eta)^\top A(\eta-\hat\eta)$ with $A\succ0$. Gradient descent
+with step $\epsilon$ from $\eta^{(0)}$, after $k$ steps, gives
+$\eta^{(k)}-\hat\eta=(I-\epsilon A)^k(\eta^{(0)}-\hat\eta)$. Along each eigen-direction of $A$ with
+eigenvalue $a$, this is the ridge (Gaussian-prior) estimate centred at $\eta^{(0)}$ with prior
+precision $\tau$, to first order, when $(1-\epsilon a)^k=\tau/(a+\tau)$, that is, $\tau\approx 1/(\epsilon k)$ for $\epsilon a k\ll1$.
+\end{proposition}
+\begin{proof}
+The ridge estimate is $\eta_\tau=\hat\eta+\tau(A+\tau I)^{-1}(\eta^{(0)}-\hat\eta)$. Along an
+eigenvector with eigenvalue $a$ its shrinkage factor is $\tau/(a+\tau)$, and that of gradient descent
+is $(1-\epsilon a)^k$. For $\epsilon a k\ll 1$, $(1-\epsilon a)^k\approx1-\epsilon ak$ and
+$\tau/(a+\tau)\approx 1-a/\tau$; these match when $\tau=1/(\epsilon k)$.
+\end{proof}
+\noindent The fits use Adam, not plain gradient descent, so for them the proposition holds only
+qualitatively: fewer steps act as a stronger prior centred at the start.
+So the base model's household and product-context terms were held near their starting
+values by a prior of precision about $1/(\epsilon k)$. Its strength was set by where training stopped.
+The mixture fit trains the same terms for 1{,}210 more steps. That weakens this implicit prior
+until nothing holds $\eta_h$ back. Choosing the best checkpoint on validation just re-introduces
+early stopping, one stopping time for all blocks. The blocks need different strengths: the
+interactions want to keep training, and the household terms want to stop.
+
+%======================================================================
+\section{The fix: a hierarchical prior with an estimated scale}
+
+Make the household and product-context parameters random effects with an explicit prior, in the
+same way as $z_t$.
+\begin{equation}\label{eq:prior}
+\theta_h\sim\N(0,\sigma_\theta^2 I),\qquad \gamma_h\sim\N(\bar\gamma,\sigma_\gamma^2 I),\qquad
+\xi_j\sim\N(0,\sigma_\xi^2 I),
+\end{equation}
+for each product-context block $\xi\in\{\alpha,\beta,\mu,\zeta,w,\dots\}$.
+The scales $\sigma^2$ are \emph{estimated} rather than set by hand, and the stopping time no longer
+matters.
+
+\paragraph{Step 1: the penalised fit (MAP).} For fixed scales, maximise
+\begin{equation}\label{eq:map}
+J_\sigma(\eta,\omega)=\sum_t\log p_{\eta_{h(t)},\omega}(S_t)-\sum_h\frac{\lVert\theta_h\rVert^2}{2\sigma_\theta^2}
+-\sum_h\frac{\lVert\gamma_h-\bar\gamma\rVert^2}{2\sigma_\gamma^2}-\sum_{\xi}\sum_j\frac{\lVert\xi_j\rVert^2}{2\sigma_\xi^2}-\Pi(\omega).
+\end{equation}
+This replaces the flat prior on $\theta_h$, and the price prior's fixed scale on $\gamma_h$, with
+learned ones. The gradient of the likelihood term is unchanged; each block only gets its own
+Gaussian term.
+
+\paragraph{Step 2: the scales (empirical Bayes).} The scale that maximises the marginal likelihood
+of the data, with $\eta_h$ integrated under \eqref{eq:prior}, satisfies a fixed point. Under the
+Laplace approximation to each household's posterior, the EM update is
+\begin{equation}\label{eq:em}
+\sigma_\theta^2\leftarrow\frac{1}{H\,d_\theta}\sum_h\Big(\lVert\hat\theta_h\rVert^2+\operatorname{tr}\big(A_h+\sigma_\theta^{-2}I\big)^{-1}\Big),
+\end{equation}
+where $A_h=-\nabla^2_{\theta_h}\sum_{t\in\mathcal T_h}\log p(S_t)$ is the curvature from the household's own trips.
+\begin{itemize}
+\item The trace term is the posterior variance that MAP leaves out. Without it, the update
+  shrinks $\sigma^2$ too far toward zero when $n_h$ is small.
+\item The same update holds for $\sigma_\gamma^2$ (with $\hat\gamma_h-\bar\gamma$, and $\bar\gamma$
+  set to the mean of $\hat\gamma_h$) and for each $\sigma_\xi^2$ (over products).
+\item $A_h$ can be replaced by its expected form, the empirical Fisher matrix
+  $\sum_{t\in\mathcal T_h}g_tg_t^\top$, with $g_t=\nabla_{\theta_h}\log p(S_t)$. Each $g_t$ is a
+  by-product of the training step.
+\end{itemize}
+The update is run every few hundred steps, like the whitening step.
+
+\begin{proposition}\label{prop:shrink}
+At a fixed point of \eqref{eq:map}--\eqref{eq:em}, a household with few trips is pulled toward the
+population: along an eigen-direction of $A_h$ with eigenvalue $a$, its estimate is the
+maximum-likelihood one shrunk by $a/(a+\sigma_\theta^{-2})$. Since $a$ grows with $n_h$, the shrinkage
+fades as the household gets more trips. The optimism \eqref{eq:optimism} becomes, approximately, the effective
+number of parameters, $\sum_i a_i/(a_i+\sigma_\theta^{-2})<d_h$, instead of $d_h$.
+\end{proposition}
+\begin{proof}
+This is the quadratic case of \eqref{eq:map}: the penalised optimum is
+$(A_h+\sigma^{-2}I)^{-1}A_h\hat\eta_h^{\rm ML}$. The effective number of parameters of a
+ridge-penalised fit is $\operatorname{tr}\big((A_h+\sigma^{-2}I)^{-1}A_h\big)$; in \eqref{eq:optimism}
+the inverse information is replaced by the inverse penalised curvature, which gives this trace
+when the model is correct.
+\end{proof}
+
+\paragraph{What does not change.} The taste $z_t$, its prior $\N(0,I)$, the likelihood estimate,
+generation, whitening and moment matching are all unchanged. The interactions keep training freely,
+under their existing prior.
+
+%======================================================================
+\section{The complete version: integrate the household parameters too}
+
+Proposition~\ref{prop:shrink} is still a point estimate. The consistent treatment does for $\theta_h$
+what \eqref{eq:marg} does for $z_t$: the probability of all of a household's baskets is
+\begin{equation}\label{eq:hh}
+p\big((S_t)_{t\in\mathcal T_h}\big)=\int \N(\theta;0,\sigma_\theta^2 I)\prod_{t\in\mathcal T_h}\Big[\int\N(z_t;0,I)\,p(S_t\mid z_t,\theta)\,dz_t\Big]d\theta .
+\end{equation}
+\begin{proposition}\label{prop:joint}
+Hold $\gamma_h$ and $\omega$ fixed, and treat the within-category competition shift and the
+history centring as fixed offsets at their current values. Then the joint posterior of $(\theta_h,z_{t})_{t\in\mathcal T_h}$
+given the household's baskets is strongly log-concave, so it has a single peak.
+\end{proposition}
+\begin{proof}
+With the offsets fixed, the utility of product $j$ on trip $t$ is affine in $(\theta,z_t)$:
+$u_{tj}=c_{tj}+\theta\cdot a_j+z_t\cdot\phi_j$. Here $a_j$ collects the size shift, $\alpha_j$ and
+$u_{c(j)}$. The presence term is $-z_t\cdot\psi_c$ per extra product of category $c$, also affine
+in $z_t$. Hence the energy $E_{z_t}(S,\theta)$ of every basket $S$ is affine in $(\theta,z_t)$.
+So $\log p(S_t\mid z_t,\theta)=E_{z_t}(S_t,\theta)-\log Z_{z_t}(\theta)$, and
+$\log Z_{z_t}(\theta)=\log\sum_S e^{E_{z_t}(S,\theta)}$ is the log of a sum of exponentials of affine
+functions, hence convex in $(\theta,z_t)$ jointly. The sum over trips of concave terms, plus the strictly concave log-prior, is strongly concave.
+\end{proof}
+\noindent The price slopes $\gamma_h$ enter through a softplus, which breaks affinity, so they stay as in
+Section~4. This version removes the household optimism entirely, but it costs much more: every step
+needs the joint peak over a whole household's trips, and batches must be formed by household.
+Section~4 is the first step; this version is the one to move to if Section~4's held-out gain stays
+well short of what Section~2 shows is available.
+
+%======================================================================
+\section{What the fix must show (stated before any run)}
+\begin{enumerate}
+\item Held-out log-likelihood no longer falls as training continues: the last checkpoint is within
+  noise of the best.
+\item The training-minus-held-out gap stays near the value at step 242 (about 0.5), instead of reaching 2.5.
+\item The block swap of Section~2 for the household and product-context blocks changes the held-out
+  score by no more than its standard error.
+\item Held-out log-likelihood at least $-26.59$, the score of the final checkpoint with only the
+  household block put back.
+\item Generated basket size within 0.2 of the data (8.69), with the 99\% quantile near 22.8.
+\item The competition estimate stays near the truth, 0.05.
+\end{enumerate}
+
+\section{Open points}
+\begin{itemize}
+\item The real-data mixture fit also dropped after step 240 (by 0.66), yet its household and context
+  terms were frozen there. This note does not explain that drop. The same block swap on the real
+  checkpoints (interactions against size terms) is the next measurement there.
+\item Update \eqref{eq:em} uses the Laplace approximation. With $n_h=1$ or 2 a household's posterior
+  is far from Gaussian, and the trace term is then an approximation.
+\end{itemize}
+
+\end{document}

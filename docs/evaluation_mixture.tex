@@ -1,6 +1,6 @@
 \documentclass[11pt]{article}
 \usepackage[a4paper,margin=2.2cm]{geometry}
-\usepackage{amsmath,amssymb,booktabs,microtype}
+\usepackage{amsmath,amssymb,booktabs,microtype,graphicx}
 \usepackage[hidelinks]{hyperref}
 \newcommand{\E}{\mathbb{E}}
 \newcommand{\N}{\mathcal{N}}
@@ -65,7 +65,7 @@ the display and mailer effects, and its agreement with the observed share change
 
 \paragraph{Recommendation} (real: 1,620 cases; synthetic: 1,974).
 \begin{center}\small
-\begin{tabular}{llllll}
+\resizebox{\textwidth}{!}{\begin{tabular}{llllll}
 \toprule
 & model & MRR & recall@10 & recall@20 & median rank\\
 \midrule
@@ -81,7 +81,7 @@ synthetic & control best & $0.259\pm0.008$ & 0.485 & 0.613 & 12\\
 & \textbf{S9} & $\mathbf{0.278\pm0.008}$ & 0.513 & 0.652 & 10\\
 & popularity & $0.084\pm0.005$ & 0.166 & 0.280 & 50\\
 \bottomrule
-\end{tabular}
+\end{tabular}}
 \end{center}
 Paired differences, household-clustered:
 \begin{itemize}
@@ -96,7 +96,7 @@ the likelihood.
 
 \paragraph{Generation.}
 \begin{center}\small
-\begin{tabular}{lllllll}
+\resizebox{\textwidth}{!}{\begin{tabular}{lllllll}
 \toprule
 & model & full AUC & category AUC & size (real 7.50 / 8.88) & categories (5.88 / 8.11) & 20+ products\\
 \midrule
@@ -109,7 +109,7 @@ synthetic & control best & 0.765 & 0.844 & 8.72 & 7.95 & \\
 & S1 & 0.686 & 0.786 & 8.01 & 7.37 & \\
 & \textbf{S9} & \textbf{0.683} & \textbf{0.786} & 7.98 & 7.35 & \\
 \bottomrule
-\end{tabular}
+\end{tabular}}
 \end{center}
 On real data the new recipe gives the most realistic baskets. Its AUC falls by 0.034 (full) and
 0.028 (categories) against step 360. Its size is within 3.5\% of the data, against 19\% too large
@@ -121,7 +121,7 @@ held-out likelihood fell after step 420. Their baskets are 10\% too small, the s
 \paragraph{Price counterfactuals, synthetic} (32 scenarios; S9; the control is within 0.02 on
 every number).
 \begin{center}\small
-\begin{tabular}{lllll}
+\resizebox{\textwidth}{!}{\begin{tabular}{lllll}
 \toprule
 & correlation with truth & sign agreement & slope of model on truth & mean change at $\times0.8$ / $\times1.2$\\
 \midrule
@@ -130,7 +130,7 @@ rest of subcategory & 0.83 & 0.97 & 0.06 & \\
 rest of category & 0.92 & 0.95 & 0.13 & \\
 basket size & $-0.19$ & 0.56 & & truth and model both $\approx0$\\
 \bottomrule
-\end{tabular}
+\end{tabular}}
 \end{center}
 \textbf{The directions and the ranking of the scenarios are right; the sizes are about ten times
 too small.} A 20\% price cut raises the product's purchases by 47\% in the truth and by 5\% in the
@@ -143,7 +143,7 @@ not from the mixture training.
 \paragraph{Price and promotion response, real} (validation weeks; all three checkpoints within
 0.005 of each other, because the real fits did not train the price and promotion terms).
 \begin{center}\small
-\begin{tabular}{lll}
+\resizebox{\textwidth}{!}{\begin{tabular}{lll}
 \toprule
 & measured (product-clustered 95\%) & model\\
 \midrule
@@ -154,7 +154,7 @@ mailer on vs off & $0.347\ [0.26,\ 0.43]$ & 0.39 (purchase-weighted), 0.51 (mean
 agreement with observed share changes & & correlation 0.16, sign agreement 0.61\\
 mean share change when the discount deepens & $+0.108$ & $+0.015$\\
 \bottomrule
-\end{tabular}
+\end{tabular}}
 \end{center}
 Display and mailer effects match the measured ones, weighted by purchases. The response to the
 discount depth is about twice the measured one, and outside its interval. Agreement event by event

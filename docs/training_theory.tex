@@ -142,8 +142,9 @@ trips. It only limits how far the mixture fit moves these blocks.
 
 \paragraph{Predictions.} Synthetic: freezing or anchoring the household and product-context
 blocks removes most of the held-out loss after step 420; the best held-out score is at least
-the swap result $-26.43$. Real: this mechanism cannot explain the real loss, because there the
-training score fell as well. Memorisation raises the training score.
+the swap result $-26.43$. Real: this mechanism cannot explain the real loss, for two reasons. The
+training score fell as well, while memorisation raises it. And the real fits never trained these
+blocks.
 
 %======================================================================
 \section{Mechanism 2: the steps that are not gradient steps}\label{sec:proc}
@@ -222,9 +223,96 @@ Generation draws $z\sim\N(0,I)$. The two agree when the pooled posterior
 $\frac1T\sum_t p(z\mid S_t)$ equals $\N(0,I)$. That holds at the maximum-likelihood point of a
 \emph{correctly specified} model, with large $T$. Whitening forces only the second moment to $I$.
 \emph{Measured} (real): the mean is not zero ($|\bar\mu|=0.22$), and the covariance has eigenvalues
-from 0.80 to 1.16. So the size gap is a symptom, not a separate cause. It shrinks if
-Sections~3--5 bring the fit closer to the maximum-likelihood point. If a gap remains, it measures
-misspecification.
+from 0.80 to 1.16.
+
+\paragraph{Measured after the runs} (\texttt{research/size\_by\_taste.py}, 512 synthetic training
+trips, 4 baskets per trip and way). Three facts settle this section.
+\begin{enumerate}
+\item The likelihood and the sampler agree. The mean number of categories implied by the gradient
+  of $\log p$ with respect to $\rho_0$ (through the exact log-partition) is 7.874. The sampler at the
+  same posterior draws gives 7.83--7.88. The data has 7.881. So the size statistic is matched under
+  the posterior, as the stationarity condition requires.
+\item Drawing $z$ from $\N(0,I)$ instead gives 8.08--8.12 products (data 8.67).
+\item Drawing $z$ from a Gaussian with the \emph{pooled posterior's own mean and covariance} gives
+  7.94--8.05, no better than $\N(0,I)$.
+\end{enumerate}
+So the gap is not a matter of the first two moments, which whitening could fix. It comes from the
+\emph{shape} of the pooled posterior. That posterior is a mixture of the trips' posteriors, not a
+Gaussian. The expected size grows faster than linearly in $z$, so a Gaussian with the right
+covariance still gives too few large baskets. This is misspecification of the taste distribution
+$\N(0,I)$, and no change to the training removes it. Fixing it needs a model change, such as a
+richer distribution of $z$, or drawing $z$ from the household's own past posteriors for
+counterfactuals of known households. That choice is left to the user.
+
+%======================================================================
+\section{Mechanism 5: whitening and the training objective have different fixed points}\label{sec:fight}
+
+This section was worked out after the first results (Section~\ref{sec:results}). Those results
+showed that on real data the \emph{training objective itself} falls: from step 360 to the final
+checkpoint, $\overline{L_8}$ on 256 training trips went from $-40.09$ to $-40.71$, and $\log p$ from
+$-39.93$ to $-40.44$. So Mechanism~3, which needs $L_8$ to rise while $\log p$ falls, is ruled out.
+A gradient method does not lower its own objective unless other steps move the parameters away
+from it. This section shows that whitening does exactly that.
+
+\paragraph{The scale direction.} For $c>0$ let $T_c$ map the parameters to
+\[
+\varphi_j\mapsto c\varphi_j,\quad \psi_c\mapsto c\psi_c,\quad
+\lambda_j\mapsto\lambda_j+\tfrac12(c^2-1)|\varphi_j|^2,
+\]
+and leave everything else fixed. By the change of variable $z=cz'$, the model $T_c\theta$ with prior
+$\N(0,I)$ is the model $\theta$ with prior $\N(0,c^2I)$, apart from the $|\psi_c|^2$ term
+(Section~\ref{sec:proc}).
+
+\begin{proposition}\label{prop:scale}
+Let $M=\frac1T\sum_t\E[zz^\top\mid S_t]$ be the pooled posterior second moment over the training
+trips. Then
+\[
+\frac{d}{dc}\Bigl[\frac1T\sum_t\log p(S_t;T_c\theta)\Bigr]_{c=1}=\operatorname{tr}M-r .
+\]
+For the prior of the fit, $\frac{1}{2T}\bigl(200\sum_j|\varphi_j-\psi_{c(j)}|^2+20\sum_c|\psi_c|^2\bigr)$,
+the derivative along $T_c$ at $c=1$ is
+\[
+\pi=\frac1T\Bigl(200\sum_j|\varphi_j-\psi_{c(j)}|^2+20\sum_c|\psi_c|^2\Bigr)>0 .
+\]
+At a stationary point of the penalised likelihood, therefore, $\operatorname{tr}M=r+\pi$, and not $r$.
+\end{proposition}
+
+\begin{proof}
+$\partial_c\log\N(z;0,c^2I)=|z|^2/c^3-r/c$. Differentiating under the integral, the derivative of
+$\log p(S)$ at $c=1$ is $\E[|z|^2\mid S]-r$. The prior is a sum of squares that scales as $c^2$.
+\end{proof}
+
+\paragraph{Consequence.} Whitening sets $M=I$, which is the stationary point of the likelihood
+\emph{without} the prior. The gradient steps go toward the stationary point \emph{with} the prior,
+where $\operatorname{tr}M/r=1+\pi/r$. So the two procedures have different fixed points, and the fit
+cycles between them without settling. Moreover, the gradient steps do not undo a whitening along
+$T_c$: they move $\varphi$, $\lambda$, $\rho_0$ and $\rho_c$ separately. So each cycle leaves a
+remainder, and the remainders add up to the drift measured in Section~\ref{sec:facts}.
+
+\paragraph{The measured numbers fit.} Real data: $\pi=0.70$ per trip at step 360, which predicts
+that without whitening the fit settles at $\operatorname{tr}M/r\approx1+0.70/16=1.044$. The run
+without whitening (R2) settles at 1.035 and stays there from step 390 to step 480. With whitening
+(R0), each block of 30 steps takes $M$ from 1 back to 1.02--1.03. Synthetic: $\pi$ grows from 0.36
+(step 420) to 0.63 (step 1,210) as $\varphi$ grows, so the gap that whitening closes widens as the
+fit goes on.
+
+\paragraph{Two fixes that follow.} The conflict exists only because the prior pulls along $T_c$,
+with strength $\pi$. Either remove one of the two procedures, or remove the pull.
+\begin{enumerate}
+\item[(a)] Train without whitening, so that every step serves one objective. Then, at the end,
+  apply the EM update of the prior covariance once, with all else fixed (one whitening step).
+\item[(b)] Keep whitening, and make the prior on $\varphi$ weak enough that $\pi/r$ is small.
+  Dividing both precisions by 10 gives $\pi=0.07$ on real data, so the two fixed points differ by
+  $\operatorname{tr}M/r\approx1.004$ instead of $1.044$. With $T=158{,}983$ trips, a prior of
+  precision 2 on a loading still corresponds to very little information against the data.
+\end{enumerate}
+
+\paragraph{Predictions.}
+(i) Without whitening, the training objective does not fall, and the held-out score keeps
+improving past step 360.
+(ii) The final whitening step does not lower $\log p$ and moves the generated size toward the data.
+(iii) With the weaker prior and whitening on, the held-out score improves as in (i), and the
+generated size stays where whitening holds it.
 
 %======================================================================
 \section{Experiments}\label{sec:exp}
@@ -235,7 +323,10 @@ All runs use the existing code with three new switches: \texttt{--no-moment-matc
 held-out and 1,024 training trips with $K=256$. Selection is on held-out trips only; the test
 weeks are never opened.
 
-\paragraph{Real} (from the step-360 checkpoint, 480 steps to step 840, same batches).
+\paragraph{Real} (from the step-360 checkpoint, 480 steps to step 840, same batches). The real fits
+were made before the household, context and price blocks were trained: they trained only
+$\psi,\varphi,\lambda,\rho_0,\rho_c,f$, and did not re-estimate $\lambda_c$. The runs below keep that
+scope (\texttt{--interaction-only}). So on real data, Mechanism~1 is excluded from the start.
 \begin{center}\small
 \begin{tabular}{lll}
 \toprule
@@ -269,5 +360,54 @@ trips (6--16), so it halves the movement of such a household.
 and final steps, against the control. Also report the generated size and the change in $\rho_0$
 and $|\varphi|$. A mechanism is confirmed only if switching it off changes the late loss by more
 than twice the paired standard error. Otherwise it is rejected.
+
+%======================================================================
+\section{Results}\label{sec:results}
+
+Validation scores are on the fit's first 64 held-out trips ($K=256$). Paired scores are on 512
+held-out or training trips, with the same trips and random numbers for every checkpoint.
+
+\paragraph{Synthetic, full fits (10 epochs).}
+\begin{center}\small
+\begin{tabular}{llll}
+\toprule
+run & change & best (step) & final, step 1,210\\
+\midrule
+control & none & $-28.34$ (420) & $-28.75$\\
+S1 & household and product context frozen & $\mathbf{-27.24}$ (1,210) & $\mathbf{-27.24}$\\
+S2 & anchored, $\tau=10$ & $-28.20$ (960) & $-28.38$\\
+S3 & anchored, $\tau=100$ & $-27.54$ (960) & $-27.58$\\
+S4 & no moment matching & $-28.34$ & $-28.72$\\
+S5 & no whitening & $-28.70$ (720) & see log\\
+\bottomrule
+\end{tabular}
+\end{center}
+Mechanism~1 is confirmed. Freezing removes the late loss: the fit improves to the last step, and
+its best is 1.1 nats per trip above the control's best. The stronger the anchor, the better, and
+freezing is best. Moment matching has no effect (S4 equals the control). Without whitening, the
+synthetic fit is worse early on.
+
+\paragraph{Real, continued from step 360 (interaction and size only).}
+\begin{center}\small
+\begin{tabular}{llll}
+\toprule
+run & change & step 480 & step 600\\
+\midrule
+R0 & none (replays the original run exactly) & $-35.898$ & $-35.885$\\
+R1 & no moment matching & $-35.846$ & $-35.828$\\
+R2 & no whitening & $-35.811$ & $\mathbf{-35.725}$\\
+\bottomrule
+\end{tabular}
+\end{center}
+Step 360 scores $-35.744$. R0 reproduces the original run's $-35.8983$ at step 480 exactly, so the
+comparison is clean. R2 is the first real run that improves past step 360. On 512 paired held-out
+trips, R2 at step 600 scores $-38.144$, against $-38.291$ for step 360. The bound measurement (256
+training trips, step 360 to the original final checkpoint) is in Section~\ref{sec:fight}: $L_8$ fell
+by 0.61.
+
+\paragraph{Final whitening} (prediction (ii) of Section~\ref{sec:fight}), on R2 at step 600, two EM
+steps of the prior covariance. Held-out: $-0.007\pm0.008$. Training: $+0.004\pm0.009$. Generated
+size: 6.76 to 6.90 (data 7.22). The likelihood is unchanged, as predicted. The size moves the
+predicted way, but only by a third of the gap, as Section~\ref{sec:size} explains.
 
 \end{document}

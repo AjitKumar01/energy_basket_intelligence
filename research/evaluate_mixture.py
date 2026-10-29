@@ -384,6 +384,8 @@ def discount(a, data, root):
         g = model.price_coefficients(ix.item, ix.item_trip)
         count = torch.bincount(ix.item_trip, minlength=ix.B).double()
         du = -g * (kappa + (1.0 - kappa) / count[ix.item_trip]) * d_price
+        if model.price_common is not None:
+            du = du - float(model.price_common) * (1.0 - 1.0 / count[ix.item_trip]) * d_price
         if "dsc" in batch.ctx:
             if model.disc_kappa is not None:
                 du = du - g * (float(torch.nn.functional.softplus(model.disc_kappa)) - kappa) * d_disc

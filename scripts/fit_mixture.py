@@ -79,6 +79,8 @@ def parse_args():
                    help="within-category competition for price and promotion changes (lambda_c by instrument)")
     p.add_argument("--promo-common", action="store_true",
                    help="common display and mailer slopes with per-product deviations shrunk to zero")
+    p.add_argument("--price-common", action="store_true",
+                   help="add a common regular-price slope (price_common, v4/model.py), trained with the price terms")
     p.add_argument("--max-per-category", type=int,
                    help="largest number of products from one category in a basket (default: nmax)")
     p.add_argument("--comp-iv-trips", type=int, default=0,
@@ -164,6 +166,8 @@ def start_fresh(args, data, root):
                gen=torch.Generator().manual_seed(args.seed + 2))
     if args.max_per_category is not None:
         model.R = min(model.R, args.max_per_category)
+    if args.price_common:
+        model.price_common = torch.nn.Parameter(torch.zeros(()))
     batcher = batcher_for(data, root, parent, recency=args.recency, purchase_history=args.recency)
     blob = {"initialization": str(args.initialization.resolve()), "additive": str(args.additive.resolve()),
             "rank": args.rank, "max_per_category": model.R, "cat_rho0": True, "recency": bool(args.recency),
@@ -251,7 +255,7 @@ def main():
     # Price (and, without recency, the unused recency loading psi) has a prior centred at the
     # base model's values.
     price_names = ("gamma", "beta", "price_kappa") + tuple(
-        n for n in ("disc_kappa", "disc_common") if getattr(model, n) is not None) + (() if recency else ("psi",))
+        n for n in ("disc_kappa", "disc_common", "price_common") if getattr(model, n) is not None) + (() if recency else ("psi",))
     if fresh:
         blob["price_init"] = {n: getattr(model, n).detach().clone() for n in price_names}
         if promo_common:                 # common slopes start at the exposure-weighted base weights

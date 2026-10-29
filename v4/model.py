@@ -26,6 +26,14 @@ products (the "discount split"):
 
 With disc_kappa = price_kappa and disc_common = 0 this is exactly the one-slope model.
 
+A common regular-price slope (price_common, optional) adds, for every household and product,
+
+    - price_common * (dlp - m)
+
+so the relative-price coefficient is g_hj kappa + price_common.  Without it the whole regular-price
+response must come from the factorised g_hj, which sits where softplus is flat and moves little
+(docs/training_theory.pdf); the discount part already has its common slope, disc_common.
+
 Energy of a basket S (n products, n_c of them in category c, k categories present):
 
     E(S) = sum_{j in S} b_j + sum_{i<j in S} phi_i . phi_j
@@ -81,7 +89,7 @@ import torch
 from torch.nn.functional import softplus
 
 PRICE_KEYS = ("dlp", "dlp_bar", "disp", "mail", "dsc")
-OPTIONAL_PARAMETERS = ("disc_kappa", "disc_common", "f_extra", "psi_cat", "u_cat",
+OPTIONAL_PARAMETERS = ("disc_kappa", "disc_common", "price_common", "f_extra", "psi_cat", "u_cat",
                        "psi_item", "iv_slope_raw", "hist_size", "comp_raw", "dsp_common", "mlr_common")
 HISTORY_KEYS = ("rec", "rec_item")
 # Parameters of an old quantity model and size factorisation that older checkpoints carry;
@@ -195,6 +203,8 @@ class BasketModel(torch.nn.Module):
             mean = c["dlp_bar"][trip]
             kappa = softplus(self.price_kappa)
             b = b - g * (mean + kappa * (c["dlp"] - mean))
+            if self.price_common is not None:
+                b = b - self.price_common * (c["dlp"] - mean)
             if "dsc" in c and self.disc_kappa is not None:
                 b = b - g * (softplus(self.disc_kappa) - kappa) * c["dsc"]
             if "dsc" in c and self.disc_common is not None:

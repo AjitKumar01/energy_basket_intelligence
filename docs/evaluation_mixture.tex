@@ -178,4 +178,60 @@ is weak, as before (\texttt{v4\_comp\_promo}: 1.38--1.51, correlation 0.15--0.16
   them.
 \end{enumerate}
 
+
+\section{The price fix (added after the evaluation)}
+
+\paragraph{Diagnosis, synthetic.} A within-category conditional logit on the synthetic training
+weeks (73,633 choices; product fixed effects) estimates $-2.01$ per unit of log regular price and
+$-1.55$ per unit of log discount, with $0.08$ and $0.07$ standard deviations of the two. So the
+data identify a large regular-price effect. The model's regular-price coefficient was
+$g_{hj}\kappa\approx0.29$, against a discount coefficient of $1.73$, and the scenarios change the
+regular price. There were two causes.
+\begin{enumerate}
+\item $\kappa$ was limited by its learning rate. Adam moves a parameter by at most about its learning
+  rate per step, so over 1,210 steps at 0.003 the raw $\kappa$ can move at most 3.6. It moved 3.1.
+  With a learning rate of 0.05 or 0.015 (runs S10, S11), $\kappa$ converges at 11--12, and the response
+  doubles (slope on truth 0.10 to 0.21).
+\item The rest is the parametrisation. $g_{hj}=\mathrm{softplus}(\gamma_h)\cdot\mathrm{softplus}(\beta_j)$
+  is fixed at the base model's values (and sits where softplus is flat). So $\kappa$ can only rescale
+  a pattern that does not match the true sensitivities, and the best scale for it is shrunk. The
+  discount part did not suffer from this because it has a common slope.
+\end{enumerate}
+
+\paragraph{Fix.} A common regular-price slope, $-c\,(\mathrm{dlp}-m)$, so the regular-price
+coefficient is $g_{hj}\kappa+c$ (\texttt{v4/model.py}, \texttt{price\_common};
+\texttt{fit\_mixture.py --price-common}), with the price scalars at learning rate 0.05. The law stays
+exact: it is one more term in each product's utility.
+
+\paragraph{Result} (run S12 = S9 + the fix). $c=2.12$, $\kappa=3.59$: the regular-price coefficient
+is 2.30 and the discount's about 2.2, against the data logit's 2.0 and 1.5.
+\begin{center}\small
+\resizebox{\textwidth}{!}{\begin{tabular}{lllll}
+\toprule
+& S9 & S10 ($\kappa$ converged) & \textbf{S12 (common slope)} & truth\\
+\midrule
+own: slope of model on truth & 0.10 & 0.21 & \textbf{0.73} & 1\\
+own: mean change at $\times0.8$ / $\times1.2$ & $+0.05/-0.04$ & $+0.11/-0.08$ & $\mathbf{+0.42/-0.25}$ & $+0.47/-0.35$\\
+own: mean absolute error & 0.36 & 0.31 & \textbf{0.14} & \\
+rest of category: slope on truth & 0.13 & 0.28 & \textbf{0.93} & 1\\
+same subcategory: slope on truth & 0.06 & 0.12 & 0.44 & 1\\
+held-out $\log p$ (1,024 trips) & $-25.79$ & & $\mathbf{-25.74}$ ($+0.055\pm0.010$) & \\
+recommendation MRR & 0.278 & & 0.277 ($-0.001\pm0.002$) & \\
+generation AUC, full / categories & 0.683 / 0.786 & & 0.681 / 0.783 & \\
+\bottomrule
+\end{tabular}}
+\end{center}
+The likelihood improves, and recommendation and generation are unchanged. Two parts of the
+generator are not in the model, and they explain the rest: price rises hurt twice as much as cuts
+(loss aversion), and products are nested by subcategory. So rises and within-subcategory switching
+are still understated.
+
+\paragraph{Real data.} The same logit on 152,298 real training-week choices gives $-0.18$ for regular
+price and $-1.01$ for discount depth (display $0.63$, mailer $0.53$). The real model's coefficients
+already agree with it: regular median $0.07$ and mean $0.24$, discount $0.91$. So on real data the
+2$\times$ gap is \emph{not} this problem. It is a gap between the choice logit, which pools all
+weeks ($\approx1.0$), and the week-to-week discount-event study ($0.64$), which nets out pantry
+loading and post-promotion dips. Closing it needs a decision: which of the two the model should
+reproduce, and whether to add purchase dynamics (stock at home). It is not a training fix.
+
 \end{document}

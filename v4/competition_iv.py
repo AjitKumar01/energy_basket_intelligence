@@ -107,6 +107,8 @@ def competition_moments(model, batches, batcher):
 
         mean = c["dlp_bar"][tr]
         d = -g_bar[it] * (mean + kappa * (c["dlp"] - mean))
+        if model.price_common is not None:
+            d = d - model.price_common * (c["dlp"] - mean)
         if "dsc" in c and model.disc_kappa is not None:
             d = d - g_bar[it] * (disc_k - kappa) * c["dsc"]
         if "dsc" in c and model.disc_common is not None:

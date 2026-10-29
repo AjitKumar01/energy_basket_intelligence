@@ -468,12 +468,12 @@ the training that follows it. R5 tests the reset of Adam's state.
 \begin{center}\small
 \begin{tabular}{lllll}
 \toprule
-run & 480 & 600 & 720 & generated size at 600 (data 7.26)\\
+run & 480 & 600 & 720 & 840 (size; data 7.26)\\
 \midrule
-R0 control & $-35.898$ & $-35.885$ & $-35.836$ & 7.80\\
-R4 $\psi$ compensated & $-35.901$ & $-35.894$ & $-35.865$ & 7.61\\
-R5 R4 + Adam state kept & $-35.877$ & $-35.840$ & & 7.13\\
-R2 no whitening & $\mathbf{-35.811}$ & $\mathbf{-35.725}$ & $\mathbf{-35.634}$ & 6.44\\
+R0 control & $-35.898$ & $-35.885$ & $-35.836$ & $-35.899$ (7.95)\\
+R4 $\psi$ compensated & $-35.901$ & $-35.894$ & $-35.865$ & $-35.902$ (7.79)\\
+R5 R4 + Adam state kept & $-35.877$ & $-35.840$ & $-35.805$ & $-35.809$ (7.12)\\
+R2 no whitening & $\mathbf{-35.811}$ & $\mathbf{-35.725}$ & $\mathbf{-35.634}$ & $\mathbf{-35.583}$ (6.17)\\
 \bottomrule
 \end{tabular}
 \end{center}

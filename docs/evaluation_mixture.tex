@@ -1,0 +1,181 @@
+\documentclass[11pt]{article}
+\usepackage[a4paper,margin=2.2cm]{geometry}
+\usepackage{amsmath,amssymb,booktabs,microtype}
+\usepackage[hidelinks]{hyperref}
+\newcommand{\E}{\mathbb{E}}
+\newcommand{\N}{\mathcal{N}}
+\title{Evaluation of the mixture fits: recommendation, price counterfactuals and basket generation}
+\author{Version-4 basket model, branch \texttt{v4-mixture}}
+\date{30 October 2026}
+\begin{document}
+\maketitle
+
+\noindent All numbers are on the \emph{validation weeks} (\texttt{trip\_split = 1}). These trips were
+never used in training or model selection. The test weeks were not read. Tool:
+\texttt{research/evaluate\_mixture.py}. Its protocols are those of the evaluators removed in
+\texttt{d716f95}, so results compare with earlier ones. Only the treatment of the taste $z$ changes,
+to the mixture form.
+
+\section{What is evaluated}
+
+\paragraph{Checkpoints.} Real data (Dunnhumby, 5,455 products):
+\begin{itemize}
+\item \textbf{step 360}: the old best mixture checkpoint.
+\item \textbf{R2+fw}: the new recipe. It continues from step 360 to step 840 without whitening,
+  then applies one final compensated whitening (\texttt{docs/training\_theory.pdf}).
+\item \textbf{R0}: the old recipe continued to step 840.
+\end{itemize}
+Synthetic world \texttt{disc\_c48\_s3} (522 products, with causal truth for price changes):
+\begin{itemize}
+\item the control's best (step 420) and final (step 1,210) checkpoints;
+\item S1: household and product-context blocks frozen;
+\item S9: S1 with Adam's state kept across whitening, the best synthetic fit.
+\end{itemize}
+
+\paragraph{Recommendation.} One product is hidden from each basket that has at least 2 products.
+Every product the store offers is then ranked by $\log p(\text{rest}+j)-\log p(\text{rest})$. Because
+$Z_z$ is the same for both baskets, this equals
+\[
+\log \E\bigl[\exp\Delta E_z(j)\,\big|\,\text{rest}\bigr],\qquad
+\Delta E_z(j)=d_j-s\cdot\Delta s_j-\tfrac12|\Delta s_j|^2+z\cdot\Delta s_j .
+\]
+Here $d_j$ is the exact change of the energy, and $\Delta s_j$ the change of the basket field. The
+expectation is over the posterior of $z$ given the rest, with 32 importance draws. The cases are
+2,000 validation trips, with a fixed seed. The table reports MRR, recall@$k$ and the median rank;
+standard errors are clustered by household. ``No taste integral'' ranks by $d_j$ alone, which is
+the old form's formula.
+
+\paragraph{Generation.} One basket per validation trip: $z\sim\N(0,I)$, then $S\mid z$ exactly. A
+gradient-boosted classifier tries to tell real from generated baskets, using the full basket or
+only the categories present. AUC 0.5 means the two cannot be told apart. Three seeds; 6,000 trips on
+real data, and all 2,755 on synthetic data.
+
+\paragraph{Price counterfactuals.} \emph{Synthetic:} 32 scenarios, each multiplying one product's
+price by 0.8 or 1.2, compared with the generator's causal truth. The quantities are the relative
+change in purchases of the product, of the rest of its subcategory and of the rest of its category,
+and the change in basket size. The model's incidence is the mean, over 64 common draws
+$z\sim\N(0,I)$ per trip, of the exact $P_z(j\in S)$, on 400 validation trips. \emph{Real:} 166,164
+validation-week discount events (a product's chain discount depth changes between weeks). The
+measured within-category response comes from a conditional binomial with an offset for the
+category's change, with product-clustered 95\% intervals. The model's response is the depth slope,
+the display and mailer effects, and its agreement with the observed share changes. It uses 580 trips
+(one per store-week) and 64 draws of $z$.
+
+\section{Results}
+
+\paragraph{Recommendation} (real: 1,620 cases; synthetic: 1,974).
+\begin{center}\small
+\begin{tabular}{llllll}
+\toprule
+& model & MRR & recall@10 & recall@20 & median rank\\
+\midrule
+real & step 360 & $0.119\pm0.007$ & 0.228 & 0.305 & 92\\
+& \textbf{R2+fw} & $\mathbf{0.123\pm0.007}$ & 0.227 & 0.306 & 86\\
+& R0 & $0.116\pm0.007$ & 0.227 & 0.293 & 100\\
+& no taste integral (R0) & $0.076\pm0.006$ & 0.132 & 0.177 & 264\\
+& popularity & $0.045\pm0.004$ & 0.075 & 0.097 & 760\\
+\midrule
+synthetic & control best & $0.259\pm0.008$ & 0.485 & 0.613 & 12\\
+& control final & $0.277\pm0.008$ & 0.502 & 0.642 & 10\\
+& S1 & $0.276\pm0.008$ & 0.509 & 0.648 & 10\\
+& \textbf{S9} & $\mathbf{0.278\pm0.008}$ & 0.513 & 0.652 & 10\\
+& popularity & $0.084\pm0.005$ & 0.166 & 0.280 & 50\\
+\bottomrule
+\end{tabular}
+\end{center}
+Paired differences, household-clustered:
+\begin{itemize}
+\item real: R2+fw $-$ step 360 $=+0.0034\pm0.0024$; R0 $-$ step 360 $=-0.0037\pm0.0025$;
+\item synthetic: S9 $-$ control best $=+0.019\pm0.004$.
+\end{itemize}
+The model is 2.7 times better than popularity on real data and 3.3 times on synthetic data.
+Integrating over the taste of the rest of the basket matters: on real data, MRR is 0.116 with it
+and 0.076 with the old form's formula. On real data the differences between the three checkpoints
+are small, and only the ordering (new $>$ old best $>$ old recipe continued) is consistent with
+the likelihood.
+
+\paragraph{Generation.}
+\begin{center}\small
+\begin{tabular}{lllllll}
+\toprule
+& model & full AUC & category AUC & size (real 7.50 / 8.88) & categories (5.88 / 8.11) & 20+ products\\
+\midrule
+real & step 360 & 0.709 & 0.661 & 8.92 & 7.42 & 0.130 (real 0.092)\\
+& \textbf{R2+fw} & \textbf{0.675} & \textbf{0.633} & \textbf{7.24} & \textbf{5.96} & \textbf{0.080}\\
+& R0 & 0.711 & 0.682 & 8.62 & 7.07 & 0.119\\
+\midrule
+synthetic & control best & 0.765 & 0.844 & 8.72 & 7.95 & \\
+& control final & 0.687 & 0.788 & 7.81 & 7.19 & \\
+& S1 & 0.686 & 0.786 & 8.01 & 7.37 & \\
+& \textbf{S9} & \textbf{0.683} & \textbf{0.786} & 7.98 & 7.35 & \\
+\bottomrule
+\end{tabular}
+\end{center}
+On real data the new recipe gives the most realistic baskets. Its AUC falls by 0.034 (full) and
+0.028 (categories) against step 360. Its size is within 3.5\% of the data, against 19\% too large
+for step 360. The number of categories is within 1.4\%, against 26\% too many. On synthetic data,
+the later checkpoints are much more realistic than the control's best, even though the control's
+held-out likelihood fell after step 420. Their baskets are 10\% too small, the shape gap of
+\texttt{training\_theory.pdf}, Section~6.
+
+\paragraph{Price counterfactuals, synthetic} (32 scenarios; S9; the control is within 0.02 on
+every number).
+\begin{center}\small
+\begin{tabular}{lllll}
+\toprule
+& correlation with truth & sign agreement & slope of model on truth & mean change at $\times0.8$ / $\times1.2$\\
+\midrule
+own product & 0.93 & 1.00 & 0.10 & truth $+0.47/-0.35$, model $+0.05/-0.04$\\
+rest of subcategory & 0.83 & 0.97 & 0.06 & \\
+rest of category & 0.92 & 0.95 & 0.13 & \\
+basket size & $-0.19$ & 0.56 & & truth and model both $\approx0$\\
+\bottomrule
+\end{tabular}
+\end{center}
+\textbf{The directions and the ranking of the scenarios are right; the sizes are about ten times
+too small.} A 20\% price cut raises the product's purchases by 47\% in the truth and by 5\% in the
+model, so the own-price elasticity is about $-2$ in the truth and $-0.25$ in the model. Substitution
+to the rest of the subcategory and the category is also 6--13\% of the truth. This holds for every
+synthetic checkpoint. In S1 and S9 the price parameters ($\gamma_h$, $\beta$) were not trained by
+the mixture fit, and the control is no better, so the gap comes from the base model's price terms,
+not from the mixture training.
+
+\paragraph{Price and promotion response, real} (validation weeks; all three checkpoints within
+0.005 of each other, because the real fits did not train the price and promotion terms).
+\begin{center}\small
+\begin{tabular}{lll}
+\toprule
+& measured (product-clustered 95\%) & model\\
+\midrule
+discount depth, within-category share slope & $0.64\ [0.35,\ 0.93]$ & 1.38 (whole week) -- 1.50 (own price only)\\
+display on vs off, share log ratio & $0.375\ [0.28,\ 0.47]$ & 0.37 (purchase-weighted), 0.52 (mean)\\
+mailer on vs off & $0.347\ [0.26,\ 0.43]$ & 0.39 (purchase-weighted), 0.51 (mean)\\
+\midrule
+agreement with observed share changes & & correlation 0.16, sign agreement 0.61\\
+mean share change when the discount deepens & $+0.108$ & $+0.015$\\
+\bottomrule
+\end{tabular}
+\end{center}
+Display and mailer effects match the measured ones, weighted by purchases. The response to the
+discount depth is about twice the measured one, and outside its interval. Agreement event by event
+is weak, as before (\texttt{v4\_comp\_promo}: 1.38--1.51, correlation 0.15--0.16, the same).
+
+\section{Verdict}
+
+\begin{enumerate}
+\item \textbf{Recommendation:} good, and the new recipe is the best on real data. The model is
+  2.7--3.3 times better than popularity, and the taste integral is worth 50\% of the MRR on real
+  data.
+\item \textbf{Basket generation:} the new recipe is clearly the most realistic on real data:
+  lowest classifier AUC, size within 3.5\%, categories within 1.4\%. A classifier can still tell
+  real from generated baskets (AUC 0.68 full, 0.63 categories).
+\item \textbf{Price counterfactuals: not good enough yet.} On synthetic data the signs and the
+  ranking are right, but the sizes are about 10 times too small. On real data the discount
+  response is twice the measured one, while display and mailer match. In neither case does the
+  mixture training cause this. It sits in the price terms of the base model, which the
+  mixture fits keep fixed (real) or near their start (synthetic). This is the next problem to
+  work on. The goal requires correct price counterfactuals, and none of today's fixes touched
+  them.
+\end{enumerate}
+
+\end{document}

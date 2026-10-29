@@ -1,0 +1,273 @@
+\documentclass[11pt]{article}
+\usepackage[a4paper,margin=2.3cm]{geometry}
+\usepackage{amsmath,amssymb,amsthm,booktabs,microtype}
+\usepackage[hidelinks]{hyperref}
+\newtheorem{proposition}{Proposition}
+\newtheorem{definition}{Definition}
+\theoremstyle{remark}\newtheorem{remark}{Remark}
+\newcommand{\R}{\mathbb{R}}
+\newcommand{\E}{\mathbb{E}}
+\newcommand{\N}{\mathcal{N}}
+\title{The late losses of the mixture fit: theory, predictions and the experiments that decide}
+\author{Version-4 basket model, branch \texttt{v4-mixture}}
+\date{29 October 2026}
+\begin{document}
+\maketitle
+
+\noindent The mixture form (\texttt{docs/mixture\_theory.pdf}) did what it was introduced for: one
+posterior peak per trip, exact generation, a reliable likelihood estimate, and a better held-out
+score than the old form. This note is about the \emph{training}. After its best step the fit loses
+held-out likelihood, on synthetic and on real data, and its generated baskets drift in size.
+Section~1 fixes notation. Section~2 lists what has been measured. Sections~3--6 take each
+mechanism that could cause the losses, say what it predicts, and say which measurement already
+decides it. Section~7 is the experiment plan, with the result each mechanism predicts stated
+before any run.
+
+%======================================================================
+\section{Setting and notation}
+
+\paragraph{Data.} Trips $t$, each with a basket $S_t$ and a household $h(t)$. The fit uses $T$
+training trips: $T=7{,}695$ in the synthetic world \texttt{disc\_c48\_s3} (928 households, about
+8 trips each) and $T=158{,}983$ on Dunnhumby (1,920 households, about 83 trips each). 1,024
+further trips are held out.
+
+\paragraph{The model.} A trip draws a taste $z\in\R^r$ ($r=16$) from $\N(0,I)$, then a basket from
+the exact law given $z$:
+\begin{equation}\label{eq:marg}
+p(S)=\int \N(z;0,I)\,p(S\mid z)\,dz,\qquad p(S\mid z)=\frac{e^{E_z(S)}}{Z_z}.
+\end{equation}
+For a basket $S$ with $n_c$ products in category $c$ and $k$ categories present,
+\begin{equation}\label{eq:Ez}
+E_z(S)=\sum_{j\in S}\Bigl(b_j+\lambda_j-\tfrac12|\varphi_j|^2+z\cdot\varphi_j\Bigr)
+-\sum_c (n_c-1)_+\Bigl(z\cdot\psi_c-\tfrac12|\psi_c|^2\Bigr)
+-\sum_c\bigl[\rho_c\tbinom{n_c}{2}+f_c(n_c)\bigr]-\rho_0(k).
+\end{equation}
+The symbols: $b_j$ is product $j$'s utility from the household, context and price terms;
+$\lambda_j$ is its intercept; $\varphi_j\in\R^r$ is its taste loading; $\psi_c\in\R^r$ is the
+loading charged for each \emph{extra} product of category $c$; $\rho_c$, $f_c$ penalise several
+products of one category; $\rho_0(k)$ is the size term, indexed by the number of categories $k$.
+$Z_z$ normalises over all baskets.
+
+\paragraph{Parameter blocks.} \emph{Household}: $\theta_h,\gamma_h$ (40 numbers per household).
+\emph{Product context}: the per-product context and price factors ($\alpha,\beta,\mu,\zeta,\dots$).
+\emph{Interaction}: $\varphi,\psi,\lambda$. \emph{Size}: $\rho_0,\rho_c,f$.
+
+\paragraph{The training procedure} (\texttt{scripts/fit\_mixture.py}). Each step takes a batch of
+256 training trips and does the following.
+\begin{enumerate}
+\item It finds each trip's posterior peak, draws $K=8$ tastes $z_1,\dots,z_K$ from a proposal $q$, and
+  forms the importance bound
+  \begin{equation}\label{eq:LK}
+  L_K(S)=\log\frac1K\sum_{k=1}^K w_k,\qquad w_k=\frac{\N(z_k;0,I)\,p(S\mid z_k)}{q(z_k)}.
+  \end{equation}
+  The proposal is $q=0.8\,\N(m,1.2^2\Sigma)+0.2\,\N(m,I)$, where $m$ is the peak and $\Sigma$ the
+  Laplace covariance. It is deliberately wider than the posterior.
+\item It takes one Adam step on $-\overline{L_K}+\text{prior}/T$ for every block.
+\end{enumerate}
+Every 30 steps it also does the following.
+\begin{enumerate}\setcounter{enumi}{2}
+\item \emph{Moment matching}: an extra step $\lambda_j\mathrel{-}=0.35\,\bar g_j/r_j$, and the same
+  for $\rho_0,\rho_c$ with factor 0.5. Here $\bar g$ is the gradient averaged over the 30 steps and
+  $r$ the data rate.
+\item \emph{Whitening}: it estimates the pooled posterior second moment
+  $M=\frac1B\sum_t\E[zz^\top\mid S_t]$ on 256 fixed trips ($K=256$). With $A=M^{1/2}$ it sets
+  $\varphi_j\leftarrow A\varphi_j$, $\psi_c\leftarrow A\psi_c$ and
+  $\lambda_j\mathrel{+}=\frac12(|A\varphi_j|^2-|\varphi_j|^2)$. Then it clears Adam's state for
+  $\varphi,\psi$.
+\end{enumerate}
+\emph{Held-out score} means the mean of $\log p(S)$ over 1,024 held-out trips with $K=256$.
+\emph{Training score} means the same over 1,024 training trips. All comparisons are paired, trip
+by trip, with the same random numbers.
+
+%======================================================================
+\section{What has been measured}\label{sec:facts}
+
+\begin{center}\small
+\begin{tabular}{lll}
+\toprule
+& synthetic (step 420 $\to$ 1,210) & real (step 360/240 $\to$ 1,244)\\
+\midrule
+held-out score & $-0.18\pm0.04$ & $-0.66\pm0.08$ (from step 240)\\
+training score & $+1.31\pm0.04$ & $-0.56\pm0.06$ (from step 240)\\
+generated size (data) & $8.68\to7.92$ (8.69) & $8.0$--$8.3\to7.5$--$7.9$ (7.26)\\
+$\tfrac12|\varphi_j|^2$, mean over products & $0.59\to1.75$ & $0.65\to2.33$\\
+growth of $|\varphi_j|^2$ by purchase count & $\times2.2$--$3.7$ in every band & $\times1.6$--$2.9$ in every band\\
+$\lambda$ mean change & $+0.65$ & $+1.02$\\
+$\rho_0(k)$ change & up to $+4.4$ & up to $+15.3$\\
+product of whitening trace$/r$ & $\times3.0$ (40 whitenings) & $\times1.54$ (29 whitenings)\\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Further measurements:
+\begin{enumerate}
+\item \emph{Block swaps, synthetic.} Putting the household block back to step 242 gains
+  $+0.54$ on held-out trips and loses $0.61$ on training trips. The product-context block gains
+  $+0.30$ and loses $0.69$. Both together, back to step 420, reach $-26.43$.
+\item \emph{One whitening step} applied to the real step-360 fit changes the score by $-0.007\pm0.005$
+  (held-out) and $-0.010\pm0.005$ (training). The same step with $1.5M$ costs $-1.3$ and doubles
+  the generated size.
+\item \emph{The estimate of $M$} is unbiased at $K=256$: trace$/r$ is 1.020 at $K=256$ and 1.019 at
+  $K=2{,}048$ (synthetic step 420). At $K=16$ it is 1.037.
+\item \emph{The pooled posterior, real:} its mean has norm 0.21--0.23, its covariance eigenvalues
+  lie in 0.80--1.16, and its trace$/r$ is 1.00.
+\item \emph{The bound gap} $\log p-L_8$ is the same for every basket size, at 0.14 nats at step 1,210.
+\end{enumerate}
+
+%======================================================================
+\section{Mechanism 1: memorisation by per-household and per-product parameters}\label{sec:mem}
+
+\paragraph{Theory} (\texttt{docs/overfitting\_theory.pdf}). A block with $d$ free numbers per
+household, fitted to that household's $n_h$ trips, makes the training score better than the
+held-out score by about $d/(2n_h)$ per trip. With $d=40$ and $n_h\approx 8$ that is about 2.5
+nats. Early stopping stops this partway.
+
+\paragraph{Why the hierarchical prior failed.}
+\texttt{v4/hier\_prior.py} centres each block column at its mean over rows. The base model had
+already fitted every row with early stopping on validation. A prior at the column mean pulls
+those validated row values toward the average, so it removes real signal (measured: $-0.3$ from
+the first step on). For $\gamma$ and $\beta$, a single household's trips barely determine the
+values, so the EM update drives their prior scale to zero.
+
+\paragraph{The fix that follows.} The row values to keep are the base model's,
+$x^{(0)}$. Use the penalty
+\begin{equation}\label{eq:anchor}
+\frac{\tau}{2}\sum_{r,k}\bigl(x_{rk}-x^{(0)}_{rk}\bigr)^2 \quad\text{(in total log-likelihood units)}.
+\end{equation}
+For a row whose own likelihood has curvature $a$ along a coordinate, the penalised fit moves that
+coordinate by the fraction $a/(a+\tau)$ of the unpenalised move. This is a smooth version of early
+stopping: $\tau=0$ is the present fit and $\tau=\infty$ freezes the block. $\tau$ is chosen on
+validation. It is not a model of the population: $x^{(0)}$ was itself fitted to the training
+trips. It only limits how far the mixture fit moves these blocks.
+
+\paragraph{Predictions.} Synthetic: freezing or anchoring the household and product-context
+blocks removes most of the held-out loss after step 420; the best held-out score is at least
+the swap result $-26.43$. Real: this mechanism cannot explain the real loss, because there the
+training score fell as well. Memorisation raises the training score.
+
+%======================================================================
+\section{Mechanism 2: the steps that are not gradient steps}\label{sec:proc}
+
+The real fit loses on held-out \emph{and} training trips. Steps 1--2 alone (stochastic gradient
+ascent on $\overline{L_K}$) can lose training likelihood only through noise or through the
+difference between $L_K$ and $\log p$ (Section~\ref{sec:bias}). Steps 3--4 are not gradient steps.
+
+\paragraph{Whitening (parameter-expanded EM).} Write $z=Az'$ with $z'\sim\N(0,I)$. Then
+$z\cdot\varphi_j=z'\cdot A\varphi_j$, and $\lambda$ absorbs $-\frac12|\varphi_j|^2$ exactly. So the
+new model with prior $\N(0,I)$ equals the old model with prior $\N(0,M)$, except for one term. In
+\eqref{eq:Ez}, the term $+\frac12(n_c-1)_+|\psi_c|^2$ becomes
+$+\frac12(n_c-1)_+|A\psi_c|^2$. It is linear in the number of extra products, and $f_c$ (free
+only for $n_c=2,3,\ge4$) and $\rho_c$ (quadratic) cannot absorb it. A second omission: the EM
+update of a Gaussian prior also moves its mean, and $A=M^{1/2}$ folds the pooled mean $\bar\mu$
+into the scale.
+\emph{Measured:} at the real step-360 fit, one step costs $0.007$--$0.010$, and $|\bar\mu|=0.21$
+shifts each product's utility by an amount with standard deviation 0.11. So whitening alone, at
+29 steps, can account for at most about $0.3$ of the $0.66$, and only if nothing is recovered in
+between.
+
+\paragraph{The reset of Adam's state.} After a reset, Adam's first step moves every coordinate of
+$\varphi,\psi$ by $\pm$ the learning rate, whatever the size of its gradient. With resets every 30
+steps, this adds a random walk of about $0.003\sqrt{29}\approx0.016$ per coordinate. That is far
+below the measured change ($|\Delta\varphi_j|^2\approx1.3$ after the best rotation). \emph{Decided: not the cause.}
+
+\paragraph{Moment matching.} For $\lambda_j$, the gradient of the mean log-likelihood is
+$r_j-\hat r_j$: the data rate minus the model rate, averaged over the posterior. Dividing by $r_j$
+gives a damped Newton step, and its fixed point is the same as the gradient's. There are two
+departures:
+\begin{enumerate}
+\item it uses the gradient averaged over the last 30 steps, while Adam keeps moving the same
+  parameters, so the two can overshoot together along directions where $\lambda$, $\rho_0$ and the
+  scale of $\varphi$ trade off;
+\item its noise. A product bought $c$ times in 7,680 trips gets a relative error of
+  $1/\sqrt c$, so $\lambda_j$ jitters with standard deviation about $0.35/\sqrt c$ around its
+  target.
+\end{enumerate}
+The size terms have the same structure. The measured change is a coordinated drift: $|\varphi|$
+grows in every frequency band, $\lambda$ rises by about 1, and $\rho_0$ rises by up to 15. That
+is the trade-off direction of the first departure.
+
+\paragraph{Predictions.} If moment matching drives the loss, a continuation without it loses
+less on training and held-out trips. If whitening drives it, a continuation without whitening
+does. Both continuations still train every parameter by the gradient, so they are fair tests.
+
+%======================================================================
+\section{Mechanism 3: training on the bound instead of the likelihood}\label{sec:bias}
+
+The training gradient is
+\[
+\nabla L_K=\sum_k\tilde w_k\,\nabla\log\bigl[\N(z_k;0,I)\,p(S\mid z_k)\bigr],\qquad
+\tilde w_k=w_k\Big/\sum_l w_l,
+\]
+because the proposal $q$ does not depend on the parameters. This is the self-normalised estimate of
+$\nabla\log p(S)=\E[\nabla\log p(S,z)\mid S]$. Its bias is of order $1/K$, and it points toward
+averages under $q$. Since $q$ is wider than the posterior, the gradient behaves as if each
+posterior were wider than it is. \emph{Measured:} at $K=16$ the pooled second moment is
+overstated by 1.8\% (1.037 against 1.019); at $K=8$ it is about twice that. The fixed point of
+$L_8$ is therefore not the maximum-likelihood point, and the gap grows as posteriors narrow
+(synthetic: $0.06\to0.14$ nats).
+
+\paragraph{Prediction.} A continuation with $K=32$ (bias four times smaller) loses less. This
+costs about 4 times as much per step, so it is the last experiment, run only if Sections~3--4
+leave a loss unexplained.
+
+%======================================================================
+\section{Mechanism 4: generated size}\label{sec:size}
+
+At a stationary point of the likelihood, the size statistics match the data \emph{averaged over
+each trip's posterior}:
+\[
+\frac1T\sum_t \E\bigl[\,\E[n\mid z]\;\big|\;S_t\bigr]=\bar n_{\text{data}}.
+\]
+Generation draws $z\sim\N(0,I)$. The two agree when the pooled posterior
+$\frac1T\sum_t p(z\mid S_t)$ equals $\N(0,I)$. That holds at the maximum-likelihood point of a
+\emph{correctly specified} model, with large $T$. Whitening forces only the second moment to $I$.
+\emph{Measured} (real): the mean is not zero ($|\bar\mu|=0.22$), and the covariance has eigenvalues
+from 0.80 to 1.16. So the size gap is a symptom, not a separate cause. It shrinks if
+Sections~3--5 bring the fit closer to the maximum-likelihood point. If a gap remains, it measures
+misspecification.
+
+%======================================================================
+\section{Experiments}\label{sec:exp}
+
+All runs use the existing code with three new switches: \texttt{--no-moment-match},
+\texttt{--no-whiten}, and \texttt{--anchor BLOCKS --anchor-prec $\tau$} (penalty
+\eqref{eq:anchor}; $\tau=\infty$ is written \texttt{--freeze}). Scores are paired, on 1,024
+held-out and 1,024 training trips with $K=256$. Selection is on held-out trips only; the test
+weeks are never opened.
+
+\paragraph{Real} (from the step-360 checkpoint, 480 steps to step 840, same batches).
+\begin{center}\small
+\begin{tabular}{lll}
+\toprule
+run & change & prediction if its mechanism is the cause\\
+\midrule
+R0 & none (control) & held-out and training both below step 360\\
+R1 & \texttt{--no-moment-match} & loss much smaller than R0 on both splits\\
+R2 & \texttt{--no-whiten} & loss much smaller than R0 on both splits\\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\paragraph{Synthetic} (fresh 10-epoch fits, the same seed as the original run, which is the control).
+\begin{center}\small
+\begin{tabular}{lll}
+\toprule
+run & change & prediction\\
+\midrule
+S1 & freeze household and product context & best held-out $\ge-26.43$; small late loss\\
+S2 & anchor, $\tau=10$ & between S1 and the control\\
+S3 & anchor, $\tau=100$ & close to S1\\
+S4 & \texttt{--no-moment-match} & tells whether Mechanism 2 also acts here\\
+S5 & \texttt{--no-whiten} & likewise\\
+\bottomrule
+\end{tabular}
+\end{center}
+The value $\tau=10$ is about the measured likelihood curvature of a household coordinate with 2--4
+trips (6--16), so it halves the movement of such a household.
+
+\paragraph{Reading the results.} For each run, report the held-out and training score at the best
+and final steps, against the control. Also report the generated size and the change in $\rho_0$
+and $|\varphi|$. A mechanism is confirmed only if switching it off changes the late loss by more
+than twice the paired standard error. Otherwise it is rejected.
+
+\end{document}

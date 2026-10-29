@@ -57,6 +57,10 @@ from v4.constraints import category_capacities  # noqa: E402
 from v4.hier_prior import HierPrior  # noqa: E402
 from v4.training import CONTEXT_NAMES, Priors, add_blocks, penalties, project  # noqa: E402
 
+# Blocks for --anchor (docs/training_theory.pdf, Section 3).
+ANCHOR_BLOCKS = {"household": ("theta", "gamma"),
+                 "product_context": ("alpha", "beta", "mu", "zeta", "w_dsp", "w_mlr", "delta", "xi")}
+
 
 def parse_args():
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
@@ -119,6 +123,16 @@ def parse_args():
                    help="EXPERIMENTAL, did not fix the overfitting (docs/BRIEF_mixture_overfitting.md): Gaussian priors with estimated scales on the household (theta, gamma) and product-context "
                         "(alpha, beta, mu, zeta) blocks (v4/hier_prior.py); gamma, beta leave the price prior")
     p.add_argument("--em-every", type=int, default=0, help="--hier-prior: steps between scale updates (0: one epoch)")
+    # Switches for the experiments of docs/training_theory.pdf, Section 7.
+    p.add_argument("--no-moment-match", action="store_true", help="skip the moment-matching steps")
+    p.add_argument("--no-whiten", action="store_true", help="skip the whitening steps")
+    p.add_argument("--anchor", default="", help="comma list of blocks (household, product_context) held near their "
+                                                "values at the start of the fit by --anchor-prec")
+    p.add_argument("--anchor-prec", type=float, default=0.0,
+                   help="precision tau of the anchor penalty tau/2 |x - x0|^2 (total log-likelihood units); inf freezes")
+    p.add_argument("--interaction-only", action="store_true",
+                   help="train only psi, phi, rho_0, rho_c, f_extra and lam (the scope of the fits before d716f95, "
+                        "such as runs/commodity/v4_mixture_w); with --init it also accepts their checkpoints")
     p.add_argument("--seed", type=int, default=41001)
     p.add_argument("--start-step", type=int, default=0,
                    help="with --init: the step its checkpoint was saved at (same seed and epochs)")
@@ -130,6 +144,11 @@ def parse_args():
         p.error("--start-step needs --init")
     if args.centre_history and not args.recency:
         p.error("--centre-history needs --recency")
+    args.anchor = [b for b in args.anchor.split(",") if b]
+    if any(b not in ANCHOR_BLOCKS for b in args.anchor):
+        p.error(f"--anchor blocks must be among {sorted(ANCHOR_BLOCKS)}")
+    if args.anchor and args.anchor_prec <= 0.0:
+        p.error("--anchor needs --anchor-prec > 0")
     return args
 
 
@@ -153,8 +172,12 @@ def start_fresh(args, data, root):
 def continue_from(args, data, root):
     """The model of a checkpoint this script wrote, its Batcher, its blob and nmax."""
     model, meta, parent, flags, blob = load_model(args.init, data, root)
-    if blob.get("form") != "mixture" or "price_init" not in blob:
+    if blob.get("form") != "mixture":
         raise SystemExit(f"--init {args.init} was not written by this script")
+    if "price_init" not in blob:
+        if not args.interaction_only:
+            raise SystemExit(f"--init {args.init} has no price_init (an older fit): continue it with --interaction-only")
+        blob["price_init"] = {}                                  # price terms are not trained
     batcher = batcher_for(data, root, parent, recency=flags["recency"], purchase_history=flags["recency"])
     return model, batcher, blob, int(meta["nmax"])
 
@@ -254,6 +277,23 @@ def main():
         emit({"event": "hier_prior_init", **{n: {"s2_mean": round(float(b["s2"].mean()), 5)}
                                             for n, b in hier.blocks.items()}})
     em_every = args.em_every or len(batches)
+    # Anchored blocks: x0 = their values at the start of the fit (kept in the checkpoint, so a continued
+    # fit anchors at the same values); an infinite precision freezes them.
+    anchor_names = [n for b in args.anchor for n in ANCHOR_BLOCKS[b] if getattr(model, n, None) is not None]
+    frozen = set(anchor_names) if args.anchor_prec == float("inf") else set()
+    if anchor_names:
+        blob.setdefault("anchor_init", {})
+        for n in anchor_names:
+            blob["anchor_init"].setdefault(n, getattr(model, n).detach().clone())
+        price_init = {k: v for k, v in price_init.items() if k not in anchor_names}
+        emit({"event": "anchor", "names": anchor_names, "prec": args.anchor_prec})
+    anchor_init = {n: blob["anchor_init"][n] for n in anchor_names if n not in frozen}
+
+    def anchor_penalty():
+        total = 0.0
+        for n, x0 in anchor_init.items():
+            total = total + 0.5 * args.anchor_prec * (getattr(model, n) - x0).square().sum()
+        return total / N
     priors = Priors(args.pool_prod, args.phi_prec, args.delta_prec, args.rho_c_prec, args.f_extra_prec,
                     args.price_prec, args.u_cat_prec, args.rec_prec, args.promo_dev_prec if promo_common else 0.0)
     rec_params = ([model.psi, model.psi_item] if recency else []) + (
@@ -310,6 +350,10 @@ def main():
               ([getattr(model, n) for n in CONTEXT_NAMES] + promo_params, args.lr_base),
               ([getattr(model, n) for n in price_names], args.lr_price), ([model.u_cat], args.lr_u_cat),
               (rec_params, args.lr_rec)]
+    if args.interaction_only:
+        groups = groups[:5]
+    frozen_ids = {id(getattr(model, n)) for n in frozen}
+    groups = [([q for q in params if id(q) not in frozen_ids], lr) for params, lr in groups]
     trained = [q for params, _ in groups for q in params]
     for q in trained:
         q.requires_grad_(True)
@@ -342,6 +386,8 @@ def main():
         prior = penalties(model, priors, N, model.psi_cat, delta, price_init, recency)
         if hier is not None:
             prior = prior + hier.penalty(N)
+        if anchor_init:
+            prior = prior + anchor_penalty()
         prior.backward()
         grads = [model.rho_0_free.grad.detach().clone(), model.rho_c.grad.detach().clone(),
                  model.lam.grad.detach().clone()]
@@ -351,16 +397,21 @@ def main():
         opt.step()
         project(model, capacities, opt)
         if step % args.every == 0:
-            with torch.no_grad():                                # moment matching
-                r0, rc, la = (g / g_count for g in g_sums)
-                model.rho_0_free.sub_(0.5 * (r0 / rate_k).clamp(-0.5, 0.5))
-                model.rho_c.sub_(0.5 * (rc / rate_pairs).clamp(-0.5, 0.5))
-                model.lam.sub_(0.35 * (la / rate_item).clamp(-0.35, 0.35))
-            project(model, capacities, opt)
+            r0, rc, la = (g / g_count for g in g_sums)
+            if not args.no_moment_match:
+                with torch.no_grad():                            # moment matching
+                    model.rho_0_free.sub_(0.5 * (r0 / rate_k).clamp(-0.5, 0.5))
+                    model.rho_c.sub_(0.5 * (rc / rate_pairs).clamp(-0.5, 0.5))
+                    model.lam.sub_(0.35 * (la / rate_item).clamp(-0.35, 0.35))
+                project(model, capacities, opt)
             train_trace = float(torch.trace(zz / zz_n)) / r
-            eig = mixture.whiten_(model, second_moment())        # parameter-expanded EM
-            for prm in (model.phi, model.psi_cat):
-                opt.state.pop(prm, None)
+            if args.no_whiten:                                   # still measured, not applied
+                M = second_moment()
+                eig = torch.linalg.eigvalsh(0.5 * (M + M.T)).flip(0)
+            else:
+                eig = mixture.whiten_(model, second_moment())    # parameter-expanded EM
+                for prm in (model.phi, model.psi_cat):
+                    opt.state.pop(prm, None)
             emit({"step": step, "lam_rel_err_mean": round(float((la / rate_item).abs().mean()), 4),
                   "whiten_eigs_top3": [round(float(v), 3) for v in eig[:3]],
                   "whiten_trace_over_rank": round(float(eig.sum() / r), 3),

@@ -263,6 +263,11 @@ and leave everything else fixed. By the change of variable $z=cz'$, the model $T
 $\N(0,I)$ is the model $\theta$ with prior $\N(0,c^2I)$, apart from the $|\psi_c|^2$ term
 (Section~\ref{sec:proc}).
 
+\emph{Status after the experiments:} the derivative in Proposition~\ref{prop:scale} is exact, but the
+claim that the prior's pull $\pi$ explains the conflict was \textbf{refuted}. With the prior divided
+by 10, the moment still returns to 1.03--1.035 between whitenings (R3), and the synthetic fit is
+unchanged (S8). The match $1.044$ against $1.035$ was a coincidence.
+
 \begin{proposition}\label{prop:scale}
 Let $M=\frac1T\sum_t\E[zz^\top\mid S_t]$ be the pooled posterior second moment over the training
 trips. Then
@@ -378,14 +383,19 @@ S1 & household and product context frozen & $\mathbf{-27.24}$ (1,210) & $\mathbf
 S2 & anchored, $\tau=10$ & $-28.20$ (960) & $-28.38$\\
 S3 & anchored, $\tau=100$ & $-27.54$ (960) & $-27.58$\\
 S4 & no moment matching & $-28.34$ & $-28.72$\\
-S5 & no whitening & $-28.70$ (720) & see log\\
+S5 & no whitening & $-28.70$ (720) & $-28.98$\\
+S6 & S1 without whitening & $-27.37$ (1,210) & $-27.37$\\
+S8 & S1 with the $\varphi$ priors / 10 & $-27.27$ (1,200) & $-27.27$\\
+S9 & S1, Adam state kept across whitening & $\mathbf{-27.23}$ (1,200) & $-27.23$\\
 \bottomrule
 \end{tabular}
 \end{center}
 Mechanism~1 is confirmed. Freezing removes the late loss: the fit improves to the last step, and
 its best is 1.1 nats per trip above the control's best. The stronger the anchor, the better, and
 freezing is best. Moment matching has no effect (S4 equals the control). Without whitening, the
-synthetic fit is worse early on.
+synthetic fit is worse early on (S5). On the frozen recipe, whitening helps a little (S6 against
+S1). The prior strength does not matter (S8). Keeping Adam's state helps a little (S9). On
+synthetic data, with 522 products, whitening causes no late loss.
 
 \paragraph{Real, continued from step 360 (interaction and size only).}
 \begin{center}\small
@@ -399,8 +409,28 @@ R2 & no whitening & $-35.811$ & $\mathbf{-35.725}$\\
 \bottomrule
 \end{tabular}
 \end{center}
-Step 360 scores $-35.744$. R0 reproduces the original run's $-35.8983$ at step 480 exactly, so the
-comparison is clean. R2 is the first real run that improves past step 360. On 512 paired held-out
+Step 360 scores $-35.744$. R0 reproduces the original run exactly ($-35.8983$ at step 480,
+$-35.8356$ at 720, $-35.8993$ at 840), so the comparison is clean. Run R3 ($\varphi$ priors / 10,
+whitening on) was stopped after 60 steps: its pooled moment returned to 1.030 and 1.035 after each
+whitening, the same as R0's 1.030 and 1.034, so Proposition~\ref{prop:scale}'s explanation (the
+prior) was refuted and the run gave no further information. R4 is whitening with the $\psi$
+compensation, and R5 is R4 with Adam's state kept.
+
+\begin{center}\small
+\begin{tabular}{lll}
+\toprule
+paired, 1,024 trips, $K=256$ & held-out & training\\
+\midrule
+R0 at step 840 $-$ step 360 & $-0.27\pm0.04$ & $-0.23\pm0.04$\\
+R2 at step 840 $-$ step 360 & $\mathbf{+0.26\pm0.02}$ & $\mathbf{+0.30\pm0.04}$\\
+R2 $-$ R0 & $+0.53\pm0.04$ & $+0.54\pm0.04$\\
+\bottomrule
+\end{tabular}
+\end{center}
+\textbf{On real data, whitening causes the late loss.} Without it, training past step 360 gains
+0.26 nats per held-out trip and 0.30 per training trip, and the 64-trip validation score improves at
+every check ($-35.744$, $-35.811$, $-35.725$, $-35.634$, $-35.583$). The generated size of R2
+falls, however: 6.53 against 7.26 in the data. R2 is the first real run that improves past step 360. On 512 paired held-out
 trips, R2 at step 600 scores $-38.144$, against $-38.291$ for step 360. The bound measurement (256
 training trips, step 360 to the original final checkpoint) is in Section~\ref{sec:fight}: $L_8$ fell
 by 0.61.
@@ -409,5 +439,18 @@ by 0.61.
 steps of the prior covariance. Held-out: $-0.007\pm0.008$. Training: $+0.004\pm0.009$. Generated
 size: 6.76 to 6.90 (data 7.22). The likelihood is unchanged, as predicted. The size moves the
 predicted way, but only by a third of the gap, as Section~\ref{sec:size} explains.
+
+\paragraph{The $\psi$ term, one step} (real step 360, 512 held-out trips, the same $M$):
+uncompensated $-0.0068\pm0.0049$; compensated (\texttt{whiten\_(\dots, compensate\_psi=True)})
+$+0.0012\pm0.0035$; their difference $+0.0081\pm0.0033$. For a step of $1.5M$: $-1.32\pm0.06$
+uncompensated, $-0.24\pm0.03$ compensated (generated size 21.5 and 14.5). So the compensation makes
+whitening the neutral step that theory says it should be. But over a run it is not enough: R4 at
+step 480 scores $-35.901$, the same as R0 ($-35.898$). Four whitenings at 0.008 each cannot
+account for the 0.09 that R0 loses against R2 in those 120 steps. Whitening must hurt through
+the training that follows it. R5 tests the reset of Adam's state.
+
+\paragraph{Household taste in $z$} (synthetic, 150 households, 1,196 trips). The share of the
+spread of trip posterior means $\E[z\mid S_t]$ that lies between households is $-0.02$ (S1) and
+$-0.03$ (control), that is zero. So a household mean for $z$ would add nothing there.
 
 \end{document}

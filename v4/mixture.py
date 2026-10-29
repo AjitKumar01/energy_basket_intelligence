@@ -143,11 +143,13 @@ def generate(model, ix, gen, iv=None, z=None):
 
 
 @torch.no_grad()
-def whiten_(model, second_moment):
+def whiten_(model, second_moment, compensate_psi=False):
     """Parameter-expanded EM step: with A = second_moment^(1/2) (the pooled posterior second moment
     of z), set phi_j <- A phi_j, psi_c <- A psi_c and lam_j += (|A phi_j|^2 - |phi_j|^2) / 2.  A prior
     N(0, second_moment) with the old vectors is the same law as N(0, I) with the new ones, except for
-    the |psi_c|^2 / 2 per extra product of a category, which is not re-compensated.  Returns the
+    the |psi_c|^2 / 2 per extra product of a category, which grows by a_c = (|A psi_c|^2 - |psi_c|^2) / 2.
+    ``compensate_psi``: add a_c (n - 1) to the count potential f_c at n = 2, 3, >= 4, which cancels
+    that change exactly for up to 4 products of the category (docs/training_theory.pdf).  Returns the
     eigenvalues of second_moment, largest first."""
     r = model.rank
     ev, V = torch.linalg.eigh(0.5 * (second_moment + second_moment.T))
@@ -155,6 +157,10 @@ def whiten_(model, second_moment):
     old = model.phi[:, :r].square().sum(1)
     model.phi[:, :r] = model.phi[:, :r] @ A
     if model.psi_cat is not None:
+        old_psi = model.psi_cat.square().sum(1)
         model.psi_cat.copy_(model.psi_cat @ A)
+        if compensate_psi and model.f_extra is not None:
+            a = 0.5 * (model.psi_cat.square().sum(1) - old_psi)
+            model.f_extra.add_(a[:, None] * torch.tensor([1.0, 2.0, 3.0], dtype=a.dtype))
     model.lam.add_(0.5 * (model.phi[:, :r].square().sum(1) - old))
     return ev.flip(0)

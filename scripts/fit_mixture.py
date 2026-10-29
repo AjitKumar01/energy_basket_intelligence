@@ -126,6 +126,10 @@ def parse_args():
     # Switches for the experiments of docs/training_theory.pdf, Section 7.
     p.add_argument("--no-moment-match", action="store_true", help="skip the moment-matching steps")
     p.add_argument("--no-whiten", action="store_true", help="skip the whitening steps")
+    p.add_argument("--whiten-compensate-psi", action="store_true",
+                   help="whitening also compensates the |psi_c|^2 term through f_c (mixture.whiten_)")
+    p.add_argument("--keep-adam-state", action="store_true",
+                   help="keep Adam's state for phi, psi after whitening (default: clear it)")
     p.add_argument("--anchor", default="", help="comma list of blocks (household, product_context) held near their "
                                                 "values at the start of the fit by --anchor-prec")
     p.add_argument("--anchor-prec", type=float, default=0.0,
@@ -409,9 +413,11 @@ def main():
                 M = second_moment()
                 eig = torch.linalg.eigvalsh(0.5 * (M + M.T)).flip(0)
             else:
-                eig = mixture.whiten_(model, second_moment())    # parameter-expanded EM
-                for prm in (model.phi, model.psi_cat):
-                    opt.state.pop(prm, None)
+                eig = mixture.whiten_(model, second_moment(),    # parameter-expanded EM
+                                      compensate_psi=args.whiten_compensate_psi)
+                if not args.keep_adam_state:
+                    for prm in (model.phi, model.psi_cat):
+                        opt.state.pop(prm, None)
             emit({"step": step, "lam_rel_err_mean": round(float((la / rate_item).abs().mean()), 4),
                   "whiten_eigs_top3": [round(float(v), 3) for v in eig[:3]],
                   "whiten_trace_over_rank": round(float(eig.sum() / r), 3),

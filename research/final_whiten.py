@@ -39,6 +39,7 @@ def main():
     p.add_argument("--val-trips", type=int, default=1024)
     p.add_argument("--seed", type=int, default=41001)
     p.add_argument("--threads", type=int, default=4)
+    p.add_argument("--compensate-psi", action="store_true", help="also compensate the |psi_c|^2 term (mixture.whiten_)")
     a = p.parse_args()
     torch.set_num_threads(a.threads)
     root = data_root(None)
@@ -60,7 +61,7 @@ def main():
             n += bt.ix.B
         M = M / n
         with torch.no_grad():
-            eig = mixture.whiten_(model, M)
+            eig = mixture.whiten_(model, M, compensate_psi=a.compensate_psi)
         print(json.dumps({"iter": it, "trace_over_r": round(float(eig.sum()) / model.rank, 4),
                           "eig_max": round(float(eig[0]), 4), "eig_min": round(float(eig[-1]), 4)}), flush=True)
     out = dict(blob)

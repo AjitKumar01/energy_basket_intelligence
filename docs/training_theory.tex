@@ -268,6 +268,21 @@ claim that the prior's pull $\pi$ explains the conflict was \textbf{refuted}. Wi
 by 10, the moment still returns to 1.03--1.035 between whitenings (R3), and the synthetic fit is
 unchanged (S8). The match $1.044$ against $1.035$ was a coincidence.
 
+\emph{What does cause the conflict} (measured at the end of the run without whitening, R2, on 512
+training trips, by central differences along $T_c$ with $c=1\pm0.03$ and common random numbers):
+\[
+\frac{d}{dc}\overline{L_8}=+0.09\pm0.16,\qquad
+\frac{d}{dc}\overline{\log p}=+0.46\pm0.16,\qquad
+\text{difference } -0.375\pm0.034 .
+\]
+The gradient of the training bound is zero along the scale direction (R2 is at its fixed point),
+while the likelihood still rises along it. This is Mechanism~3 (Section~\ref{sec:bias}) acting on the
+one direction that whitening also moves: the bias of the self-normalised gradient puts the bound's
+fixed point at a smaller taste scale than the likelihood's. Whitening is an exact EM step for the
+likelihood, so it moves to the likelihood's scale, and the gradient pulls back to the bound's.
+Alternating two procedures with different fixed points ascends neither objective. So the fit drifts,
+and $\log p$ falls on held-out and training trips.
+
 \begin{proposition}\label{prop:scale}
 Let $M=\frac1T\sum_t\E[zz^\top\mid S_t]$ be the pooled posterior second moment over the training
 trips. Then
@@ -449,8 +464,58 @@ step 480 scores $-35.901$, the same as R0 ($-35.898$). Four whitenings at 0.008 
 account for the 0.09 that R0 loses against R2 in those 120 steps. Whitening must hurt through
 the training that follows it. R5 tests the reset of Adam's state.
 
+\paragraph{Whitening with compensation, over a run} (64 validation trips; step 360: $-35.744$).
+\begin{center}\small
+\begin{tabular}{lllll}
+\toprule
+run & 480 & 600 & 720 & generated size at 600 (data 7.26)\\
+\midrule
+R0 control & $-35.898$ & $-35.885$ & $-35.836$ & 7.80\\
+R4 $\psi$ compensated & $-35.901$ & $-35.894$ & $-35.865$ & 7.61\\
+R5 R4 + Adam state kept & $-35.877$ & $-35.840$ & & 7.13\\
+R2 no whitening & $\mathbf{-35.811}$ & $\mathbf{-35.725}$ & $\mathbf{-35.634}$ & 6.44\\
+\bottomrule
+\end{tabular}
+\end{center}
+Neither the $\psi$ compensation nor keeping Adam's state removes the loss. Both still alternate the
+two procedures, as the slope measurement explains.
+
+\paragraph{The final whitening with compensation} on R2 at step 840 (three EM steps of the prior
+covariance, \texttt{research/final\_whiten.py --compensate-psi}; 1,024 held-out trips, paired):
+$+0.008\pm0.007$, with generated size from 6.53 to 6.85 (data 7.26). It does not lower $\log p$, as
+predicted, and moves the size toward the data.
+
 \paragraph{Household taste in $z$} (synthetic, 150 households, 1,196 trips). The share of the
 spread of trip posterior means $\E[z\mid S_t]$ that lies between households is $-0.02$ (S1) and
 $-0.03$ (control), that is zero. So a household mean for $z$ would add nothing there.
+
+%======================================================================
+\section{Conclusions}\label{sec:conc}
+
+\begin{enumerate}
+\item \textbf{Synthetic late loss: memorisation} by the household and product-context blocks.
+  \emph{Fix:} keep these blocks at the base model's values (\texttt{--anchor
+  household,product\_context --anchor-prec inf}). The fit then improves to the last step: best
+  $-27.23$ (S9) against $-28.34$ for the control, on 64 held-out trips.
+\item \textbf{Real late loss: a conflict between whitening and the training bound.} The bound's
+  gradient is biased along the scale of the tastes ($-0.375\pm0.034$ per trip against the likelihood),
+  so whitening and the gradient have different fixed points. \emph{Fix:} train without whitening
+  (\texttt{--no-whiten}), then apply the EM step of the scale once at the end, with the $\psi$
+  compensation. On 1,024 held-out trips this gives $+0.27$ per trip over the old best checkpoint
+  (step 360), and $+0.53\pm0.04$ over continuing as before. It also gives $+0.30\pm0.04$ on training
+  trips, so it is learning, not memorising.
+\item \textbf{Ruled out by measurement:} moment matching (S4, R1), the prior on $\varphi$ (R3, S8),
+  learning-rate noise (the growth of $\varphi$ is the same in every frequency band), a biased
+  estimate of $M$, and the $\psi$ term and Adam reset as the main cause (R4, R5; both are real but
+  small).
+\item \textbf{Generated size} remains about 6\% low on real data (6.85 against 7.26), and 7\% low on
+  synthetic data. On synthetic data the cause is the shape of the taste distribution. A Gaussian
+  with the right first two moments does not help, and the gap is not between households. Whether the
+  same holds on real data still needs the same two measurements on the final checkpoint. A model
+  change is not justified before that.
+\item \textbf{Not tested, and the principled long-term fix:} remove the bias of the training
+  gradient (larger $K$, or a proposal closer to the posterior). Then whitening and the gradient
+  share a fixed point, and whitening can stay in the training.
+\end{enumerate}
 
 \end{document}

@@ -473,7 +473,7 @@ $\prod_c F_c(n_c)\, e^{-\rho_0(m)} / Z(z)$, divided by the probability of $(n, m
 $T_C(n,m)\, e^{-\rho_0(m)} / Z(z)$.
 
 The code never lists the partitions and never computes this formula for each of them, because there
-are far too many. For example, 7 products over 4 of 187 categories already gives more than $10^{9}$
+are far too many. For example, 7 products over 4 of 187 categories already gives about $10^{9}$
 partitions. Instead it draws the counts **one category at a time**, starting from the last category,
 $C$, and ending with the first.
 

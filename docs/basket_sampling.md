@@ -444,151 +444,301 @@ range of a double.
 
 ### Step 5. Draw how many products come from each category
 
-- **Distribution:** given the drawn $(n, m)$,
+Step 4 has drawn the basket size $n$ and the number of categories present, $m$. Step 5 draws the
+**partition**: the list of counts $(n_1, n_2, \dots, n_C)$, one count per category.
+
+#### 5.1 The probability of a whole partition
+
+A partition is *allowed* when it satisfies three conditions:
+
+- the counts add up to $n$: $n_1 + \dots + n_C = n$;
+- exactly $m$ of the counts are at least 1;
+- each count is within its limit: $0 \le n_c \le K_c$.
+
+The probability of an allowed partition is
+
+$$
+\boxed{\;P(n_1, \dots, n_C \mid n, m, z) = \frac{F_1(n_1)\, F_2(n_2) \cdots F_C(n_C)}{T_C(n, m)}\;}
+$$
+
+and 0 for any other list. Here:
+
+- $F_c(k)$ is the category factor of section 3, the total weight of all ways of putting $k$
+  products of category $c$ in the basket;
+- $T_C(n, m)$ is the sum of the numerator over all allowed partitions. That sum is what makes the
+  probabilities add up to 1.
+
+This formula comes from section 3. It is the probability of the counts,
+$\prod_c F_c(n_c)\, e^{-\rho_0(m)} / Z(z)$, divided by the probability of $(n, m)$,
+$T_C(n,m)\, e^{-\rho_0(m)} / Z(z)$.
+
+The code never lists the partitions and never computes this formula for each of them, because there
+are far too many. For example, 7 products over 4 of 187 categories already gives more than $10^{9}$
+partitions. Instead it draws the counts **one category at a time**, starting from the last category,
+$C$, and ending with the first.
+
+#### 5.2 The partition probability as a product of conditional probabilities
+
+By the chain rule of probability, the probability of a partition equals the probability of the
+last count, times the probability of the next count given the last one, and so on:
+
+$$
+P(n_1, \dots, n_C \mid n, m)
+= P(n_C \mid n, m)\;\cdot\; P(n_{C-1} \mid n_C, n, m)\;\cdot\; P(n_{C-2} \mid n_{C-1}, n_C, n, m)\;\cdots\; P(n_1 \mid n_2, \dots, n_C, n, m).
+$$
+
+(The taste $z$ is fixed throughout step 5, so it is left out of the notation.)
+
+The algorithm draws $n_C$ from the first factor. It then draws $n_{C-1}$ from the second factor,
+with the $n_C$ just drawn put in, and so on down to $n_1$. The partition it ends with therefore has
+exactly the probability in 5.1. What remains is to write down each of these conditional
+probabilities.
+
+#### 5.3 Each conditional probability
+
+When the algorithm reaches category $i$, the counts $n_{i+1}, \dots, n_C$ are already drawn. Two
+numbers describe what is left for categories $1, \dots, i$:
+
+$$
+\hat n_i = n - (n_{i+1} + \dots + n_C) \quad\text{(products still to place)},
+\qquad
+\hat m_i = m - \#\{c > i : n_c \ge 1\} \quad\text{(categories still to fill)}.
+$$
+
+At the start, $\hat n_C = n$ and $\hat m_C = m$.
+
+We also need the **size tables** of section 3. $T_i(a, b)$ is the total weight
+$\prod_{c \le i} F_c(n_c)$ of all ways the first $i$ categories can hold $a$ products, with exactly
+$b$ of those categories non-empty.
+
+**The conditional probability of category $i$'s count is**
+
+$$
+\boxed{\;
+P(n_i = k \mid n_{i+1}, \dots, n_C, n, m) =
+\begin{cases}
+\dfrac{F_i(0)\; T_{i-1}(\hat n_i,\ \hat m_i)}{T_i(\hat n_i,\ \hat m_i)} & k = 0, \\[14pt]
+\dfrac{F_i(k)\; T_{i-1}(\hat n_i - k,\ \hat m_i - 1)}{T_i(\hat n_i,\ \hat m_i)} & k = 1, 2, \dots, \min(K_i, \hat n_i).
+\end{cases}
+\;}
+$$
+
+Read it like this:
+
+- category $i$ takes $k$ products, which has weight $F_i(k)$;
+- the earlier categories $1, \dots, i-1$ must then hold the remaining $\hat n_i - k$ products. They
+  must fill $\hat m_i$ categories if $k = 0$, or $\hat m_i - 1$ if $k \ge 1$, because category $i$ is
+  then one of the filled ones. The total weight of all the ways they can do this is the $T_{i-1}$ entry;
+- the denominator is the sum of the numerators over $k$. It equals $T_i(\hat n_i, \hat m_i)$ by
+  the recursion that builds the tables:
 
   $$
-  P(n_1, \dots, n_C \mid n, m, z) = \frac{\prod_{c=1}^{C} F_c(n_c)}{T_C(n, m)},
+  T_i(a, b) = F_i(0)\, T_{i-1}(a, b) + \sum_{k \ge 1} F_i(k)\, T_{i-1}(a - k,\, b - 1).
   $$
 
-  over the count lists with $\sum_c n_c = n$, exactly $m$ categories with $n_c \ge 1$, and $n_c \le K_c$.
+**Where the formula comes from.** Add up the joint probability of 5.1 over the counts not yet drawn,
+$n_1, \dots, n_{i-1}$. The factors $F_1(n_1) \cdots F_{i-1}(n_{i-1})$ add up to a $T_{i-1}$ entry,
+by the definition of $T_{i-1}$. This gives the probability of the counts drawn so far:
 
-- **Algorithm.** Keep two numbers: $\hat n$, the products still to place, and $\hat m$, the categories
-  still to fill. Start with $\hat n \leftarrow n$ and $\hat m \leftarrow m$. Then for $i = C, C-1, \dots, 1$:
-  1. If $\hat n = 0$: set $n_i = n_{i-1} = \dots = n_1 = 0$ and stop.
-  2. For $k = 0, 1, \dots, \min(K_i, \hat n)$, compute the weight
+$$
+P(n_i, n_{i+1}, \dots, n_C \mid n, m) = \frac{F_i(n_i) \cdots F_C(n_C)\;\; T_{i-1}\big(\hat n_i - n_i,\ \hat m_i - [n_i \ge 1]\big)}{T_C(n, m)},
+$$
 
-     $$
-     \omega(0) = \tilde T_{i-1}(\hat n,\, \hat m)\; q_i(0),
-     \qquad
-     \omega(k) = \tilde T_{i-1}(\hat n - k,\, \hat m - 1)\; q_i(k) \quad (k \ge 1),
-     $$
+where $[n_i \ge 1]$ is 1 if $n_i \ge 1$ and 0 otherwise. The same sum one category later gives
 
-     where:
-     - $\tilde T_{i-1}$ and $q_i$ are the numbers stored in step 4;
-     - an entry of $\tilde T_{i-1}$ with first index above $d_{i-1}$, or second index above
-       $\min(\text{first index}, c_{i-1})$, is 0;
-     - $\omega(k) = 0$ for $k \ge 1$ when $\hat m = 0$.
-  3. If every $\omega(k)$ is 0 because the products underflowed, recompute the same weights in logs:
+$$
+P(n_{i+1}, \dots, n_C \mid n, m) = \frac{F_{i+1}(n_{i+1}) \cdots F_C(n_C)\;\; T_i(\hat n_i, \hat m_i)}{T_C(n, m)} .
+$$
 
-     $$
-     \log\omega(0) = \log \tilde T_{i-1}(\hat n, \hat m),
-     \qquad
-     \log\omega(k) = \log \tilde T_{i-1}(\hat n - k, \hat m - 1) + G_i(k),
-     $$
+The conditional probability is the first divided by the second, which is the boxed formula.
 
-     and replace each $\omega(k)$ by $e^{\log\omega(k) - \max_{k'} \log\omega(k')}$. These are the
-     earlier weights multiplied by the common factor $e^{\mu_i - \max}$.
-  4. Draw $k$ from the list $\omega(0), \omega(1), \dots, \omega(\min(K_i, \hat n))$, in that order,
-     with the list procedure, using one uniform from the trip's stream.
-  5. Set $n_i \leftarrow k$, $\hat n \leftarrow \hat n - k$, and, if $k \ge 1$, $\hat m \leftarrow \hat m - 1$.
+**The product of the conditionals is the partition probability.** Multiply the boxed formula over
+$i = C, C-1, \dots, 1$. The denominator at category $i$ is $T_i(\hat n_i, \hat m_i)$. The $T$ in
+the numerator at category $i+1$ is $T_i(\hat n_{i+1} - n_{i+1}, \dots) = T_i(\hat n_i, \hat m_i)$,
+the same number. So each $T$ cancels against the next one, and what is left is
 
-  At the end $\hat n = \hat m = 0$. The code checks this and reports an error otherwise.
+$$
+\prod_{i=1}^{C} P(n_i \mid n_{i+1}, \dots, n_C, n, m)
+= \frac{F_1(n_1) \cdots F_C(n_C)\;\; T_0(0, 0)}{T_C(n, m)}
+= \frac{F_1(n_1) \cdots F_C(n_C)}{T_C(n, m)} ,
+$$
 
-- **Why this is right.**
-  1. **The weights are proportional to the exact ones.** $\tilde T_{i-1} = T_{i-1} e^{-s_{i-1}}$ and
-     $q_i(k) = F_i(k) e^{-\mu_i}$, so $\omega(k) = e^{-s_{i-1} - \mu_i} \times \Omega(k)$, where
+since $T_0(0,0) = 1$. This is exactly the boxed formula of 5.1.
 
-     $$
-     \Omega(0) = T_{i-1}(\hat n, \hat m)\, F_i(0), \qquad \Omega(k) = T_{i-1}(\hat n - k, \hat m - 1)\, F_i(k).
-     $$
+#### 5.4 The sampling algorithm
 
-     The factor $e^{-s_{i-1} - \mu_i}$ is the same for every $k$, so the draw returns $k$ with
-     probability $\Omega(k) / \sum_{k'} \Omega(k')$.
-  2. **The total is the next table's entry.** By the recursion of section 3,
-     $\sum_{k'} \Omega(k') = T_i(\hat n, \hat m)$. So
+```
+n_left ← n ;  m_left ← m
+for i = C, C−1, ..., 1:
+    if n_left = 0:
+        n_i = n_{i−1} = ... = n_1 = 0 ;  stop          # every remaining count must be 0
+    for k = 0, 1, ..., min(K_i, n_left):
+        if k = 0:  q_k ← F_i(0) · T_{i−1}(n_left, m_left)
+        else:      q_k ← F_i(k) · T_{i−1}(n_left − k, m_left − 1)     (0 if m_left = 0)
+    draw k from the list q_0, q_1, ..., in that order          # section 4, one uniform
+    n_i ← k ;  n_left ← n_left − k ;  if k ≥ 1: m_left ← m_left − 1
+```
 
-     $$
-     P(n_i = k \mid \text{what was drawn for } i+1..C) = \frac{T_{i-1}(\hat n - k,\ \hat m - [k \ge 1])\, F_i(k)}{T_i(\hat n, \hat m)} .
-     $$
+Some entries count as $T_{i-1}(a, b) = 0$: those with $a < 0$, $b < 0$ or $b > a$, and those beyond
+what the first $i-1$ categories can reach. The list procedure divides by $\sum_k q_k$, which equals
+$T_i(n_{\text{left}}, m_{\text{left}})$, so the draw has exactly the probabilities of 5.3.
 
-  3. **This is the exact conditional.** Take the true distribution of the counts, conditioned on
-     $n_C, \dots, n_{i+1}$ already being drawn. The first $i$ categories must hold $\hat n$ products in
-     $\hat m$ categories, and their count list has probability $\prod_{c \le i} F_c(n_c) / T_i(\hat n, \hat m)$.
-     Adding this over $n_1, \dots, n_{i-1}$ with $n_i = k$ fixed gives exactly the fraction in 2.
-  4. **Multiplying the steps gives the target.** Write $(\hat n_i, \hat m_i)$ for the values when
-     category $i$ is reached, so that $(\hat n_C, \hat m_C) = (n, m)$ and $(\hat n_0, \hat m_0) = (0, 0)$.
-     Then
+Stopping early at $n_{\text{left}} = 0$ agrees with the formula. With nothing left to place, $k = 0$
+is the only possible value, and its probability is $F_i(0)\, T_{i-1}(0,0) / T_i(0,0) = 1$.
 
-     $$
-     \prod_{i=1}^{C} \frac{T_{i-1}(\hat n_{i-1}, \hat m_{i-1})\, F_i(n_i)}{T_i(\hat n_i, \hat m_i)}
-     = \frac{T_0(0, 0)}{T_C(n, m)} \prod_{i=1}^{C} F_i(n_i)
-     = \frac{\prod_i F_i(n_i)}{T_C(n, m)} ,
-     $$
+**The numbers actually stored.** The code does not store $F_i(k)$ and $T_{i-1}$ themselves. It stores
+$q_i(k) = F_i(k)\, e^{-\mu_i}$ and $\tilde T_{i-1} = T_{i-1}\, e^{-s_{i-1}}$ (step 4), which keeps
+them inside the range of a double. For a given category $i$, every $q_k$ in the list is multiplied
+by the same number $e^{-\mu_i - s_{i-1}}$. That leaves $q_k / \sum q$ unchanged. If every product
+in the list comes out as 0 in floating point, the code recomputes the list from the logarithms of
+the stored numbers.
 
-     because each $T_{i-1}(\hat n_{i-1}, \hat m_{i-1})$ in a numerator cancels the denominator of the
-     next category down. When the loop stops early at $\hat n = 0$, the remaining categories must
-     hold 0 products; their factors are $F(0) = 1$, and $T_{i}(0, 0) = 1$, so they contribute 1.
+#### 5.5 A worked example
+
+Take three categories, each holding at most 2 products, with these factors:
+
+| $k$ | 0 | 1 | 2 |
+|---|---|---|---|
+| $F_1(k)$ | 1 | 2 | 1 |
+| $F_2(k)$ | 1 | 3 | 1 |
+| $F_3(k)$ | 1 | 1 | 2 |
+
+Suppose step 4 drew $n = 3$ and $m = 2$. The allowed partitions and their weights $F_1 F_2 F_3$ are:
+
+| $(n_1, n_2, n_3)$ | (2,1,0) | (1,2,0) | (2,0,1) | (1,0,2) | (0,2,1) | (0,1,2) |
+|---|---|---|---|---|---|---|
+| weight | 3 | 2 | 1 | 4 | 1 | 6 |
+
+The total is $T_3(3, 2) = 17$, so, for example, $P(0,1,2) = 6/17$.
+
+The tables needed are:
+
+- $T_1(0,0) = 1$, $T_1(1,1) = 2$ and $T_1(2,1) = 1$;
+- $T_2(1,1) = 5$, $T_2(2,1) = 2$ and $T_2(3,2) = 5$, from the recursion.
+
+**Category 3** ($\hat n = 3$, $\hat m = 2$):
+
+| $k$ | $q_k$ | probability |
+|---|---|---|
+| 0 | $F_3(0)\, T_2(3,2) = 1 \cdot 5 = 5$ | $5/17$ |
+| 1 | $F_3(1)\, T_2(2,1) = 1 \cdot 2 = 2$ | $2/17$ |
+| 2 | $F_3(2)\, T_2(1,1) = 2 \cdot 5 = 10$ | $10/17$ |
+
+These match the table of partitions. For example, $P(n_3 = 2) = (4 + 6)/17$.
+
+Say $k = 2$ is drawn. Then $\hat n = 1$ and $\hat m = 1$.
+
+**Category 2** ($\hat n = 1$, $\hat m = 1$):
+
+| $k$ | $q_k$ | probability |
+|---|---|---|
+| 0 | $F_2(0)\, T_1(1,1) = 2$ | $2/5$ |
+| 1 | $F_2(1)\, T_1(0,0) = 3$ | $3/5$ |
+
+The total is $5 = T_2(1,1)$. Say $k = 1$ is drawn. Then $\hat n = 0$, so the algorithm stops with
+$n_1 = 0$.
+
+**Result:** the partition $(0, 1, 2)$, drawn with probability $\tfrac{10}{17} \cdot \tfrac{3}{5} = \tfrac{6}{17}$,
+which is its probability in the partition table.
+
+---
 
 ### Step 6. Draw which products are chosen inside each category
 
-- **Distribution:** independently for each category $c$ with $n_c = k \ge 1$, a group $G$ of $k$
-  of its products, with
+Step 5 fixed each category's count. Now, separately for each category $c$ with $n_c = k \ge 1$,
+step 6 draws **which** $k$ of its $P_c$ products are in the basket. The categories are independent
+of each other given their counts, so each is drawn on its own.
 
-  $$
-  P(G) = \frac{\prod_{j \in G} w_j(z)}{A_c(k)} = \frac{\prod_{j \in G} \tilde w_j}{\tilde A_c(k)} .
-  $$
+#### 6.1 The probability of a whole group
 
-  The second form holds because $\prod_{j \in G} w_j = e^{k M_c} \prod_{j \in G}\tilde w_j$ and
-  $A_c(k) = e^{k M_c}\tilde A_c(k)$.
+For a group $G$ of exactly $k$ products of the category,
 
-- **Algorithm**, for each category with $k = n_c \ge 1$. Categories are taken in the order they are
-  stored (trip by trip, by increasing category id), and the uniforms come from the main stream.
-  1. If $k = P_c$, choose every product of the category. No random number is used.
-  2. Otherwise, **build the prefix tables** from the weights $\tilde w_p$ kept in step 3, only up to $k$.
-     For $p = 0, 1, \dots, P_c$ and $\ell = 0, 1, \dots, k$:
+$$
+\boxed{\;P(G \mid n_c = k) = \frac{\prod_{j \in G} \tilde w_j}{\tilde A^{(P_c)}(k)}\;}
+$$
 
-     $$
-     \tilde A^{(0)}(0) = 1,\quad \tilde A^{(0)}(\ell) = 0 \ (\ell \ge 1);
-     \qquad
-     \tilde A^{(p)}(0) = 1,\quad
-     \tilde A^{(p)}(\ell) = \tilde A^{(p-1)}(\ell) + \tilde w_p\, \tilde A^{(p-1)}(\ell - 1)\ \ (1 \le \ell \le \min(p, k)),
-     $$
+Here:
 
-     and $\tilde A^{(p)}(\ell) = 0$ for $\ell > p$. All $P_c + 1$ rows are kept. By the induction
-     argument of step 3, $\tilde A^{(p)}(\ell)$ is the sum of $\prod_{j \in G}\tilde w_j$ over the groups
-     of $\ell$ products among the first $p$.
-  3. **Go through the products from last to first.** Set $\text{need} \leftarrow k$. For
-     $p = P_c, P_c - 1, \dots, 1$, while $\text{need} > 0$:
-     1. If $p = \text{need}$, choose products $1, \dots, p$, set $\text{need} \leftarrow 0$, and stop.
-     2. Otherwise compute
+- $\tilde w_j = e^{u_j(z) - M_c}$ are the scaled weights from step 3. Scaling every weight by the
+  same $e^{-M_c}$ multiplies every group of size $k$ by the same $e^{-k M_c}$, which does not change
+  the probabilities;
+- $\tilde A^{(p)}(\ell)$ is the sum of $\prod_{j\in G}\tilde w_j$ over all groups of $\ell$
+  products among the first $p$ products of the category.
 
-        $$
-        \pi_p = \min\!\Big(1,\ \frac{\tilde w_p\, \tilde A^{(p-1)}(\text{need} - 1)}{\tilde A^{(p)}(\text{need})}\Big),
-        $$
+#### 6.2 The group probability as a product of conditional probabilities
 
-        with $\pi_p = 0$ if the denominator is 0.
-     3. Draw one uniform $U$. If $U < \pi_p$, choose product $p$ and set $\text{need} \leftarrow \text{need} - 1$.
+Describe the group by one yes/no answer per product, $x_p = 1$ if product $p$ is in $G$ and
+$x_p = 0$ if not. The code decides the products from the last ($p = P_c$) to the first. By the
+chain rule,
 
-     At the end $\text{need} = 0$. The code checks this and reports an error otherwise.
+$$
+P(G) = P(x_{P_c})\; P(x_{P_c - 1} \mid x_{P_c})\; \cdots\; P(x_1 \mid x_2, \dots, x_{P_c}).
+$$
 
-- **Why this is right.**
-  1. **The marginal of the last product.** Every group of $\ell$ products among the first $p$
-     either contains product $p$ or not, so
+When product $p$ is reached, let $\ell_p = k - (x_{p+1} + \dots + x_{P_c})$ be the number of
+products still to choose among products $1, \dots, p$. **The conditional probability is**
 
-     $$
-     \tilde A^{(p)}(\ell) = \underbrace{\tilde w_p\, \tilde A^{(p-1)}(\ell - 1)}_{\text{groups containing } p}
-     + \underbrace{\tilde A^{(p-1)}(\ell)}_{\text{groups without } p} .
-     $$
+$$
+\boxed{\;
+P(x_p = 1 \mid x_{p+1}, \dots, x_{P_c}) = \frac{\tilde w_p\; \tilde A^{(p-1)}(\ell_p - 1)}{\tilde A^{(p)}(\ell_p)},
+\qquad
+P(x_p = 0 \mid x_{p+1}, \dots, x_{P_c}) = \frac{\tilde A^{(p-1)}(\ell_p)}{\tilde A^{(p)}(\ell_p)} .
+\;}
+$$
 
-     Under $P(G) \propto \prod_{j\in G}\tilde w_j$ on groups of size $\ell$ among the first $p$, the
-     probability that $p \in G$ is therefore $\tilde w_p \tilde A^{(p-1)}(\ell-1) / \tilde A^{(p)}(\ell)$.
-     This is $\pi_p$ with $\ell = \text{need}$. The $\min(1, \cdot)$ only guards against rounding:
-     the exact ratio is at most 1.
-  2. **What is left is the same problem, one product smaller.**
-     - Given $p \in G$, the rest of $G$ is a group of $\ell - 1$ products among the first $p - 1$, with
-       probability $\prod \tilde w / \tilde A^{(p-1)}(\ell - 1)$.
-     - Given $p \notin G$, $G$ is a group of $\ell$ products among the first $p - 1$, with probability
-       $\prod \tilde w / \tilde A^{(p-1)}(\ell)$.
+- **Numerator:** the groups that contain product $p$ have total weight $\tilde w_p$ times the weight
+  of all ways to pick the other $\ell_p - 1$ products from $1, \dots, p-1$.
+- **The two cases:** the groups without $p$ have total weight $\tilde A^{(p-1)}(\ell_p)$.
+- **Denominator:** the two cases add up to $\tilde A^{(p)}(\ell_p)$, because
+  $\tilde A^{(p)}(\ell) = \tilde w_p \tilde A^{(p-1)}(\ell - 1) + \tilde A^{(p-1)}(\ell)$.
 
-     So the loop, which carries on with $\text{need} - 1$ or $\text{need}$, draws each later product
-     from its exact conditional.
-  3. **The forced case.** When $p = \text{need}$, the only group of size $p$ among $p$ products is all of
-     them. The formula agrees: it would give $\pi = \tilde w_p \tilde A^{(p-1)}(p-1) / \tilde A^{(p)}(p) = 1$.
-  4. **Multiplying the steps gives the target.** For a group $G$, the probability that the loop
-     outputs $G$ is a product over $p$ of $\pi_p$ (for $p \in G$) or $1 - \pi_p$ (for $p \notin G$).
-     Here $1 - \pi_p = \tilde A^{(p-1)}(\ell)/\tilde A^{(p)}(\ell)$. Each $\tilde A^{(p-1)}(\cdot)$ in a
-     numerator cancels the denominator of the next product down. What is left is
-     $\prod_{j \in G}\tilde w_j \cdot \tilde A^{(0)}(0) / \tilde A^{(P_c)}(k) = P(G)$.
+**The product of the conditionals is the group probability.** At product $p$ the denominator is
+$\tilde A^{(p)}(\ell_p)$. The numerator always contains $\tilde A^{(p-1)}(\ell_{p-1})$, which is the
+denominator at product $p-1$. Multiplying over $p = P_c, \dots, 1$, these cancel, and what is left is
+
+$$
+\frac{\prod_{p:\ x_p = 1} \tilde w_p \;\cdot\; \tilde A^{(0)}(0)}{\tilde A^{(P_c)}(k)}
+= \frac{\prod_{j \in G}\tilde w_j}{\tilde A^{(P_c)}(k)} ,
+$$
+
+which is the formula of 6.1.
+
+#### 6.3 The sampling algorithm
+
+```
+if k = P_c:  choose every product of the category ; done
+build Ã^(p)(ℓ) for p = 0..P_c, ℓ = 0..k:
+    Ã^(0)(0) = 1,  Ã^(0)(ℓ) = 0 for ℓ ≥ 1
+    Ã^(p)(0) = 1,  Ã^(p)(ℓ) = Ã^(p−1)(ℓ) + w̃_p · Ã^(p−1)(ℓ−1)   for 1 ≤ ℓ ≤ min(p, k)
+    Ã^(p)(ℓ) = 0 for ℓ > p
+need ← k
+for p = P_c, P_c−1, ..., 1, while need > 0:
+    if p = need:  choose products 1..p ;  need ← 0 ;  stop      # probability 1, see below
+    π ← w̃_p · Ã^(p−1)(need − 1) / Ã^(p)(need)                  # clipped to at most 1
+    draw a uniform U ;  if U < π:  choose product p ;  need ← need − 1
+```
+
+The variable `need` is $\ell_p$. Since $P(U < \pi) = \pi$, each product is decided with exactly the
+conditional probability of 6.2. When `need` $= p$, all remaining products must be chosen: the
+formula gives $\pi = \tilde w_p \tilde A^{(p-1)}(p-1) / \tilde A^{(p)}(p) = 1$ for each of them, so
+taking them all at once is the same draw.
+
+#### 6.4 A worked example
+
+Take a category with three products of weights $\tilde w = (1, 2, 3)$, and $k = 2$. The groups are:
+
+| group | $\{1,2\}$ | $\{1,3\}$ | $\{2,3\}$ |
+|---|---|---|---|
+| weight | 2 | 3 | 6 |
+
+The total is $\tilde A^{(3)}(2) = 11$. The other tables needed are $\tilde A^{(2)}(1) = 3$,
+$\tilde A^{(2)}(2) = 2$, $\tilde A^{(1)}(0) = 1$ and $\tilde A^{(1)}(1) = 1$.
+
+1. **Product 3** (need $= 2$): $\pi = 3 \cdot \tilde A^{(2)}(1) / 11 = 9/11$. Say it is chosen; need becomes 1.
+2. **Product 2** (need $= 1$): $\pi = 2 \cdot \tilde A^{(1)}(0) / \tilde A^{(2)}(1) = 2/3$. Say it is chosen; need becomes 0.
+
+**Result:** the group $\{2, 3\}$, drawn with probability $\tfrac{9}{11} \cdot \tfrac{2}{3} = \tfrac{6}{11}$,
+which is its weight divided by the total.
 
 **The basket** is the union of the groups chosen in step 6.
 
